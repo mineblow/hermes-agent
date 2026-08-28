@@ -84,6 +84,26 @@ def test_events_since_returns_client_dispatchable_event_objects():
     assert "params" not in event
 
 
+def test_events_since_returns_defensive_copies():
+    frame = _frame("s1")
+    frame["params"]["payload"] = {"items": [1]}
+    event_replay._stamp_event(frame)
+
+    first = events_since("s1", 0)
+    first[0]["payload"]["items"].append(2)
+    first[0]["type"] = "mutated"
+
+    second = events_since("s1", 0)
+    assert second == [
+        {
+            "type": "message.delta",
+            "session_id": "s1",
+            "payload": {"items": [1]},
+            "seq": 1,
+        }
+    ]
+
+
 def test_unknown_session_returns_empty():
     assert events_since("nope", 0) == []
     assert latest_seq("nope") == 0
@@ -108,6 +128,45 @@ def test_session_count_bounded_with_fifo_eviction():
     assert stats["sessions"] == event_replay._REPLAY_SESSIONS_MAX
     assert events_since("s0", 0) == []  # oldest session fully evicted
     assert latest_seq(f"s{event_replay._REPLAY_SESSIONS_MAX + 9}") == 1
+
+
+def test_evicted_session_without_new_events_reports_truncation():
+    event_replay._stamp_event(_frame("old-live"))
+    for index in range(event_replay._REPLAY_SESSIONS_MAX):
+        event_replay._stamp_event(_frame(f"new-{index}"))
+
+    assert events_since("old-live", 0) == []
+    assert latest_seq("old-live") == 1
+    assert event_replay.is_truncated("old-live", 0) is True
+    assert event_replay.is_truncated("old-live", 1) is False
+
+
+def test_sequence_does_not_restart_when_a_live_session_buffer_is_evicted():
+    first = _frame("old-live")
+    event_replay._stamp_event(first)
+    assert first["params"]["seq"] == 1
+
+    for index in range(event_replay._REPLAY_SESSIONS_MAX):
+        event_replay._stamp_event(_frame(f"new-{index}"))
+
+    assert events_since("old-live", 0) == []
+    resumed = _frame("old-live")
+    event_replay._stamp_event(resumed)
+
+    assert resumed["params"]["seq"] == 2
+    assert [event["seq"] for event in events_since("old-live", 0)] == [2]
+
+
+def test_release_session_reclaims_counter_and_buffer_state():
+    frame = _frame("finished")
+    event_replay._stamp_event(frame)
+    assert latest_seq("finished") == 1
+
+    event_replay.release_session("finished")
+
+    assert latest_seq("finished") == 0
+    assert events_since("finished", 0) == []
+    assert event_replay.is_truncated("finished", 0) is False
 
 
 def test_concurrent_stamping_never_drops_or_duplicates_seq():

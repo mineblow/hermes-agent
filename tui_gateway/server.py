@@ -153,6 +153,7 @@ _batch_clarify: dict[str, dict] = {}
 _db = None
 _db_error: str | None = None
 _stdout_lock = threading.Lock()
+_legacy_event_publish_lock = threading.RLock()
 _cfg_lock = threading.Lock()
 # Shared profile UI metadata can be updated concurrently by Desktop, mobile,
 # and multiple worker-pool RPCs.  Its compare/check/write transaction needs a
@@ -1174,7 +1175,12 @@ def _teardown_popped_session(
                 )
         except Exception:
             logger.debug("failed waiting for session turn thread", exc_info=True)
-    _teardown_session(session, end_reason=end_reason)
+    try:
+        _teardown_session(session, end_reason=end_reason)
+    finally:
+        from tui_gateway.event_replay import release_session
+
+        release_session(str(session.get("_sid") or ""))
     return True
 
 
@@ -2480,9 +2486,9 @@ def write_json(obj: dict) -> bool:
 
     Precedence:
 
-    1. Event frames with a session id → the transport stored on that session,
-       so async events land with the client that owns the session even if
-       the emitting thread has no contextvar binding.
+    1. Event frames with a session id → the session's event hub when present,
+       or its legacy single transport otherwise. The hub stamps and records the
+       event inside the same total-order publication boundary used for fan-out.
     2. Otherwise the transport bound on the current context (set by
        :func:`dispatch` for the lifetime of a request).
     3. Otherwise the module-level stdio transport, matching the historical
@@ -2496,15 +2502,30 @@ def write_json(obj: dict) -> bool:
     if obj.get("method") == "event":
         params = obj.get("params")
         sid = ((params or {}).get("session_id")) if isinstance(params, dict) else ""
-        if sid and (t := (_sessions.get(sid) or {}).get("transport")) is not None:
+        session = _sessions.get(sid) if sid else None
+        if session is not None:
+            from tui_gateway.event_replay import _stamp_event
+
+            hub = session.get("event_hub")
+            if hub is not None:
+                return hub.publish(obj, prepare=_stamp_event)
+            if (t := session.get("transport")) is not None:
+                # Compatibility path for sessions not migrated to
+                # SessionEventHub yet. Keep replay sequence assignment and
+                # transport delivery in one total order.
+                with _legacy_event_publish_lock:
+                    _stamp_event(obj)
+                    return t.write(obj)
+
+    if obj.get("method") == "event":
+        # Compatibility path for sessions not migrated to SessionEventHub yet.
+        # Keep replay sequence assignment and transport delivery in one total
+        # order so concurrent emitters cannot deliver seq=2 before seq=1.
+        with _legacy_event_publish_lock:
             from tui_gateway.event_replay import _stamp_event
 
             _stamp_event(obj)
-            return t.write(obj)
-
-    from tui_gateway.event_replay import _stamp_event
-
-    _stamp_event(obj)
+            return (current_transport() or _stdio_transport).write(obj)
     return (current_transport() or _stdio_transport).write(obj)
 
 

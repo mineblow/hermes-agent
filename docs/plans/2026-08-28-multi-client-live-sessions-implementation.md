@@ -75,23 +75,43 @@ Only new failures block the branch; the existing baseline failure must remain un
 
 ### Connection identity
 
-Every transport exposes a stable process-lifetime `client_id`:
+Every transport has two identities:
 
 ```text
-WSTransport.client_id = random UUID
-stdio transport client_id = "stdio"
+connection_id = server-minted random UUID, unique per socket
+client_id     = opaque per-window identity, stable across reconnects
+stdio         = implicit legacy client_id/connection_id "stdio"
 ```
 
-The WebSocket welcome payload adds optional fields:
+`gateway.ready.payload` advertises the additive protocol without trusting an
+RPC-supplied identifier as authentication:
 
 ```json
 {
-  "client_id": "uuid",
-  "capabilities": ["session.attach", "session.detach", "session.attachments"]
+  "multi_client_sessions": 1,
+  "connection_id": "server-uuid",
+  "capabilities": ["client.attach", "session.attach", "session.detach", "session.attachments"]
 }
 ```
 
-Older clients ignore these fields.
+Negotiated clients then call `client.attach` once per socket:
+
+```json
+{
+  "protocol_version": 1,
+  "client_id": "opaque-stable-per-window-id",
+  "surface": "desktop",
+  "capabilities": ["session.observe", "session.control", "session.replay"]
+}
+```
+
+The server validates length/shape, intersects requested capabilities with its
+allowlist, and stores authority as `(server-verified auth principal, client_id,
+connection_id)`. It never authorizes from `client_id` alone. Unknown requested
+capabilities are ignored and the accepted set is returned. Desktop keeps the id
+for one renderer/window; browser clients use `sessionStorage`, never shared
+`localStorage`. Older clients that never negotiate receive an internal legacy
+identity and preserve current behavior.
 
 ### Attachment modes
 
@@ -316,9 +336,9 @@ Stop assigning `session["transport"]` as ownership in normal live payload paths.
 
 ---
 
-## Task 4: Add explicit attach/detach/attachment-inspection RPCs
+## Task 4: Add client negotiation and explicit session attachment RPCs
 
-**Objective:** Provide generic client subscription lifecycle while retaining implicit behavior for older clients.
+**Objective:** Provide stable reconnect identity and generic subscription lifecycle while retaining implicit behavior for older clients.
 
 **Files:**
 - Modify: `tui_gateway/methods_session.py`
@@ -329,7 +349,10 @@ Stop assigning `session["transport"]` as ownership in normal live payload paths.
 
 **Step 1: Write failing Python and TypeScript tests**
 
-Cover exact request/result schemas, invalid mode, unknown session, idempotency, replay from `last_seen_seq`, detach-only-current-client, sanitized attachment list, and legacy clients.
+Cover `client.attach` negotiation, malformed/oversized ids, capability
+intersection, auth-principal binding, exact session request/result schemas,
+invalid mode, unknown session, idempotency, replay from `last_seen_seq`,
+detach-only-current-client, sanitized attachment list, and legacy clients.
 
 **Step 2: Implement RPCs and additive protocol types.**
 
@@ -337,7 +360,7 @@ Cover exact request/result schemas, invalid mode, unknown session, idempotency, 
 
 ---
 
-## Task 5: Give WebSocket and stdio transports stable client identity
+## Task 5: Give transports server-minted connection identity and negotiated client identity
 
 **Objective:** Make authorization and attachment idempotency connection-scoped without leaking authentication data.
 
@@ -350,13 +373,15 @@ Cover exact request/result schemas, invalid mode, unknown session, idempotency, 
 
 **Step 1: Write failing tests**
 
-1. Each WebSocket gets one UUID client id stable for its lifetime.
-2. Different WebSockets have different IDs.
-3. Welcome advertises additive identity/capability fields.
-4. No auth token/identity secret enters attachment snapshots or events.
-5. Stdio receives stable `stdio` identity and unchanged output format.
+1. Each WebSocket gets one UUID `connection_id` stable for its lifetime.
+2. Different WebSockets have different connection IDs.
+3. `client.attach` installs a validated stable `client_id` bound to the authenticated principal.
+4. A reconnect may reuse its client id but gets a new connection id.
+5. Welcome advertises additive identity/capability fields.
+6. No auth token/identity secret enters attachment snapshots or events.
+7. Stdio receives stable implicit `stdio` identity and unchanged output format.
 
-**Step 2: Implement with UUID generation at connection creation.**
+**Step 2: Implement UUID connection identity plus validated negotiation.**
 
 Do not derive client ids from token, IP address, headers, or user-agent.
 

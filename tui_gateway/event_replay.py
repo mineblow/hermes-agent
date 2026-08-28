@@ -9,15 +9,18 @@ replays everything newer from the buffer, then live events resume seamlessly.
 Design constraints honored:
 - stdio TUI path unaffected: frames gain a ``seq`` field only on event frames;
   Ink ignores unknown params keys.
-- Thread safety: a single module lock guards counters + buffers; write_json
-  already serializes per-transport writes, so stamping under the lock cannot
-  reorder frames relative to each other.
+- Thread safety: a single module lock guards counters + buffers. Multi-client
+  sessions call stamping from SessionEventHub's publication boundary so seq,
+  replay, and fan-out delivery share one total order; the legacy single-sink
+  path retains its historical transport serialization.
 - Memory bound: _REPLAY_BUFFER_MAX events / _REPLAY_SESSIONS_MAX sessions,
   oldest session evicted FIFO.
 """
 
 from __future__ import annotations
 
+import copy
+import json
 import threading
 import uuid
 from collections import OrderedDict, deque
@@ -61,18 +64,25 @@ def _stamp_event(obj: dict) -> None:
         # Session-less global events (skin.changed etc.) are re-fetchable via
         # their own RPCs; no replay contract for them.
         return
+    # Normalize before entering the replay lock. Besides making the ring a
+    # defensive snapshot, this keeps arbitrary mapping/value serialization
+    # hooks from running while replay state is locked.
+    recorded_params = json.loads(json.dumps(params, ensure_ascii=False))
     with _replay_lock:
         seq = _replay_next_seq.get(sid, 0) + 1
         _replay_next_seq[sid] = seq
         params["seq"] = seq
+        recorded_params["seq"] = seq
         buf = _replay_buffers.get(sid)
         if buf is None:
             buf = deque(maxlen=_REPLAY_BUFFER_MAX)
             _replay_buffers[sid] = buf
             while len(_replay_buffers) > _REPLAY_SESSIONS_MAX:
                 _oldest_sid, _oldest_buf = _replay_buffers.popitem(last=False)
-                _replay_next_seq.pop(_oldest_sid, None)
-        buf.append((seq, params))
+                # Keep the sequence counter for the life of this replay epoch.
+                # Reusing seq=1 after buffer eviction would make clients with a
+                # prior watermark silently ignore every future event.
+        buf.append((seq, recorded_params))
 
 
 def events_since(sid: str, last_seen: int) -> list[dict]:
@@ -88,7 +98,7 @@ def events_since(sid: str, last_seen: int) -> list[dict]:
         buf = _replay_buffers.get(sid or "")
         if not buf:
             return []
-        return [event for seq, event in buf if seq > last_seen]
+        return [copy.deepcopy(event) for seq, event in buf if seq > last_seen]
 
 
 def is_truncated(sid: str, last_seen: int) -> bool:
@@ -98,14 +108,27 @@ def is_truncated(sid: str, last_seen: int) -> bool:
     with _replay_lock:
         buf = _replay_buffers.get(sid or "")
         if not buf:
-            return False
-        return last_seen + 1 < buf[0][0]
+            # A missing buffer can mean "never emitted" or "fully evicted".
+            # The retained counter distinguishes them so reconnecting clients
+            # are told to resync instead of silently accepting an empty gap.
+            return _replay_next_seq.get(sid or "", 0) > last_seen
+        earliest = buf[0][0]
+        return last_seen + 1 < earliest
 
 
 def latest_seq(sid: str) -> int:
     """Current highest stamped seq for *sid* (0 when unknown)."""
     with _replay_lock:
         return _replay_next_seq.get(sid or "", 0)
+
+
+def release_session(sid: str) -> None:
+    """Discard replay state after the live runtime has been fully torn down."""
+    if not sid:
+        return
+    with _replay_lock:
+        _replay_buffers.pop(sid, None)
+        _replay_next_seq.pop(sid, None)
 
 
 def reset_replay_state() -> None:

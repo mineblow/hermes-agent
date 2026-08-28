@@ -1093,6 +1093,156 @@ def test_write_json_drops_detached_ws_frames(monkeypatch):
         server._sessions.pop("detached-sid", None)
 
 
+def test_write_json_fans_out_one_stamped_order_to_all_session_attachments():
+    from tui_gateway import event_replay
+    from tui_gateway.session_events import AttachmentMode, SessionEventHub
+
+    class _RecordingTransport:
+        def __init__(self):
+            self.frames = []
+            self.condition = threading.Condition()
+
+        def write(self, frame):
+            with self.condition:
+                self.frames.append(frame)
+                self.condition.notify_all()
+            return True
+
+        def wait_for_count(self, count):
+            with self.condition:
+                assert self.condition.wait_for(
+                    lambda: len(self.frames) >= count,
+                    timeout=5,
+                )
+
+    sid = "multi-client-order"
+    event_replay.reset_replay_state()
+    hub = SessionEventHub()
+    left = _RecordingTransport()
+    right = _RecordingTransport()
+    hub.attach(left, client_id="left", mode=AttachmentMode.CONTROL)
+    hub.attach(right, client_id="right", mode=AttachmentMode.OBSERVE)
+    server._sessions[sid] = {"event_hub": hub, "transport": left}
+    start = threading.Barrier(3)
+
+    def _publish(source):
+        start.wait(timeout=5)
+        for index in range(20):
+            assert server.write_json(
+                {
+                    "jsonrpc": "2.0",
+                    "method": "event",
+                    "params": {
+                        "type": "message.delta",
+                        "session_id": sid,
+                        "payload": {"source": source, "index": index},
+                    },
+                }
+            )
+
+    try:
+        workers = [threading.Thread(target=_publish, args=(source,)) for source in ("a", "b")]
+        for worker in workers:
+            worker.start()
+        start.wait(timeout=5)
+        for worker in workers:
+            worker.join(timeout=5)
+            assert not worker.is_alive()
+
+        left.wait_for_count(40)
+        right.wait_for_count(40)
+
+        assert left.frames == right.frames
+        assert [frame["params"]["seq"] for frame in left.frames] == list(range(1, 41))
+        assert [event["seq"] for event in event_replay.events_since(sid, 0)] == list(
+            range(1, 41)
+        )
+    finally:
+        hub.close()
+        server._sessions.pop(sid, None)
+        event_replay.reset_replay_state()
+
+
+def test_write_json_keeps_legacy_delivery_in_replay_sequence_order():
+    from tui_gateway import event_replay
+
+    class _LegacyRaceTransport:
+        def __init__(self):
+            self.first_entered = threading.Event()
+            self.release_first = threading.Event()
+            self.frames: list[dict] = []
+            self.lock = threading.Lock()
+
+        def write(self, obj):
+            seq = obj["params"]["seq"]
+            if seq == 1:
+                self.first_entered.set()
+                assert self.release_first.wait(timeout=5)
+            with self.lock:
+                self.frames.append(json.loads(json.dumps(obj)))
+            return True
+
+    sid = "legacy-ordered-sid"
+    transport = _LegacyRaceTransport()
+    event_replay.reset_replay_state()
+    server._sessions[sid] = {"transport": transport}
+
+    def publish(index):
+        server.write_json(
+            {
+                "jsonrpc": "2.0",
+                "method": "event",
+                "params": {
+                    "type": "message.delta",
+                    "session_id": sid,
+                    "payload": {"index": index},
+                },
+            }
+        )
+
+    first = threading.Thread(target=publish, args=(1,))
+    second = threading.Thread(target=publish, args=(2,))
+    try:
+        first.start()
+        assert transport.first_entered.wait(timeout=5)
+        second.start()
+        # Give the competing publisher an opportunity to overtake the blocked
+        # first writer. The production lock must keep it behind seq=1.
+        second.join(timeout=0.1)
+        transport.release_first.set()
+        first.join(timeout=5)
+        second.join(timeout=5)
+
+        assert not first.is_alive()
+        assert not second.is_alive()
+        assert [frame["params"]["seq"] for frame in transport.frames] == [1, 2]
+        assert [event["seq"] for event in event_replay.events_since(sid, 0)] == [1, 2]
+    finally:
+        transport.release_first.set()
+        first.join(timeout=5)
+        second.join(timeout=5)
+        server._sessions.pop(sid, None)
+        event_replay.reset_replay_state()
+
+
+def test_teardown_popped_session_releases_replay_state(monkeypatch):
+    from tui_gateway import event_replay
+
+    sid = "finished-runtime"
+    event_replay.reset_replay_state()
+    frame = {
+        "jsonrpc": "2.0",
+        "method": "event",
+        "params": {"type": "session.info", "session_id": sid, "payload": {}},
+    }
+    event_replay._stamp_event(frame)
+    monkeypatch.setattr(server, "_teardown_session", lambda *_args, **_kwargs: None)
+
+    assert server._teardown_popped_session({"_sid": sid}) is True
+    assert event_replay.latest_seq(sid) == 0
+    assert event_replay.events_since(sid, 0) == []
+
+
 def test_usage_ticker_emits_wrapped_usage_payload(monkeypatch):
     # The live ticker must nest the snapshot under a "usage" key, matching the
     # message.complete / session.info payloads the desktop & TUI handlers read
