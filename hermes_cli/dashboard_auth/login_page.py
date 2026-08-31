@@ -405,8 +405,11 @@ an SSH tunnel or Tailscale.</p>
 
 
 # Inline script that wires every password provider form to POST JSON to
-# ``/auth/password-login`` and navigate on success. Emitted ONLY when at
-# least one ``supports_password`` provider is listed (OAuth-only login
+# the path-relative ``auth/password-login`` endpoint and navigate on success.
+# A relative URL preserves reverse-proxy prefixes (for example
+# ``/proxy/9120/login`` -> ``/proxy/9120/auth/password-login``) while still
+# resolving to ``/auth/password-login`` for root deployments. Emitted ONLY when
+# at least one ``supports_password`` provider is listed (OAuth-only login
 # pages stay script-free, preserving the no-JS contract for that case).
 #
 # Plain string (NOT run through ``str.format``), so braces are literal —
@@ -428,7 +431,7 @@ _PASSWORD_FORM_SCRIPT = """\
         password: (form.querySelector('input[name=password]') || {}).value || '',
         next: (form.querySelector('input[name=next]') || {}).value || ''
       };
-      fetch('/auth/password-login', {
+      fetch('auth/password-login', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify(body),
@@ -505,8 +508,8 @@ def _render_password_form(provider, next_path: str) -> str:
     """Render a username/password form for a ``supports_password`` provider.
 
     The form is wired by :data:`_PASSWORD_FORM_SCRIPT` (a single delegated
-    submit handler) to POST JSON to ``/auth/password-login`` and navigate
-    on success. ``next_path`` is carried in a hidden field; it has already
+    submit handler) to POST JSON to path-relative ``auth/password-login`` and
+    navigate on success. ``next_path`` is carried in a hidden field; it has
     been validated same-origin by the caller and is HTML-escaped here as
     defence in depth. The provider ``name`` is emitted in a ``data-``
     attribute (not a hidden input) so the script reads it without trusting
