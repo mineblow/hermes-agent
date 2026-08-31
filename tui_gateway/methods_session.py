@@ -28,11 +28,16 @@ def _(rid, params: dict) -> dict:
     # workspace" instead of whatever folder the desktop launched in.
     raw_cwd = str(params.get("cwd") or "").strip()
     try:
-        explicit_cwd = bool(raw_cwd) and os.path.isdir(os.path.abspath(os.path.expanduser(raw_cwd)))
+        explicit_cwd = bool(raw_cwd) and os.path.isdir(
+            os.path.abspath(os.path.expanduser(raw_cwd))
+        )
     except Exception:
         explicit_cwd = False
     resolved_cwd = _completion_cwd(params)
     source = _resolve_session_source(str(params.get("source") or "").strip() or None)
+    from tui_gateway.session_events import AttachmentMode
+
+    attachment_mode = AttachmentMode.parse(params.get("attachment_mode", "control"))
     _enable_gateway_prompts()
 
     # ``profile`` (app-global remote mode): a new chat started under a non-launch
@@ -49,7 +54,10 @@ def _(rid, params: dict) -> dict:
     # (resolved at build).
     create_model = str(params.get("model") or "").strip()
     session_model_override = (
-        {"model": create_model, "provider": str(params.get("provider") or "").strip() or None}
+        {
+            "model": create_model,
+            "provider": str(params.get("provider") or "").strip() or None,
+        }
         if create_model
         else None
     )
@@ -70,6 +78,9 @@ def _(rid, params: dict) -> dict:
             "priority" if is_truthy_value(params.get("fast")) else ""
         )
 
+    runtime_owner_lease = _claim_local_runtime_owner(
+        key, profile_home or Path(_hermes_home)
+    )
     ready = threading.Event()
     now = time.time()
     lease = None  # claimed lazily on the first turn (_ensure_active_session_slot)
@@ -80,7 +91,9 @@ def _(rid, params: dict) -> dict:
             "agent_error": None,
             "agent_ready": ready,
             "attached_images": [],
-            "close_on_disconnect": is_truthy_value(params.get("close_on_disconnect", False)),
+            "close_on_disconnect": is_truthy_value(
+                params.get("close_on_disconnect", False)
+            ),
             "active_session_lease": lease,
             "cols": cols,
             "created_at": now,
@@ -101,6 +114,7 @@ def _(rid, params: dict) -> dict:
             "pending_hidden": is_truthy_value(params.get("hidden", False)),
             "profile_home": str(profile_home) if profile_home is not None else None,
             "running": False,
+            "runtime_owner_lease": runtime_owner_lease,
             "session_key": key,
             "show_reasoning": _load_show_reasoning(),
             "source": source,
@@ -110,6 +124,11 @@ def _(rid, params: dict) -> dict:
             "transport": current_transport() or _stdio_transport,
         }
         _register_session_cwd(_sessions[sid])
+    _attach_current_transport(
+        sid,
+        _sessions[sid],
+        attachment_mode,
+    )
 
     # NOTE: we intentionally do NOT persist a DB row here. Every TUI/desktop
     # launch (and every "New agent" / draft) opens a session here just to paint
@@ -393,6 +412,7 @@ def _(rid, params: dict) -> dict:
     # that returns before that transfer must close it. Otherwise reuse the
     # shared launch db, which outlives the RPC and is never closed here.
     owns_db = False
+    runtime_build_guard = None
     if profile_home is not None:
         from hermes_state import SessionDB
 
@@ -409,7 +429,9 @@ def _(rid, params: dict) -> dict:
             found = db.get_session_by_title(target)
             if found:
                 target = found["id"]
-            elif is_truthy_value(params.get("lazy", False)) and _child_run_active(target):
+            elif is_truthy_value(params.get("lazy", False)) and _child_run_active(
+                target
+            ):
                 # Race: a watch window opened on a freshly-spawned subagent. The
                 # child relays `subagent.start` (which carries child_session_id and
                 # triggers the window) BEFORE its first run_conversation() flushes
@@ -464,9 +486,12 @@ def _(rid, params: dict) -> dict:
                     # unpersisted sibling of the storm-killer paths (#91276).
                     transport = current_transport()
                     if transport is not None:
-                        with live.setdefault("history_lock", threading.Lock()):
-                            live["transport"] = transport
-                            live.setdefault("viewers", {})[transport] = time.time()
+                        _attach_current_transport(
+                            live_sid,
+                            live,
+                            params.get("attachment_mode", "control"),
+                            transport=transport,
+                        )
                     _cancel_ws_orphan_reap(live_sid)
                     history = live.get("history") or []
                     return _ok(
@@ -475,7 +500,9 @@ def _(rid, params: dict) -> dict:
                             "session_id": live_sid,
                             "stored_session_id": str(live.get("session_key") or ""),
                             "message_count": len(history),
-                            "messages": [] if omit_messages else _history_to_messages(history),
+                            "messages": []
+                            if omit_messages
+                            else _history_to_messages(history),
                             "info": {
                                 "model": _resolve_model(),
                                 "lazy": True,
@@ -588,11 +615,19 @@ def _(rid, params: dict) -> dict:
             # to lose access to a session. Only a genuine over-limit blocks.
             logger.warning(
                 "resume safety check failed for %s (proceeding without guard): %s",
-                target, exc,
+                target,
+                exc,
             )
 
-        profile_resume_cwd = str(found.get("cwd") or "").strip() or _profile_configured_cwd(
-            profile_home
+        profile_resume_cwd = str(
+            found.get("cwd") or ""
+        ).strip() or _profile_configured_cwd(profile_home)
+        runtime_key_resolver = getattr(db, "session_runtime_key", None)
+        runtime_key = str(
+            runtime_key_resolver(target) if callable(runtime_key_resolver) else target
+        )
+        runtime_build_key = _profile_scoped_runtime_key(
+            runtime_key, profile_home or Path(_hermes_home)
         )
 
         def _reuse_live_payload(sid: str, session: dict) -> dict:
@@ -602,6 +637,7 @@ def _(rid, params: dict) -> dict:
                 cols=cols,
                 touch=True,
                 transport=current_transport() or _stdio_transport,
+                attachment_mode=params.get("attachment_mode", "control"),
                 omit_messages=omit_messages,
             )
             payload["resumed"] = target
@@ -637,9 +673,9 @@ def _(rid, params: dict) -> dict:
                 _cancel_ws_orphan_reap(sid)
                 return _ok(rid, _reuse_live_payload(sid, session))
 
-        # Fast path: if the session is already live, reuse it under the lock.
+        # Fast path: if the canonical runtime is already live in this profile, reuse it.
         with _session_resume_lock:
-            live = _find_live_session_by_key(target)
+            live = _find_live_session_by_runtime_key(runtime_key, profile_home)
         if live is not None:
             return _reuse_live_response(*live)
 
@@ -652,8 +688,12 @@ def _(rid, params: dict) -> dict:
         # (resume_session_id keeps the upgrade on the stored conversation).
         if is_truthy_value(params.get("lazy", False)):
             sid = uuid.uuid4().hex[:8]
-            source = _resolve_session_source(str(params.get("source") or "").strip() or None)
-            lease = None  # claimed lazily on the first turn (_ensure_active_session_slot)
+            source = _resolve_session_source(
+                str(params.get("source") or "").strip() or None
+            )
+            lease = (
+                None  # claimed lazily on the first turn (_ensure_active_session_slot)
+            )
             try:
                 db.reopen_session(target)
                 # The child's OWN conversation only — include_ancestors would prepend
@@ -670,16 +710,24 @@ def _(rid, params: dict) -> dict:
                     lease.release()
                 return _err(rid, 5000, f"resume failed: {e}")
             cwd = profile_resume_cwd or _default_session_cwd()
+            runtime_owner_lease = _claim_local_runtime_owner(
+                runtime_key, profile_home or Path(_hermes_home)
+            )
             record = _deferred_session_record(
+                sid,
                 target,
                 cols=cols,
                 cwd=cwd,
                 history=history,
                 lease=lease,
                 source=source,
-                close_on_disconnect=is_truthy_value(params.get("close_on_disconnect", False)),
+                close_on_disconnect=is_truthy_value(
+                    params.get("close_on_disconnect", False)
+                ),
                 profile_home=profile_home,
                 lazy=True,
+                runtime_owner_key=runtime_key,
+                runtime_owner_lease=runtime_owner_lease,
             )
             if (live := _claim_or_reuse_live(sid, target, record, lease)) is not None:
                 return _reuse_live_response(*live)
@@ -697,7 +745,9 @@ def _(rid, params: dict) -> dict:
                     target, repair_alternation=False, include_row_ids=True
                 )
             except Exception:
-                logger.debug("child-watch display projection read failed", exc_info=True)
+                logger.debug(
+                    "child-watch display projection read failed", exc_info=True
+                )
                 display_history = history
             messages = [] if omit_messages else _history_to_messages(display_history)
             return _ok(
@@ -705,7 +755,9 @@ def _(rid, params: dict) -> dict:
                 {
                     "session_id": sid,
                     "resumed": target,
-                    "message_count": len(display_history) if omit_messages else len(messages),
+                    "message_count": len(display_history)
+                    if omit_messages
+                    else len(messages),
                     "messages": messages,
                     "messages_omitted": omit_messages,
                     "info": _lazy_resume_info(cwd, profile=profile),
@@ -731,23 +783,35 @@ def _(rid, params: dict) -> dict:
         # governs the response shape of the non-deferred paths.
         if defer_history and not is_truthy_value(params.get("eager_build", False)):
             sid = uuid.uuid4().hex[:8]
-            source = _resolve_session_source(str(params.get("source") or "").strip() or None)
-            lease = None  # claimed lazily on the first turn (_ensure_active_session_slot)
+            source = _resolve_session_source(
+                str(params.get("source") or "").strip() or None
+            )
+            lease = (
+                None  # claimed lazily on the first turn (_ensure_active_session_slot)
+            )
             _enable_gateway_prompts()
             overrides = _stored_session_runtime_overrides(found) or {}
             model_override = overrides.get("model_override") or {}
             cwd = profile_resume_cwd or _default_session_cwd()
+            runtime_owner_lease = _claim_local_runtime_owner(
+                runtime_key, profile_home or Path(_hermes_home)
+            )
             record = _deferred_session_record(
+                sid,
                 target,
                 cols=cols,
                 cwd=cwd,
                 history=[],
                 lease=lease,
                 source=source,
-                close_on_disconnect=is_truthy_value(params.get("close_on_disconnect", False)),
+                close_on_disconnect=is_truthy_value(
+                    params.get("close_on_disconnect", False)
+                ),
                 profile_home=profile_home,
                 model_override=overrides.get("model_override"),
                 resume_runtime_overrides=overrides or None,
+                runtime_owner_key=runtime_key,
+                runtime_owner_lease=runtime_owner_lease,
             )
             record["resume_history_ready"] = threading.Event()
             record["resume_hydrating"] = True
@@ -798,8 +862,12 @@ def _(rid, params: dict) -> dict:
         # session's persisted runtime identity, and is a real (upgradable) session.
         if not is_truthy_value(params.get("eager_build", False)):
             sid = uuid.uuid4().hex[:8]
-            source = _resolve_session_source(str(params.get("source") or "").strip() or None)
-            lease = None  # claimed lazily on the first turn (_ensure_active_session_slot)
+            source = _resolve_session_source(
+                str(params.get("source") or "").strip() or None
+            )
+            lease = (
+                None  # claimed lazily on the first turn (_ensure_active_session_slot)
+            )
             # Interactive resume routes approvals/clarify through gateway prompts;
             # the deferred build wires the remaining per-session callbacks.
             _enable_gateway_prompts()
@@ -832,18 +900,26 @@ def _(rid, params: dict) -> dict:
             overrides = _stored_session_runtime_overrides(found) or {}
             model_override = overrides.get("model_override") or {}
             cwd = profile_resume_cwd or _default_session_cwd()
+            runtime_owner_lease = _claim_local_runtime_owner(
+                runtime_key, profile_home or Path(_hermes_home)
+            )
             record = _deferred_session_record(
+                sid,
                 target,
                 cols=cols,
                 cwd=cwd,
                 history=history,
                 lease=lease,
                 source=source,
-                close_on_disconnect=is_truthy_value(params.get("close_on_disconnect", False)),
+                close_on_disconnect=is_truthy_value(
+                    params.get("close_on_disconnect", False)
+                ),
                 display_history_prefix=prefix,
                 profile_home=profile_home,
                 model_override=overrides.get("model_override"),
                 resume_runtime_overrides=overrides or None,
+                runtime_owner_key=runtime_key,
+                runtime_owner_lease=runtime_owner_lease,
             )
             if (live := _claim_or_reuse_live(sid, target, record, lease)) is not None:
                 return _reuse_live_response(*live)
@@ -880,11 +956,17 @@ def _(rid, params: dict) -> dict:
         # _session_resume_lock across it would stall session.close on the main
         # dispatch thread (it's not a _LONG_HANDLER), blocking fast-path RPCs.
         sid = uuid.uuid4().hex[:8]
-        source = _resolve_session_source(str(params.get("source") or "").strip() or None)
+        source = _resolve_session_source(
+            str(params.get("source") or "").strip() or None
+        )
         lease = None  # claimed lazily on the first turn (_ensure_active_session_slot)
+        runtime_owner_lease = None
+        runtime_owner_transferred = False
         _enable_gateway_prompts()
         home_token = (
-            set_hermes_home_override(str(profile_home)) if profile_home is not None else None
+            set_hermes_home_override(str(profile_home))
+            if profile_home is not None
+            else None
         )
         secret_token = (
             set_secret_scope(build_profile_secret_scope(Path(str(profile_home))))
@@ -915,6 +997,15 @@ def _(rid, params: dict) -> dict:
             )
             history = sanitize_replay_history(raw_history)
             messages = [] if omit_messages else _history_to_messages(display_history)
+            runtime_build_guard = _runtime_build_singleflight(runtime_build_key)
+            runtime_build_guard.__enter__()
+            with _session_resume_lock:
+                live = _find_live_session_by_runtime_key(runtime_key, profile_home)
+            if live is not None:
+                return _reuse_live_response(*live)
+            runtime_owner_lease = _claim_local_runtime_owner(
+                runtime_key, profile_home or Path(_hermes_home)
+            )
             tokens = _set_session_context(target)
             try:
                 # Pass the profile's db so the agent persists turns to the right
@@ -936,6 +1027,8 @@ def _(rid, params: dict) -> dict:
         except Exception as e:
             if lease is not None:
                 lease.release()
+            if runtime_owner_lease is not None and not runtime_owner_transferred:
+                runtime_owner_lease.release()
             return _err(rid, 5000, f"resume failed: {e}")
         finally:
             if home_token is not None:
@@ -949,6 +1042,8 @@ def _(rid, params: dict) -> dict:
         with _session_resume_lock:
             live = _find_live_session_by_key(target)
             if live is not None:
+                if runtime_owner_lease is not None:
+                    live[1].setdefault("runtime_owner_lease", runtime_owner_lease)
                 try:
                     if hasattr(agent, "close"):
                         agent.close()
@@ -964,7 +1059,9 @@ def _(rid, params: dict) -> dict:
                     else None
                 )
                 init_secret_token = (
-                    set_secret_scope(build_profile_secret_scope(Path(str(profile_home))))
+                    set_secret_scope(
+                        build_profile_secret_scope(Path(str(profile_home)))
+                    )
                     if profile_home is not None
                     else None
                 )
@@ -1026,6 +1123,9 @@ def _(rid, params: dict) -> dict:
                     if profile_home is not None:
                         _sessions[sid]["profile_home"] = str(profile_home)
                     _sessions[sid]["active_session_lease"] = lease
+                    _sessions[sid]["runtime_owner_key"] = runtime_key
+                    _sessions[sid]["runtime_owner_lease"] = runtime_owner_lease
+                    runtime_owner_transferred = True
             except Exception as e:
                 # _init_session registers _sessions[sid] BEFORE its first read
                 # through this handle. If it raised in between — "database is
@@ -1041,9 +1141,13 @@ def _(rid, params: dict) -> dict:
                         _sessions.pop(sid, None)
                 if lease is not None:
                     lease.release()
+                if runtime_owner_lease is not None and not runtime_owner_transferred:
+                    runtime_owner_lease.release()
                 return _err(rid, 5000, f"resume failed: {e}")
             session = _sessions.get(sid) or {}
     finally:
+        if runtime_build_guard is not None:
+            runtime_build_guard.__exit__(None, None, None)
         # Every return that does NOT reach the transfer above abandons this
         # handle — session-not-found, both "resume failed" paths, the live-session
         # fast path (the hot one: reconnects re-resume live chats through it), the
@@ -1093,12 +1197,16 @@ def _(rid, params: dict) -> dict:
     except ValueError as e:
         return _err(rid, 4017, str(e))
     agent = session.get("agent")
-    info = _session_info(agent, session) if agent is not None else {
-        "cwd": cwd,
-        "branch": _git_branch_for_cwd(cwd),
-        "project": _project_info_for_cwd(cwd),
-        "lazy": True,
-    }
+    info = (
+        _session_info(agent, session)
+        if agent is not None
+        else {
+            "cwd": cwd,
+            "branch": _git_branch_for_cwd(cwd),
+            "project": _project_info_for_cwd(cwd),
+            "lazy": True,
+        }
+    )
     _emit("session.info", params.get("session_id", ""), info)
     return _ok(rid, info)
 
@@ -1167,12 +1275,16 @@ def _(rid, params: dict) -> dict:
         except ValueError as e:
             return _err(rid, 4017, str(e))
         agent = live.get("agent")
-        info = _session_info(agent, live) if agent is not None else {
-            "cwd": resolved,
-            "branch": branch,
-            "project": _project_info_for_cwd(resolved),
-            "lazy": True,
-        }
+        info = (
+            _session_info(agent, live)
+            if agent is not None
+            else {
+                "cwd": resolved,
+                "branch": branch,
+                "project": _project_info_for_cwd(resolved),
+                "lazy": True,
+            }
+        )
         _emit("session.info", live_sid, info)
 
     return _ok(rid, {"cwd": resolved, "branch": branch, "git_repo_root": root})
@@ -1310,7 +1422,9 @@ def _(rid, params: dict) -> dict:
                         resolved_title = fallback
                     else:
                         existing_row = db.get_session(key)
-                        existing_title = ((existing_row or {}).get("title") or "").strip()
+                        existing_title = (
+                            (existing_row or {}).get("title") or ""
+                        ).strip()
                         if existing_title == fallback:
                             session["pending_title"] = None
                             resolved_title = fallback
@@ -1362,7 +1476,9 @@ def _(rid, params: dict) -> dict:
             with _session_db(session) as scoped_db:
                 if scoped_db is not None and scoped_db.set_session_title(key, title):
                     session["pending_title"] = None
-                    _emit_session_info_for_session(params.get("session_id", ""), session)
+                    _emit_session_info_for_session(
+                        params.get("session_id", ""), session
+                    )
                     return _ok(rid, {"pending": False, "title": title})
             # Row creation didn't take (DB unavailable, or a concurrent writer) —
             # fall back to queuing so the post-turn apply block can still recover.
@@ -1418,7 +1534,11 @@ def _(rid, params: dict) -> dict:
         if db is None:
             return _db_unavailable_error(rid, code=5007)
         try:
-            resolved = db.resolve_session_id(target) if hasattr(db, "resolve_session_id") else target
+            resolved = (
+                db.resolve_session_id(target)
+                if hasattr(db, "resolve_session_id")
+                else target
+            )
             if not resolved:
                 return err
             db.set_session_hidden(resolved, hidden)
@@ -1494,7 +1614,9 @@ def _(rid, params: dict) -> dict:
     template = (params.get("template") or "").strip() or None
     instructions = params.get("instructions") or ""
     user_input = params.get("input") or ""
-    variables = params.get("variables") if isinstance(params.get("variables"), dict) else {}
+    variables = (
+        params.get("variables") if isinstance(params.get("variables"), dict) else {}
+    )
     task = (params.get("task") or "title_generation").strip() or "title_generation"
 
     try:
@@ -1717,7 +1839,9 @@ def _(rid, params: dict) -> dict:
                 "context_max": usage.get("context_max", 0) or 0,
                 "context_percent": usage.get("context_percent", 0) or 0,
                 "context_used": usage.get("context_used", 0) or 0,
-                "estimated_total": usage.get("context_used", 0) or usage.get("total", 0) or 0,
+                "estimated_total": usage.get("context_used", 0)
+                or usage.get("total", 0)
+                or 0,
                 "model": _metadata_mirror(session).get("model", ""),
             },
         )
@@ -1811,8 +1935,12 @@ def _(rid, params: dict) -> dict:
             from hermes_cli.config import load_config
 
             cfg = load_config()
-            display = cfg.get("display", {}) if isinstance(cfg.get("display"), dict) else {}
-            pet_cfg = display.get("pet", {}) if isinstance(display.get("pet"), dict) else {}
+            display = (
+                cfg.get("display", {}) if isinstance(cfg.get("display"), dict) else {}
+            )
+            pet_cfg = (
+                display.get("pet", {}) if isinstance(display.get("pet"), dict) else {}
+            )
         except Exception:
             pet_cfg = {}
 
@@ -1824,8 +1952,12 @@ def _(rid, params: dict) -> dict:
             return _ok(rid, {"enabled": False})
 
         state = str(params.get("state") or constants.PetState.IDLE.value)
-        scale = float(pet_cfg.get("scale", constants.DEFAULT_SCALE) or constants.DEFAULT_SCALE)
-        cols = int(params.get("cols") or 0) or constants.resolve_cols(scale, pet_cfg.get("unicode_cols", 0))
+        scale = float(
+            pet_cfg.get("scale", constants.DEFAULT_SCALE) or constants.DEFAULT_SCALE
+        )
+        cols = int(params.get("cols") or 0) or constants.resolve_cols(
+            scale, pet_cfg.get("unicode_cols", 0)
+        )
 
         # Graphics path: when the TUI is attached to a real TTY (``graphics``)
         # and the terminal speaks the kitty protocol, return a Unicode-
@@ -1836,7 +1968,11 @@ def _(rid, params: dict) -> dict:
         # kitty is grid-safe in Ink — iTerm/sixel stay on the fallback.
         if params.get("graphics"):
             configured = str(pet_cfg.get("render_mode", "auto") or "auto").lower()
-            gmode = render.detect_terminal_graphics() if configured in ("", "auto") else configured
+            gmode = (
+                render.detect_terminal_graphics()
+                if configured in ("", "auto")
+                else configured
+            )
             if gmode == "kitty":
                 image_id = render.kitty_image_id(pet.slug)
                 # kitty sizes from scaled pixels (_cell_box), so unicode_cols is moot here.
@@ -1874,9 +2010,7 @@ def _(rid, params: dict) -> dict:
         frames = []
         for i in range(count):
             grid = renderer.cells(state, i, cols=cols)
-            frames.append(
-                [[[*top, *bottom] for (top, bottom) in row] for row in grid]
-            )
+            frames.append([[[*top, *bottom] for (top, bottom) in row] for row in grid])
 
         return _ok(
             rid,
@@ -1918,8 +2052,12 @@ def _(rid, params: dict) -> dict:
             from hermes_cli.config import load_config
 
             cfg = load_config()
-            display = cfg.get("display", {}) if isinstance(cfg.get("display"), dict) else {}
-            pet_cfg = display.get("pet", {}) if isinstance(display.get("pet"), dict) else {}
+            display = (
+                cfg.get("display", {}) if isinstance(cfg.get("display"), dict) else {}
+            )
+            pet_cfg = (
+                display.get("pet", {}) if isinstance(display.get("pet"), dict) else {}
+            )
         except Exception:
             pet_cfg = {}
 
@@ -1937,34 +2075,31 @@ def _(rid, params: dict) -> dict:
 
             for entry in [] if local_only else fetch_manifest():
                 seen.add(entry.slug)
-                gallery.append(
-                    {
-                        "slug": entry.slug,
-                        "displayName": entry.display_name,
-                        "installed": entry.slug in installed,
-                        "spritesheetUrl": entry.spritesheet_url,
-                        # petdex exposes no popularity metric; "curated" (its
-                        # hand-picked/official set, identified by the asset path)
-                        # is the closest signal, so the picker can surface it first.
-                        "curated": "/curated/" in entry.spritesheet_url,
-                        "generated": entry.slug in installed and installed[entry.slug].generated,
-                    }
-                )
+                gallery.append({
+                    "slug": entry.slug,
+                    "displayName": entry.display_name,
+                    "installed": entry.slug in installed,
+                    "spritesheetUrl": entry.spritesheet_url,
+                    # petdex exposes no popularity metric; "curated" (its
+                    # hand-picked/official set, identified by the asset path)
+                    # is the closest signal, so the picker can surface it first.
+                    "curated": "/curated/" in entry.spritesheet_url,
+                    "generated": entry.slug in installed
+                    and installed[entry.slug].generated,
+                })
         except Exception as exc:  # noqa: BLE001 - offline: fall back to installed
             logger.debug("pet.gallery manifest fetch failed: %s", exc)
 
         # Always include locally-installed pets even if the gallery is unreachable.
         for slug, pet in installed.items():
             if slug not in seen:
-                gallery.append(
-                    {
-                        "slug": slug,
-                        "displayName": pet.display_name,
-                        "installed": True,
-                        "spritesheetUrl": "",
-                        "generated": pet.generated,
-                    }
-                )
+                gallery.append({
+                    "slug": slug,
+                    "displayName": pet.display_name,
+                    "installed": True,
+                    "spritesheetUrl": "",
+                    "generated": pet.generated,
+                })
 
         return _ok(
             rid,
@@ -2056,7 +2191,11 @@ def _(rid, params: dict) -> dict:
         filename, data = store.export_pet(slug)
         return _ok(
             rid,
-            {"ok": True, "filename": filename, "zipBase64": base64.standard_b64encode(data).decode("ascii")},
+            {
+                "ok": True,
+                "filename": filename,
+                "zipBase64": base64.standard_b64encode(data).decode("ascii"),
+            },
         )
     except Exception as exc:  # noqa: BLE001
         logger.debug("pet.export failed: %s", exc)
@@ -2128,7 +2267,8 @@ def _(rid, params: dict) -> dict:
             {
                 "ok": True,
                 "slug": slug,
-                "dataUri": "data:image/png;base64," + base64.standard_b64encode(data).decode("ascii"),
+                "dataUri": "data:image/png;base64,"
+                + base64.standard_b64encode(data).decode("ascii"),
             },
         )
     except Exception as exc:  # noqa: BLE001
@@ -2267,7 +2407,9 @@ def _(rid, params: dict) -> dict:
         sprite = None
         if provider_name:
             try:
-                sprite = resolve_provider(require_references=bool(reference_images), prefer=provider_name)
+                sprite = resolve_provider(
+                    require_references=bool(reference_images), prefer=provider_name
+                )
             except GenerationError as exc:
                 _pet_cancel_release(token)
                 return _err(rid, 5031, str(exc))
@@ -2297,7 +2439,12 @@ def _(rid, params: dict) -> dict:
                 _emit(
                     "pet.generate.progress",
                     "",
-                    {"token": token, "index": index, "dataUri": data_uri, "count": count},
+                    {
+                        "token": token,
+                        "index": index,
+                        "dataUri": data_uri,
+                        "count": count,
+                    },
                 )
             except Exception as exc:  # noqa: BLE001
                 logger.debug("pet.generate progress emit failed: %s", exc)
@@ -2441,7 +2588,10 @@ def _(rid, params: dict) -> dict:
         state = build_billing_state()
         return _ok(rid, _serialize_billing_state(state))
     except Exception:
-        return _ok(rid, {"ok": True, "logged_in": False, "error": "could not load billing state"})
+        return _ok(
+            rid,
+            {"ok": True, "logged_in": False, "error": "could not load billing state"},
+        )
 
 
 @method("usage.bars")
@@ -2472,7 +2622,14 @@ def _(rid, params: dict) -> dict:
         state = build_subscription_state()
         return _ok(rid, _serialize_subscription_state(state))
     except Exception:
-        return _ok(rid, {"ok": True, "logged_in": False, "error": "could not load subscription state"})
+        return _ok(
+            rid,
+            {
+                "ok": True,
+                "logged_in": False,
+                "error": "could not load subscription state",
+            },
+        )
 
 
 @method("subscription.preview")
@@ -2488,7 +2645,14 @@ def _(rid, params: dict) -> dict:
 
     tier_id = params.get("subscription_type_id")
     if not tier_id:
-        return _ok(rid, {"ok": False, "error": "invalid_request", "message": "subscription_type_id is required"})
+        return _ok(
+            rid,
+            {
+                "ok": False,
+                "error": "invalid_request",
+                "message": "subscription_type_id is required",
+            },
+        )
     try:
         preview = subscription_change_preview_from_payload(
             post_subscription_preview(subscription_type_id=tier_id)
@@ -2513,10 +2677,21 @@ def _(rid, params: dict) -> dict:
     cancel = bool(params.get("cancel"))
     tier_id = params.get("subscription_type_id")
     if not cancel and not tier_id:
-        return _ok(rid, {"ok": False, "error": "invalid_request", "message": "subscription_type_id or cancel is required"})
+        return _ok(
+            rid,
+            {
+                "ok": False,
+                "error": "invalid_request",
+                "message": "subscription_type_id or cancel is required",
+            },
+        )
     try:
-        result = put_subscription_pending_change(subscription_type_id=tier_id, cancel=cancel)
-        return _ok(rid, {"ok": True, "message": result.get("message"), "payload": result})
+        result = put_subscription_pending_change(
+            subscription_type_id=tier_id, cancel=cancel
+        )
+        return _ok(
+            rid, {"ok": True, "message": result.get("message"), "payload": result}
+        )
     except BillingError as exc:
         return _ok(rid, _serialize_billing_error(exc))
     except Exception as exc:
@@ -2534,7 +2709,9 @@ def _(rid, params: dict) -> dict:
 
     try:
         result = delete_subscription_pending_change()
-        return _ok(rid, {"ok": True, "message": result.get("message"), "payload": result})
+        return _ok(
+            rid, {"ok": True, "message": result.get("message"), "payload": result}
+        )
     except BillingError as exc:
         return _ok(rid, _serialize_billing_error(exc))
     except Exception as exc:
@@ -2556,10 +2733,19 @@ def _(rid, params: dict) -> dict:
 
     tier_id = params.get("subscription_type_id")
     if not tier_id:
-        return _ok(rid, {"ok": False, "error": "invalid_request", "message": "subscription_type_id is required"})
+        return _ok(
+            rid,
+            {
+                "ok": False,
+                "error": "invalid_request",
+                "message": "subscription_type_id is required",
+            },
+        )
     key = params.get("idempotency_key") or new_idempotency_key()
     try:
-        result = post_subscription_upgrade(subscription_type_id=tier_id, idempotency_key=key)
+        result = post_subscription_upgrade(
+            subscription_type_id=tier_id, idempotency_key=key
+        )
         return _ok(
             rid,
             {
@@ -2576,7 +2762,15 @@ def _(rid, params: dict) -> dict:
         env["idempotency_key"] = key  # so the TUI can reuse on retry
         return _ok(rid, env)
     except Exception as exc:
-        return _ok(rid, {"ok": False, "error": "error", "message": str(exc), "idempotency_key": key})
+        return _ok(
+            rid,
+            {
+                "ok": False,
+                "error": "error",
+                "message": str(exc),
+                "idempotency_key": key,
+            },
+        )
 
 
 @method("billing.charge")
@@ -2592,17 +2786,35 @@ def _(rid, params: dict) -> dict:
 
     amount = params.get("amount_usd")
     if amount is None:
-        return _ok(rid, {"ok": False, "error": "invalid_request", "message": "amount_usd is required"})
+        return _ok(
+            rid,
+            {
+                "ok": False,
+                "error": "invalid_request",
+                "message": "amount_usd is required",
+            },
+        )
     key = params.get("idempotency_key") or new_idempotency_key()
     try:
         result = post_charge(amount_usd=amount, idempotency_key=key)
-        return _ok(rid, {"ok": True, "charge_id": result.get("chargeId"), "idempotency_key": key})
+        return _ok(
+            rid,
+            {"ok": True, "charge_id": result.get("chargeId"), "idempotency_key": key},
+        )
     except BillingError as exc:
         env = _serialize_billing_error(exc)
         env["idempotency_key"] = key  # so the TUI can reuse on retry
         return _ok(rid, env)
     except Exception as exc:
-        return _ok(rid, {"ok": False, "error": "error", "message": str(exc), "idempotency_key": key})
+        return _ok(
+            rid,
+            {
+                "ok": False,
+                "error": "error",
+                "message": str(exc),
+                "idempotency_key": key,
+            },
+        )
 
 
 @method("billing.charge_status")
@@ -2615,7 +2827,14 @@ def _(rid, params: dict) -> dict:
 
     charge_id = params.get("charge_id")
     if not charge_id:
-        return _ok(rid, {"ok": False, "error": "invalid_charge_id", "message": "charge_id is required"})
+        return _ok(
+            rid,
+            {
+                "ok": False,
+                "error": "invalid_charge_id",
+                "message": "charge_id is required",
+            },
+        )
     try:
         result = get_charge_status(charge_id)
         return _ok(
@@ -2647,8 +2866,17 @@ def _(rid, params: dict) -> dict:
         threshold = params.get("threshold")
         top_up_amount = params.get("top_up_amount")
         if threshold is None or top_up_amount is None:
-            return _ok(rid, {"ok": False, "error": "invalid_request", "message": "threshold and top_up_amount are required"})
-        patch_auto_top_up(enabled=enabled, threshold=threshold, top_up_amount=top_up_amount)
+            return _ok(
+                rid,
+                {
+                    "ok": False,
+                    "error": "invalid_request",
+                    "message": "threshold and top_up_amount are required",
+                },
+            )
+        patch_auto_top_up(
+            enabled=enabled, threshold=threshold, top_up_amount=top_up_amount
+        )
         return _ok(rid, {"ok": True})
     except BillingError as exc:
         return _ok(rid, _serialize_billing_error(exc))
@@ -2694,7 +2922,9 @@ def _(rid, params: dict) -> dict:
         env["granted"] = False
         return _ok(rid, env)
     except Exception as exc:
-        return _ok(rid, {"ok": False, "error": "error", "message": str(exc), "granted": False})
+        return _ok(
+            rid, {"ok": False, "error": "error", "message": str(exc), "granted": False}
+        )
 
 
 @method("session.status")
@@ -2761,15 +2991,13 @@ def _(rid, params: dict) -> dict:
     title = (meta.get("title") or "").strip()
     if title:
         lines.append(f"Title: {title}")
-    lines.extend(
-        [
-            f"Model: {model} ({provider})",
-            f"Created: {created.strftime('%Y-%m-%d %H:%M')}",
-            f"Last Activity: {updated.strftime('%Y-%m-%d %H:%M')}",
-            f"Tokens: {int(usage.get('total') or 0):,}",
-            f"Agent Running: {'Yes' if session.get('running') else 'No'}",
-        ]
-    )
+    lines.extend([
+        f"Model: {model} ({provider})",
+        f"Created: {created.strftime('%Y-%m-%d %H:%M')}",
+        f"Last Activity: {updated.strftime('%Y-%m-%d %H:%M')}",
+        f"Tokens: {int(usage.get('total') or 0):,}",
+        f"Agent Running: {'Yes' if session.get('running') else 'No'}",
+    ])
     return _ok(rid, {"output": "\n".join(lines)})
 
 
@@ -2825,9 +3053,7 @@ def _(rid, params: dict) -> dict:
             return _err(
                 rid, 4009, "session busy — /interrupt the current turn before /undo"
             )
-        history = _history_without_ephemeral_scaffolding(
-            session.get("history", [])
-        )
+        history = _history_without_ephemeral_scaffolding(session.get("history", []))
         # Truncate from the last *real* user turn. Popping only trailing
         # assistant/tool then one user left timeline markers
         # (async_delegation_complete, model_switch, …) or compaction
@@ -2843,8 +3069,8 @@ def _(rid, params: dict) -> dict:
         ]
         if user_indices:
             try:
-                _installed, _live_view, rewound_count = (
-                    _rewind_active_session_history(session, len(user_indices) - 1)
+                _installed, _live_view, rewound_count = _rewind_active_session_history(
+                    session, len(user_indices) - 1
                 )
                 removed = rewound_count
             except Exception as exc:
@@ -2873,7 +3099,9 @@ def _(rid, params: dict) -> dict:
         except Exception as exc:
             return _err(rid, 5019, f"compute-host compress failed: {exc}")
         if ack.get("type") in {"control.error", "error"}:
-            return _err(rid, 4009, str(ack.get("message") or "compute-host compress failed"))
+            return _err(
+                rid, 4009, str(ack.get("message") or "compute-host compress failed")
+            )
         _apply_compute_host_metadata_mirror(session, ack)
         host_result = ack.get("result")
         if isinstance(host_result, dict):
@@ -2883,8 +3111,14 @@ def _(rid, params: dict) -> dict:
             # old text-only acknowledgement made Desktop show aborted work as a
             # success toast.
             return _ok(rid, {**host_result, "turn_isolation": True})
-        host_info = ack.get("session_info") if isinstance(ack.get("session_info"), dict) else {}
-        host_messages = _history_to_messages(ack.get("messages")) if isinstance(ack.get("messages"), list) else []
+        host_info = (
+            ack.get("session_info") if isinstance(ack.get("session_info"), dict) else {}
+        )
+        host_messages = (
+            _history_to_messages(ack.get("messages"))
+            if isinstance(ack.get("messages"), list)
+            else []
+        )
         # `messages` is returned at top level for the desktop transcript
         # replacement. Keep the host acknowledgement metadata, but do not send
         # the same (potentially large) transcript a second time inside it.
@@ -2897,7 +3131,9 @@ def _(rid, params: dict) -> dict:
                 "host_ack": host_ack,
                 "info": host_info,
                 "messages": host_messages,
-                "usage": host_info.get("usage") if isinstance(host_info.get("usage"), dict) else {},
+                "usage": host_info.get("usage")
+                if isinstance(host_info.get("usage"), dict)
+                else {},
             },
         )
     session, err = _sess(params, rid)
@@ -3011,11 +3247,15 @@ def _(rid, params: dict) -> dict:
         from agent.manual_compression_feedback import (
             describe_compression_lock_skip,
         )
-        return _ok(rid, {
-            "compressed": False,
-            "lock_held": True,
-            "message": describe_compression_lock_skip(e.holder),
-        })
+
+        return _ok(
+            rid,
+            {
+                "compressed": False,
+                "lock_held": True,
+                "message": describe_compression_lock_skip(e.holder),
+            },
+        )
     except Exception as e:
         finalize_context_engine_compression_notification(
             session["agent"],
@@ -3041,10 +3281,14 @@ def _(rid, params: dict) -> dict:
         except Exception as exc:
             return _err(rid, 5011, f"compute-host session save failed: {exc}")
         if ack.get("type") in {"control.error", "error"}:
-            return _err(rid, 5011, str(ack.get("message") or "compute-host session save failed"))
+            return _err(
+                rid, 5011, str(ack.get("message") or "compute-host session save failed")
+            )
         result = ack.get("result")
         if not isinstance(result, dict):
-            return _err(rid, 5011, "compute-host session save returned an invalid response")
+            return _err(
+                rid, 5011, "compute-host session save returned an invalid response"
+            )
         return _ok(rid, result)
 
     agent = session["agent"]
@@ -3122,14 +3366,18 @@ def _(rid, params: dict) -> dict:
         with session["history_lock"]:
             in_memory_history = [
                 dict(msg)
-                for msg in list(session.get("display_history_prefix") or []) + list(session.get("history", []))
+                for msg in list(session.get("display_history_prefix") or [])
+                + list(session.get("history", []))
                 if isinstance(msg, dict)
             ]
 
         def _visible_branch_history(messages):
             visible = []
             for message in messages or []:
-                if not isinstance(message, dict) or message.get("role") not in {"user", "assistant"}:
+                if not isinstance(message, dict) or message.get("role") not in {
+                    "user",
+                    "assistant",
+                }:
                     continue
                 if not _coerce_message_text(message.get("content")).strip():
                     continue
@@ -3149,7 +3397,9 @@ def _(rid, params: dict) -> dict:
         if callable(get_resume_conversations):
             try:
                 _, display_history = get_resume_conversations(old_key)
-                display_history = _reconcile_display_with_live(display_history, in_memory_history)
+                display_history = _reconcile_display_with_live(
+                    display_history, in_memory_history
+                )
                 history = _visible_branch_history(display_history)
             except Exception:
                 logger.debug("branch display projection read failed", exc_info=True)
@@ -3234,6 +3484,7 @@ def _(rid, params: dict) -> dict:
     # unbound, whatever raises inside.
     branch_db = None
     branch_owns_db = False
+    branch_runtime_owner_lease = None
     try:
         # Bind the branched AGENT to the parent's profile, mirroring
         # session.create/resume: home override so config/skills/memory resolve
@@ -3251,9 +3502,7 @@ def _(rid, params: dict) -> dict:
             # _init_session raising, both leave here without that transfer.
             branch_db = SessionDB(db_path=Path(parent_home) / "state.db")
             branch_owns_db = True
-        home_token = (
-            set_hermes_home_override(parent_home) if parent_home else None
-        )
+        home_token = set_hermes_home_override(parent_home) if parent_home else None
         # The home override alone only moves config/skills/memory; credentials
         # resolve through get_secret(), which without a scope falls through to
         # process os.environ — the LAUNCH profile's .env. Install the parent's
@@ -3263,6 +3512,9 @@ def _(rid, params: dict) -> dict:
             set_secret_scope(build_profile_secret_scope(Path(parent_home)))
             if parent_home
             else None
+        )
+        branch_runtime_owner_lease = _claim_local_runtime_owner(
+            new_key, Path(parent_home or _hermes_home)
         )
         try:
             tokens = _set_session_context(new_key)
@@ -3301,9 +3553,12 @@ def _(rid, params: dict) -> dict:
                 reset_hermes_home_override(home_token)
         if new_sid in _sessions:
             _sessions[new_sid]["active_session_lease"] = lease
+            _sessions[new_sid]["runtime_owner_lease"] = branch_runtime_owner_lease
     except Exception as e:
         if lease is not None:
             lease.release()
+        if branch_runtime_owner_lease is not None and new_sid not in _sessions:
+            branch_runtime_owner_lease.release()
         return _err(rid, 5000, f"agent init failed on branch: {e}")
     finally:
         if branch_owns_db and branch_db is not None:
@@ -3508,16 +3763,14 @@ def _(rid, params: dict) -> dict:
                 except Exception:
                     raw = {}
                 subagents = raw.get("subagents") or []
-                entries.append(
-                    {
-                        "path": str(p),
-                        "session_id": raw.get("session_id") or d.name,
-                        "finished_at": raw.get("finished_at") or stat.st_mtime,
-                        "started_at": raw.get("started_at"),
-                        "label": raw.get("label") or "",
-                        "count": len(subagents) if isinstance(subagents, list) else 0,
-                    }
-                )
+                entries.append({
+                    "path": str(p),
+                    "session_id": raw.get("session_id") or d.name,
+                    "finished_at": raw.get("finished_at") or stat.st_mtime,
+                    "started_at": raw.get("started_at"),
+                    "label": raw.get("label") or "",
+                    "count": len(subagents) if isinstance(subagents, list) else 0,
+                })
             except OSError:
                 continue
 
@@ -3602,7 +3855,14 @@ def _(rid, params: dict) -> dict:
     # model as the next turn, instead of a misleading 4010 the client silently
     # swallows into a lost follow-up.
     if agent is None and session.get("running"):
-        _enqueue_prompt(session, text, current_transport() or _stdio_transport)
+        queue_transport = current_transport() or _stdio_transport
+        _enqueue_prompt(
+            session,
+            text,
+            queue_transport,
+            origin_client_id=_legacy_client_id_for_transport(queue_transport),
+            request_id=str(rid),
+        )
         session["last_active"] = time.time()
         return _ok(rid, {"status": "queued", "text": text})
     if (
@@ -3637,6 +3897,156 @@ def _(rid, params: dict) -> dict:
     return _ok(rid, {"cols": session["cols"]})
 
 
+@method("client.attach")
+def _(rid, params: dict) -> dict:
+    transport = current_transport() or _stdio_transport
+    protocol_version = params.get("protocol_version", 1)
+    if isinstance(protocol_version, bool) or protocol_version != 1:
+        return _err(rid, -32602, "unsupported protocol_version")
+    surface = params.get("surface", "legacy")
+    if not isinstance(surface, str) or not re.fullmatch(
+        r"[A-Za-z0-9][A-Za-z0-9._:-]{0,63}", surface
+    ):
+        return _err(rid, -32602, "surface must be 1-64 safe identifier characters")
+
+    supported = frozenset({"session.observe", "session.control", "session.replay"})
+    requested = params.get("capabilities")
+    if requested is None:
+        accepted = supported
+    elif (
+        not isinstance(requested, list)
+        or len(requested) > 32
+        or any(
+            not isinstance(item, str) or not item or len(item) > 64
+            for item in requested
+        )
+    ):
+        return _err(rid, -32602, "capabilities must be a list of up to 32 identifiers")
+    else:
+        accepted = supported.intersection(requested)
+
+    from tui_gateway.session_events import ATTACHMENT_MODES
+
+    attachment_capabilities = (
+        ATTACHMENT_MODES["control"]
+        if "session.control" in accepted
+        else ATTACHMENT_MODES["observe"].intersection(
+            {"observe"}
+            if accepted.intersection({"session.observe", "session.replay"})
+            else set()
+        )
+    )
+    negotiated = (1, surface, accepted)
+    existing_negotiated = getattr(transport, "client_negotiation", None)
+    if existing_negotiated is not None and existing_negotiated != negotiated:
+        return _err(rid, 4003, "connection negotiation is already bound")
+    try:
+        client_id, idempotent = _bind_client_identity(
+            transport, params.get("client_id")
+        )
+    except ValueError as exc:
+        return _err(rid, -32602, str(exc))
+    except PermissionError as exc:
+        return _err(rid, 4003, str(exc))
+    except RuntimeError as exc:
+        return _err(rid, 5030, str(exc))
+    transport.client_negotiation = negotiated
+    transport.negotiated_capabilities = frozenset(attachment_capabilities)
+    return _ok(
+        rid,
+        {
+            "protocol_version": 1,
+            "client_id": client_id,
+            "connection_id": str(getattr(transport, "connection_id", "")),
+            "surface": surface,
+            "capabilities": sorted(accepted),
+            "idempotent": idempotent,
+        },
+    )
+
+
+@method("session.attach")
+def _(rid, params: dict) -> dict:
+    sid = str(params.get("session_id") or "")
+    session = _sessions.get(sid)
+    if session is None:
+        return _err(rid, 4007, "session not live")
+    transport = current_transport() or _stdio_transport
+    client_id = getattr(transport, "client_id", None)
+    if not client_id:
+        return _err(rid, 4003, "client.attach required")
+    since = params.get("last_seen_seq", 0)
+    if isinstance(since, bool) or not isinstance(since, int) or since < 0:
+        return _err(rid, -32602, "last_seen_seq must be a non-negative integer")
+    try:
+        hub = _attach_current_transport(
+            sid, session, params.get("mode", "observe"), transport=transport
+        )
+    except ValueError as exc:
+        return _err(rid, -32602, str(exc))
+    snapshot = next(
+        item for item in hub.snapshots() if item["client_id"] == str(client_id)
+    )
+    from tui_gateway import event_replay
+
+    events = event_replay.events_since(sid, since)
+    truncated = event_replay.is_truncated(sid, since)
+    epoch = event_replay.replay_epoch()
+    return _ok(
+        rid,
+        {
+            **snapshot,
+            "session_id": sid,
+            "events": events,
+            "latest_seq": event_replay.latest_seq(sid),
+            "truncated": truncated,
+            "epoch": epoch,
+            "replay_epoch": epoch,
+            "replay": {"events": events, "truncated": truncated},
+        },
+    )
+
+
+@method("session.detach")
+def _(rid, params: dict) -> dict:
+    sid = str(params.get("session_id") or "")
+    session = _sessions.get(sid)
+    if session is None:
+        return _err(rid, 4007, "session not live")
+    transport = current_transport() or _stdio_transport
+    hub = session.get("event_hub")
+    try:
+        if hub is None:
+            raise PermissionError("transport is not attached")
+        hub.require(transport, "observe")
+    except PermissionError:
+        return _err(rid, 4003, "session observe permission required")
+    return _ok(
+        rid,
+        {
+            "session_id": sid,
+            "detached": _detach_transport_from_session(sid, session, transport),
+        },
+    )
+
+
+@method("session.attachments")
+def _(rid, params: dict) -> dict:
+    sid = str(params.get("session_id") or "")
+    session = _sessions.get(sid)
+    if session is None:
+        return _err(rid, 4007, "session not live")
+    transport = current_transport() or _stdio_transport
+    hub = session.get("event_hub")
+    try:
+        if hub is None:
+            raise PermissionError("transport is not attached")
+        hub.require(transport, "prompt.submit")
+    except PermissionError:
+        return _err(rid, 4003, "session control permission required")
+    return _ok(rid, {"session_id": sid, "attachments": hub.snapshots()})
+
+
 @method("session.events.since")
 def _(rid, params: dict) -> dict:
     """Replay recorded events for a session newer than the client's last-seen seq.
@@ -3648,24 +4058,43 @@ def _(rid, params: dict) -> dict:
     the client knows to refetch history instead of silently accepting a gap.
     """
     sid = str(params.get("session_id") or "")
+    session = _sessions.get(sid)
+    if session is None:
+        return _err(rid, 4007, "session not live")
+    hub = session.get("event_hub")
+    transport = current_transport() or _stdio_transport
     try:
-        last_seen = int(params.get("last_seen", 0))
+        if hub is None:
+            raise PermissionError("transport is not attached")
+        hub.require(transport, "observe")
+    except PermissionError:
+        # Do not reveal whether replay exists or any attachment metadata.
+        return _err(rid, 4003, "session observe permission required")
+    try:
+        last_seen = int(
+            params.get(
+                "last_seen", params.get("last_seen_seq", params.get("since_seq", 0))
+            )
+        )
     except (TypeError, ValueError):
         return _err(rid, -32602, "invalid params: last_seen must be an integer")
     from tui_gateway import event_replay
 
     frames = event_replay.events_since(sid, last_seen)
-    return _ok(rid, {
-        "events": frames,
-        "latest_seq": event_replay.latest_seq(sid),
-        "truncated": event_replay.is_truncated(sid, last_seen),
-        "count": len(frames),
-        # Restart detection: seq counters are in-process, so after a gateway
-        # restart a client's old high watermark would silently match nothing.
-        # Clients compare this against the epoch they learned at gateway.ready
-        # and reset watermarks on mismatch.
-        "epoch": event_replay.replay_epoch(),
-    })
+    return _ok(
+        rid,
+        {
+            "events": frames,
+            "latest_seq": event_replay.latest_seq(sid),
+            "truncated": event_replay.is_truncated(sid, last_seen),
+            "count": len(frames),
+            # Restart detection: seq counters are in-process, so after a gateway
+            # restart a client's old high watermark would silently match nothing.
+            # Clients compare this against the epoch they learned at gateway.ready
+            # and reset watermarks on mismatch.
+            "epoch": event_replay.replay_epoch(),
+        },
+    )
 
 
 @method("session.events.stats")

@@ -33,6 +33,7 @@ def _session(agent=None, **extra):
 
 # ── _enqueue_prompt ────────────────────────────────────────────────────────
 
+
 def test_enqueue_pins_text_and_transport():
     session = _session()
     server._enqueue_prompt(session, "hello", "ws-1")
@@ -52,9 +53,8 @@ def test_enqueue_preserves_order_after_an_image_turn():
     ]
 
 
-
-
 # ── _handle_busy_submit (policy) ───────────────────────────────────────────
+
 
 def test_busy_interrupt_mode_redirects_active_turn(monkeypatch):
     monkeypatch.setattr(server, "_load_busy_input_mode", lambda: "interrupt")
@@ -67,7 +67,10 @@ def test_busy_interrupt_mode_redirects_active_turn(monkeypatch):
         ),
     )
     session = _session(agent=agent, running=True)
-    session["inflight_turn"] = {"user": "original request", "assistant": "partial reply"}
+    session["inflight_turn"] = {
+        "user": "original request",
+        "assistant": "partial reply",
+    }
 
     resp = server._handle_busy_submit("r1", "sid", session, "redirect", "ws-1")
 
@@ -170,6 +173,79 @@ def test_enqueue_skips_text_duplicate_of_inflight_user():
         "text": "different follow-up",
         "transport": "ws-1",
     }
+
+
+def test_inflight_snapshot_keeps_request_origin():
+    session = _session()
+
+    server._start_inflight_turn(
+        session,
+        "hello",
+        origin_client_id="client-a",
+        request_id="request-a",
+    )
+
+    assert session["inflight_turn"]["origin_client_id"] == "client-a"
+    assert session["inflight_turn"]["request_id"] == "request-a"
+
+
+def test_enqueue_different_clients_preserves_fifo_without_merging():
+    session = _session()
+
+    server._enqueue_prompt(
+        session,
+        "from A",
+        "ws-a",
+        origin_client_id="client-a",
+        request_id="request-a",
+    )
+    server._enqueue_prompt(
+        session,
+        "from B",
+        "ws-b",
+        origin_client_id="client-b",
+        request_id="request-b",
+    )
+
+    assert session["queued_prompt"] == {
+        "text": "from A",
+        "origin_client_id": "client-a",
+        "request_id": "request-a",
+    }
+    assert session["queued_prompts"] == [
+        {
+            "text": "from B",
+            "origin_client_id": "client-b",
+            "request_id": "request-b",
+        }
+    ]
+
+
+def test_enqueue_same_client_can_merge_without_losing_request_origins():
+    session = _session()
+
+    server._enqueue_prompt(
+        session,
+        "first",
+        "ws-a",
+        origin_client_id="client-a",
+        request_id="request-a",
+    )
+    server._enqueue_prompt(
+        session,
+        "second",
+        "ws-a-reconnected",
+        origin_client_id="client-a",
+        request_id="request-b",
+    )
+
+    assert session["queued_prompt"] == {
+        "text": "first\n\nsecond",
+        "origin_client_id": "client-a",
+        "request_id": "request-a",
+        "request_ids": ["request-a", "request-b"],
+    }
+    assert "transport" not in session["queued_prompt"]
 
 
 def test_enqueue_followup_does_not_merge_stale_inflight_self_duplicate():
@@ -310,12 +386,6 @@ def test_compress_no_rotation_does_not_bump_queue_generation(monkeypatch):
     assert session["_queued_prompt_generation"] == 2
 
 
-
-
-
-
-
-
 def test_busy_interrupt_mode_ignores_completed_background_delegation(monkeypatch):
     """A terminal delegation must not suppress normal busy-turn interruption."""
     monkeypatch.setattr(server, "_load_busy_input_mode", lambda: "interrupt")
@@ -344,11 +414,11 @@ def test_busy_interrupt_mode_ignores_completed_background_delegation(monkeypatch
     assert session["queued_prompt"]["text"] == "continue"
 
 
-
-
 def test_busy_steer_mode_injects_when_accepted(monkeypatch):
     monkeypatch.setattr(server, "_load_busy_input_mode", lambda: "steer")
-    agent = types.SimpleNamespace(steer=lambda text: True, interrupt=lambda *a, **k: None)
+    agent = types.SimpleNamespace(
+        steer=lambda text: True, interrupt=lambda *a, **k: None
+    )
     session = _session(agent=agent, running=True)
 
     resp = server._handle_busy_submit("r1", "sid", session, "nudge", "ws-1")
@@ -358,6 +428,7 @@ def test_busy_steer_mode_injects_when_accepted(monkeypatch):
 
 
 # ── steer-mode burst preservation (#86134) ─────────────────────────────────
+
 
 def test_busy_steer_fallthrough_queues_without_interrupting(monkeypatch):
     """A steer-mode fall-through must keep queue semantics, never interrupt.
@@ -499,20 +570,12 @@ def test_busy_steer_fallthrough_burst_drains_all_texts_fifo(monkeypatch):
         assert text in joined, f"burst message dropped: {text!r}"
 
 
-
-
-
-
 def test_busy_helper_retries_when_turn_finished(monkeypatch):
     monkeypatch.setattr(server, "_load_busy_input_mode", lambda: "interrupt")
     session = _session(running=False)
 
     assert server._handle_busy_submit("r1", "sid", session, "run now", "ws-1") is None
     assert session.get("queued_prompt") is None
-
-
-
-
 
 
 def test_busy_interrupt_mode_queues_multimodal_payload_instead_of_redirect(monkeypatch):
@@ -559,11 +622,12 @@ def test_busy_submit_claims_attached_image_for_queued_turn(monkeypatch):
     assert redirected == []
     assert not interrupted.wait(0.1)
     assert session["attached_images"] == []
-    assert session["queued_prompt"] == {
-        "text": "is this B?",
-        "image_paths": ["/tmp/b.png"],
-        "transport": None,
-    }
+    queued = session["queued_prompt"]
+    assert queued["text"] == "is this B?"
+    assert queued["image_paths"] == ["/tmp/b.png"]
+    assert queued["request_id"] == "r1"
+    assert queued["origin_client_id"].startswith("legacy-transport-")
+    assert "transport" not in queued
 
 
 def test_busy_image_prompts_keep_b_and_c_attachments_in_submission_order(monkeypatch):
@@ -572,11 +636,18 @@ def test_busy_image_prompts_keep_b_and_c_attachments_in_submission_order(monkeyp
     monkeypatch.setattr(
         server,
         "_run_prompt_submit",
-        lambda rid, sid, _session, text, **kwargs: dispatched.append((rid, sid, text, kwargs)),
+        lambda rid, sid, _session, text, **kwargs: dispatched.append((
+            rid,
+            sid,
+            text,
+            kwargs,
+        )),
     )
     agent = types.SimpleNamespace(
         _supports_active_turn_redirect=True,
-        redirect=lambda _text: (_ for _ in ()).throw(AssertionError("images must queue")),
+        redirect=lambda _text: (_ for _ in ()).throw(
+            AssertionError("images must queue")
+        ),
         interrupt=lambda: None,
     )
     session = _session(agent=agent, running=True, attached_images=["/tmp/b.png"])
@@ -588,9 +659,12 @@ def test_busy_image_prompts_keep_b_and_c_attachments_in_submission_order(monkeyp
         server._methods["prompt.submit"]("c", {"session_id": "sid", "text": "C"})
 
         assert session["queued_prompt"]["image_paths"] == ["/tmp/b.png"]
-        assert session["queued_prompts"] == [
-            {"text": "C", "image_paths": ["/tmp/c.png"], "transport": None}
-        ]
+        queued_c = session["queued_prompts"][0]
+        assert queued_c["text"] == "C"
+        assert queued_c["image_paths"] == ["/tmp/c.png"]
+        assert queued_c["request_id"] == "c"
+        assert queued_c["origin_client_id"].startswith("legacy-transport-")
+        assert "transport" not in queued_c
 
         session["running"] = False
         assert server._drain_queued_prompt("drain-b", "sid", session) is True
@@ -599,29 +673,33 @@ def test_busy_image_prompts_keep_b_and_c_attachments_in_submission_order(monkeyp
     finally:
         server._sessions.pop("sid", None)
 
-    assert dispatched == [
-        (
-            "drain-b",
-            "sid",
-            "B",
-            {"image_paths": ["/tmp/b.png"], "queued_prompt_generation": 0},
-        ),
-        (
-            "drain-c",
-            "sid",
-            "C",
-            {"image_paths": ["/tmp/c.png"], "queued_prompt_generation": 0},
-        ),
+    assert [(rid, sid, text) for rid, sid, text, _ in dispatched] == [
+        ("drain-b", "sid", "B"),
+        ("drain-c", "sid", "C"),
     ]
+    for (_, _, _, kwargs), image, request_id in zip(
+        dispatched,
+        ("/tmp/b.png", "/tmp/c.png"),
+        ("b", "c"),
+        strict=True,
+    ):
+        assert kwargs["image_paths"] == [image]
+        assert kwargs["queued_prompt_generation"] == 0
+        assert kwargs["request_id"] == request_id
+        assert kwargs["origin_client_id"].startswith("legacy-transport-")
 
 
 # ── _drain_queued_prompt ───────────────────────────────────────────────────
 
+
 def test_drain_fires_queued_prompt_and_claims_running(monkeypatch):
     fired = {}
     monkeypatch.setattr(
-        server, "_run_prompt_submit",
-        lambda rid, sid, session, text, **kwargs: fired.update(rid=rid, sid=sid, text=text),
+        server,
+        "_run_prompt_submit",
+        lambda rid, sid, session, text, **kwargs: fired.update(
+            rid=rid, sid=sid, text=text
+        ),
     )
     session = _session(queued_prompt={"text": "go", "transport": "ws-9"})
 
@@ -638,13 +716,19 @@ def test_drain_compute_host_forwards_queued_image_paths(monkeypatch):
     monkeypatch.setattr(
         server,
         "_submit_prompt_to_compute_host",
-        lambda rid, sid, session, text, **kwargs: captured.update(
-            rid=rid, sid=sid, text=text, image_paths=kwargs.get("image_paths")
-        )
-        or {"result": {"status": "started"}},
+        lambda rid, sid, session, text, **kwargs: (
+            captured.update(
+                rid=rid, sid=sid, text=text, image_paths=kwargs.get("image_paths")
+            )
+            or {"result": {"status": "started"}}
+        ),
     )
     session = _session(
-        queued_prompt={"text": "inspect", "image_paths": ["/tmp/b.png"], "transport": "ws-9"}
+        queued_prompt={
+            "text": "inspect",
+            "image_paths": ["/tmp/b.png"],
+            "transport": "ws-9",
+        }
     )
 
     assert server._drain_queued_prompt("r1", "sid", session) is True
@@ -654,10 +738,6 @@ def test_drain_compute_host_forwards_queued_image_paths(monkeypatch):
         "text": "inspect",
         "image_paths": ["/tmp/b.png"],
     }
-
-
-
-
 
 
 def test_drain_preserves_queued_prompt_when_session_is_closing(monkeypatch):
@@ -681,6 +761,7 @@ def test_drain_preserves_queued_prompt_when_session_is_closing(monkeypatch):
 def test_drain_releases_running_on_dispatch_failure(monkeypatch):
     def _boom(*a, **k):
         raise RuntimeError("dispatch failed")
+
     monkeypatch.setattr(server, "_run_prompt_submit", _boom)
     session = _session(queued_prompt={"text": "go", "transport": None})
 
@@ -707,7 +788,9 @@ def test_drain_does_not_dispatch_a_prompt_cancelled_after_claim(monkeypatch):
     monkeypatch.setattr(
         server,
         "_run_prompt_submit",
-        lambda *args, **kwargs: (_ for _ in ()).throw(AssertionError("must not dispatch")),
+        lambda *args, **kwargs: (_ for _ in ()).throw(
+            AssertionError("must not dispatch")
+        ),
     )
 
     assert server._drain_queued_prompt("r1", "sid", session) is True
@@ -728,7 +811,9 @@ def test_drain_restores_claimed_prompt_when_generation_bumps_mid_claim(monkeypat
     monkeypatch.setattr(
         server,
         "_run_prompt_submit",
-        lambda *args, **kwargs: (_ for _ in ()).throw(AssertionError("must not dispatch")),
+        lambda *args, **kwargs: (_ for _ in ()).throw(
+            AssertionError("must not dispatch")
+        ),
     )
 
     assert server._drain_queued_prompt("r1", "sid", session) is True
@@ -772,11 +857,12 @@ def test_drain_continues_with_later_queued_prompt_after_dispatch_failure(monkeyp
     monkeypatch.setattr(server, "_run_prompt_submit", _run)
     session = _session(
         queued_prompt={"text": "broken", "transport": None},
-        queued_prompts=[{"text": "next", "image_paths": ["/tmp/next.png"], "transport": None}],
+        queued_prompts=[
+            {"text": "next", "image_paths": ["/tmp/next.png"], "transport": None}
+        ],
     )
 
     assert server._drain_queued_prompt("r1", "sid", session) is True
     assert calls == ["broken", "next"]
     assert session["queued_prompt"] is None
     assert session.get("queued_prompts") is None
-

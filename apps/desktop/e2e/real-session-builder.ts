@@ -35,6 +35,8 @@ export interface RealSessionTurn {
 }
 
 export interface RealSessionSpec {
+  /** Workspace used by the real gateway session. Defaults to the repository root. */
+  cwd?: string
   /** Session label. The durable row stores no title, so clients fall back to
    * the preview (the first 60 characters of the first user message). */
   title: string
@@ -107,7 +109,7 @@ export class RealSessionBuilder {
 
     const created = await this.request<CreatedSession>('session.create', {
       cols: 120,
-      cwd: REPO_ROOT,
+      cwd: spec.cwd ?? REPO_ROOT,
       source: 'desktop',
       title: spec.title,
     })

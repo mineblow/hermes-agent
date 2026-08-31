@@ -762,6 +762,23 @@ export function createGatewayEventHandler(ctx: GatewayEventHandlerContext): (ev:
         handleReady(ev.payload?.skin)
 
         return
+      case 'session.runtime_owner_lost': {
+        const sessionIds = Array.isArray(ev.payload?.session_ids) ? ev.payload.session_ids : []
+
+        const durableSessionIds = Array.isArray(ev.payload?.durable_session_ids)
+          ? ev.payload.durable_session_ids
+          : []
+
+        const index = sessionIds.findIndex((sessionId: unknown) => sessionId === sid)
+        const durableSessionId = index >= 0 ? durableSessionIds[index] : undefined
+
+        if (typeof durableSessionId === 'string' && durableSessionId) {
+          resumeById(durableSessionId)
+          patchUiState({ status: 'recovering session…' })
+        }
+
+        return
+      }
 
       case 'skin.changed':
         if (ev.payload) {

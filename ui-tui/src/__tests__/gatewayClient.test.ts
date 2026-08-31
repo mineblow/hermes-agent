@@ -160,6 +160,241 @@ describe('GatewayClient websocket attach mode', () => {
     gw.kill()
   })
 
+  it('maps owner loss to the durable id from a production session resume', async () => {
+    process.env.HERMES_TUI_GATEWAY_URL = 'ws://gateway.test/api/ws?token=abc'
+    const gw = new GatewayClient()
+    const events: any[] = []
+
+    gw.on('event', event => events.push(event))
+    gw.start()
+    gw.drain()
+    await Promise.resolve()
+    const socket = FakeWebSocket.instances[0]!
+    socket.open()
+
+    const resume = gw.request('session.resume', { session_id: 'stored-session' })
+    await vi.waitFor(() => expect(socket.sent).toHaveLength(1))
+    const request = JSON.parse(socket.sent[0] ?? '{}') as { id: string }
+    socket.message(JSON.stringify({
+      id: request.id,
+      jsonrpc: '2.0',
+      result: { session_id: 'live-session', session_key: 'stored-session', resumed: 'stored-session' }
+    }))
+    await resume
+
+    socket.message(JSON.stringify({
+      jsonrpc: '2.0',
+      method: 'event',
+      params: {
+        type: 'session.runtime_owner_lost',
+        payload: { session_ids: ['live-session'] }
+      }
+    }))
+
+    await vi.waitFor(() => expect(events.at(-1)?.payload).toEqual({
+      durable_session_ids: ['stored-session'],
+      session_ids: ['live-session']
+    }))
+    gw.kill()
+  })
+
+  it('maps owner loss to stored_session_id from a production session create', async () => {
+    process.env.HERMES_TUI_GATEWAY_URL = 'ws://gateway.test/api/ws?token=abc'
+    const gw = new GatewayClient()
+    const events: any[] = []
+
+    gw.on('event', event => events.push(event))
+    gw.start()
+    gw.drain()
+    await Promise.resolve()
+    const socket = FakeWebSocket.instances[0]!
+    socket.open()
+
+    const create = gw.request('session.create', {})
+    await vi.waitFor(() => expect(socket.sent).toHaveLength(1))
+    const request = JSON.parse(socket.sent[0] ?? '{}') as { id: string }
+    socket.message(JSON.stringify({
+      id: request.id,
+      jsonrpc: '2.0',
+      result: { session_id: 'live-created', stored_session_id: 'durable-created' }
+    }))
+    await create
+
+    socket.message(JSON.stringify({
+      jsonrpc: '2.0',
+      method: 'event',
+      params: {
+        type: 'session.runtime_owner_lost',
+        payload: { session_ids: ['live-created'] }
+      }
+    }))
+
+    await vi.waitFor(() => expect(events.at(-1)?.payload).toEqual({
+      durable_session_ids: ['durable-created'],
+      session_ids: ['live-created']
+    }))
+    gw.kill()
+  })
+
+  it('reconstructs durable sessions before readiness after runtime host takeover', async () => {
+    process.env.HERMES_TUI_GATEWAY_URL = 'ws://gateway.test/api/ws?token=abc'
+    const gw = new GatewayClient()
+    const events: any[] = []
+
+    gw.on('event', event => events.push(event))
+    gw.start()
+    gw.drain()
+    await Promise.resolve()
+    const first = FakeWebSocket.instances[0]!
+    first.open()
+
+    first.message(JSON.stringify({
+      jsonrpc: '2.0',
+      method: 'event',
+      params: {
+        type: 'gateway.ready',
+        payload: {
+          capabilities: ['client.attach'],
+          connection_id: 'connection-1',
+          replay_epoch: 'epoch-1',
+          runtime_host_id: 'host-1'
+        }
+      }
+    }))
+    await vi.waitFor(() => expect(first.sent).toHaveLength(1))
+    const firstAttach = JSON.parse(first.sent[0] ?? '{}') as { id: string }
+    first.message(JSON.stringify({ id: firstAttach.id, jsonrpc: '2.0', result: { ok: true } }))
+    await vi.waitFor(() => expect(events.filter(event => event.type === 'gateway.ready')).toHaveLength(1))
+
+    const create = gw.request('session.create', {})
+    await vi.waitFor(() => expect(first.sent).toHaveLength(2))
+    const createFrame = JSON.parse(first.sent[1] ?? '{}') as { id: string }
+    first.message(JSON.stringify({
+      id: createFrame.id,
+      jsonrpc: '2.0',
+      result: { session_id: 'live-old', stored_session_id: 'durable-session' }
+    }))
+    await create
+
+    gw.start()
+    gw.drain()
+    await Promise.resolve()
+    const second = FakeWebSocket.instances[1]!
+    second.open()
+    second.message(JSON.stringify({
+      jsonrpc: '2.0',
+      method: 'event',
+      params: {
+        type: 'gateway.ready',
+        payload: {
+          capabilities: ['client.attach'],
+          connection_id: 'connection-2',
+          replay_epoch: 'epoch-2',
+          runtime_host_id: 'host-2'
+        }
+      }
+    }))
+    await vi.waitFor(() => expect(second.sent).toHaveLength(1))
+    const secondAttach = JSON.parse(second.sent[0] ?? '{}') as { id: string }
+    second.message(JSON.stringify({ id: secondAttach.id, jsonrpc: '2.0', result: { ok: true } }))
+
+    await vi.waitFor(() => expect(second.sent).toHaveLength(2))
+
+    const resumeFrame = JSON.parse(second.sent[1] ?? '{}') as {
+      id: string
+      method: string
+      params: { session_id: string }
+    }
+
+    expect(resumeFrame).toMatchObject({
+      method: 'session.resume',
+      params: { session_id: 'durable-session' }
+    })
+    expect(events.filter(event => event.type === 'gateway.ready')).toHaveLength(1)
+
+    second.message(JSON.stringify({
+      id: resumeFrame.id,
+      jsonrpc: '2.0',
+      result: {
+        session_id: 'live-new',
+        session_key: 'durable-session',
+        resumed: 'durable-session'
+      }
+    }))
+
+    await vi.waitFor(() => expect(events.map(event => event.type).slice(-2)).toEqual([
+      'session.runtime_owner_lost',
+      'gateway.ready'
+    ]))
+    expect(events.at(-2)?.payload).toEqual({
+      durable_session_ids: ['durable-session'],
+      recovered_session_ids: ['live-new'],
+      session_ids: ['live-old']
+    })
+    gw.kill()
+  })
+
+  it('negotiates a stable TUI identity before publishing gateway readiness', async () => {
+    process.env.HERMES_TUI_GATEWAY_URL = 'ws://gateway.test/api/ws?token=abc'
+    const gw = new GatewayClient()
+    const events: string[] = []
+
+    gw.on('event', event => events.push(event.type))
+    gw.start()
+    gw.drain()
+    await Promise.resolve()
+    const gatewaySocket = FakeWebSocket.instances[0]!
+
+    gatewaySocket.open()
+    gatewaySocket.message(
+      JSON.stringify({
+        jsonrpc: '2.0',
+        method: 'event',
+        params: {
+          type: 'gateway.ready',
+          payload: {
+            capabilities: ['client.attach'],
+            connection_id: 'connection-1',
+            replay_epoch: 'epoch-1'
+          }
+        }
+      })
+    )
+
+    await vi.waitFor(() => expect(gatewaySocket.sent).toHaveLength(1))
+    expect(events).not.toContain('gateway.ready')
+
+    const attach = JSON.parse(gatewaySocket.sent[0] ?? '{}') as {
+      id: string
+      method: string
+      params: { client_id: string; protocol_version: number; surface: string }
+    }
+
+    expect(attach.method).toBe('client.attach')
+    expect(attach.params).toMatchObject({
+      client_id: expect.stringMatching(/^tui:/),
+      protocol_version: 1,
+      surface: 'tui'
+    })
+    gatewaySocket.message(
+      JSON.stringify({
+        id: attach.id,
+        jsonrpc: '2.0',
+        result: {
+          capabilities: ['session.observe', 'session.control', 'session.replay'],
+          client_id: attach.params.client_id,
+          connection_id: 'connection-1',
+          idempotent: false,
+          protocol_version: 1,
+          surface: 'tui'
+        }
+      })
+    )
+
+    await vi.waitFor(() => expect(events).toContain('gateway.ready'))
+    gw.kill()
+  })
+
   it('drains buffered events on a later microtask, not synchronously inside drain()', async () => {
     // Regression for #36658: in attach mode the already-running gateway
     // replays `gateway.ready` the instant the socket connects, so it lands in

@@ -16,19 +16,19 @@ _log = logging.getLogger(__name__)
 
 ATTACHMENT_QUEUE_MAX = 256
 _WORKER_JOIN_TIMEOUT_SECONDS = 11.0
+_DELIVERY_WAIT_TIMEOUT_SECONDS = 11.0
 
 _OBSERVE_CAPABILITIES = frozenset({"observe"})
-_CONTROL_CAPABILITIES = frozenset(
-    {
-        "observe",
-        "prompt.submit",
-        "session.steer",
-        "session.interrupt",
-        "approval.respond",
-        "clarify.respond",
-        "ui.respond",
-    }
-)
+_CONTROL_CAPABILITIES = frozenset({
+    "observe",
+    "prompt.submit",
+    "session.steer",
+    "session.interrupt",
+    "approval.respond",
+    "clarify.respond",
+    "ui.respond",
+})
+SUPPORTED_CAPABILITIES = _CONTROL_CAPABILITIES
 
 
 class AttachmentMode(str, Enum):
@@ -53,9 +53,9 @@ class AttachmentMode(str, Enum):
         return _OBSERVE_CAPABILITIES
 
 
-ATTACHMENT_MODES = MappingProxyType(
-    {mode.value: mode.capabilities for mode in AttachmentMode}
-)
+ATTACHMENT_MODES = MappingProxyType({
+    mode.value: mode.capabilities for mode in AttachmentMode
+})
 
 
 @dataclass(frozen=True)
@@ -71,10 +71,17 @@ class AttachmentSnapshot:
 
 
 @dataclass
+class _QueuedFrame:
+    frame: dict
+    delivered: Optional[threading.Event] = None
+    succeeded: bool = False
+
+
+@dataclass
 class _Attachment:
     transport: object
     snapshot: AttachmentSnapshot
-    events: queue.Queue[dict]
+    events: queue.Queue[_QueuedFrame]
     stopped: threading.Event
     worker: Optional[threading.Thread] = None
 
@@ -91,6 +98,7 @@ class SessionEventHub:
         self._registry_lock = threading.Lock()
         self._publication_lock = threading.Lock()
         self._attachments: dict[int, _Attachment] = {}
+        self._clients: dict[str, int] = {}
         self._retiring: dict[int, _Attachment] = {}
         self._closed = False
 
@@ -100,41 +108,66 @@ class SessionEventHub:
         *,
         client_id: str,
         mode: AttachmentMode,
+        capabilities: frozenset[str] | set[str] | None = None,
     ) -> AttachmentSnapshot:
-        """Attach once per transport, updating metadata on repeated calls."""
+        """Attach or reconnect one stable client to this live runtime."""
         parsed_mode = AttachmentMode.parse(mode)
+        granted = parsed_mode.capabilities
+        if capabilities is not None:
+            granted = granted.intersection(capabilities)
         snapshot = AttachmentSnapshot(
             client_id=str(client_id),
             mode=parsed_mode,
-            capabilities=parsed_mode.capabilities,
+            capabilities=granted,
         )
         key = id(transport)
+        replaced: _Attachment | None = None
         with self._publication_lock:
             with self._registry_lock:
                 if self._closed:
                     raise RuntimeError("session event hub is closed")
                 if key in self._retiring:
-                    raise RuntimeError("transport attachment cleanup is still in progress")
+                    raise RuntimeError(
+                        "transport attachment cleanup is still in progress"
+                    )
+
+                previous_key = self._clients.get(snapshot.client_id)
+                if previous_key is not None and previous_key != key:
+                    previous = self._attachments.pop(previous_key, None)
+                    if previous is not None:
+                        previous.stopped.set()
+                        self._retiring[previous_key] = previous
+                        replaced = previous
+
                 current = self._attachments.get(key)
                 if current is not None and current.transport is transport:
+                    previous_client_id = current.snapshot.client_id
+                    if self._clients.get(previous_client_id) == key:
+                        self._clients.pop(previous_client_id, None)
                     current.snapshot = snapshot
-                    return snapshot
+                    self._clients[snapshot.client_id] = key
+                else:
+                    attachment = _Attachment(
+                        transport=transport,
+                        snapshot=snapshot,
+                        events=queue.Queue(maxsize=ATTACHMENT_QUEUE_MAX),
+                        stopped=threading.Event(),
+                    )
+                    worker = threading.Thread(
+                        target=self._write_events,
+                        args=(attachment,),
+                        name=f"session-event-writer-{client_id}",
+                        daemon=True,
+                    )
+                    attachment.worker = worker
+                    self._attachments[key] = attachment
+                    self._clients[snapshot.client_id] = key
+                    worker.start()
 
-                attachment = _Attachment(
-                    transport=transport,
-                    snapshot=snapshot,
-                    events=queue.Queue(maxsize=ATTACHMENT_QUEUE_MAX),
-                    stopped=threading.Event(),
-                )
-                worker = threading.Thread(
-                    target=self._write_events,
-                    args=(attachment,),
-                    name=f"session-event-writer-{client_id}",
-                    daemon=True,
-                )
-                attachment.worker = worker
-                self._attachments[key] = attachment
-                worker.start()
+        if replaced is not None:
+            # Stable reconnect must not wait for a stale transport.write(). The
+            # retired writer owns generation-safe cleanup when it exits.
+            self._finish_detach(replaced, join=False)
         return snapshot
 
     def detach(self, transport: object) -> bool:
@@ -167,6 +200,7 @@ class SessionEventHub:
         frame: dict,
         *,
         prepare: Optional[Callable[[dict], None]] = None,
+        wait_for_delivery: bool = False,
     ) -> bool:
         """Prepare once, then enqueue private copies in one total order.
 
@@ -181,6 +215,7 @@ class SessionEventHub:
         # plain built-ins for the per-subscriber deepcopy below.
         normalized = json.loads(json.dumps(frame, ensure_ascii=False))
         overflowed: list[_Attachment] = []
+        queued: list[_QueuedFrame] = []
         enqueued = False
         with self._publication_lock:
             with self._registry_lock:
@@ -194,7 +229,12 @@ class SessionEventHub:
                 if attachment.stopped.is_set():
                     continue
                 try:
-                    attachment.events.put_nowait(copy.deepcopy(normalized))
+                    item = _QueuedFrame(
+                        frame=copy.deepcopy(normalized),
+                        delivered=threading.Event() if wait_for_delivery else None,
+                    )
+                    attachment.events.put_nowait(item)
+                    queued.append(item)
                     enqueued = True
                 except queue.Full:
                     removed = self._remove_registered(attachment.transport)
@@ -203,6 +243,14 @@ class SessionEventHub:
 
         for attachment in overflowed:
             self._finish_detach(attachment, join=False)
+        if wait_for_delivery:
+            for item in queued:
+                if item.delivered is None or not item.delivered.wait(
+                    timeout=_DELIVERY_WAIT_TIMEOUT_SECONDS
+                ):
+                    return False
+                if not item.succeeded:
+                    return False
         return enqueued
 
     def snapshots(self) -> list[dict]:
@@ -237,6 +285,7 @@ class SessionEventHub:
                     self._closed = True
                     attachments = list(self._attachments.values())
                     self._attachments.clear()
+                    self._clients.clear()
                     for attachment in attachments:
                         attachment.stopped.set()
                         self._retiring[id(attachment.transport)] = attachment
@@ -259,18 +308,31 @@ class SessionEventHub:
         try:
             while not attachment.stopped.is_set():
                 try:
-                    frame = attachment.events.get(timeout=0.05)
+                    item = attachment.events.get(timeout=0.05)
                 except queue.Empty:
                     continue
                 if attachment.stopped.is_set():
+                    if item.delivered is not None:
+                        item.delivered.set()
                     return
                 try:
-                    if attachment.transport.write(frame) is False:  # type: ignore[attr-defined]
+                    write_and_wait = getattr(
+                        attachment.transport, "write_and_wait", None
+                    )
+                    if item.delivered is not None and callable(write_and_wait):
+                        success = write_and_wait(item.frame)
+                    else:
+                        success = attachment.transport.write(item.frame)  # type: ignore[attr-defined]
+                    if success is False:
                         raise ConnectionError("transport write returned false")
+                    item.succeeded = True
                 except Exception as exc:
                     _log.debug("session attachment writer failed: %s", exc)
                     self._detach_failed_attachment(attachment)
                     return
+                finally:
+                    if item.delivered is not None:
+                        item.delivered.set()
         finally:
             # The writer itself owns deferred cleanup. This avoids creating a
             # second thread that waits forever when transport.write() is
@@ -293,6 +355,9 @@ class SessionEventHub:
             if attachment is None or attachment.transport is not transport:
                 return None
             del self._attachments[key]
+            client_id = attachment.snapshot.client_id
+            if self._clients.get(client_id) == key:
+                del self._clients[client_id]
             attachment.stopped.set()
             self._retiring[key] = attachment
             return attachment

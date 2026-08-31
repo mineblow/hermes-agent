@@ -12,10 +12,12 @@ import {
   writeMockProviderConfig,
 } from './fixtures'
 import { startMockServer } from './mock-server'
+import { RealSessionBuilder } from './real-session-builder'
 import { expect, test } from './test'
 import { expectVisualSnapshot } from './visual-snapshot'
 
 const BRANCH_NAME = 'e2e-composer-branch'
+const SESSION_TITLE = 'E2E Worktree Branch Status'
 
 /**
  * Enough branches to make both the base-branch popover and the convert-branch
@@ -54,9 +56,10 @@ function createGitRepo(root: string): string {
   return repo
 }
 
-function configureRepoCwd(hermesHome: string, mockUrl: string, repo: string): void {
+function configureRepoCwd(hermesHome: string, userDataDir: string, mockUrl: string, repo: string): void {
   writeMockProviderConfig(hermesHome, mockUrl)
   fs.appendFileSync(path.join(hermesHome, 'config.yaml'), `\nterminal:\n  cwd: ${repo}\n`, 'utf8')
+  fs.writeFileSync(path.join(userDataDir, 'project-dir.json'), JSON.stringify({ dir: repo }, null, 2), 'utf8')
   writeEnvFile(hermesHome)
 }
 
@@ -84,7 +87,18 @@ test.beforeAll(async () => {
   const repo = createGitRepo(sandbox.root)
   const mock = await startMockServer()
 
-  configureRepoCwd(sandbox.hermesHome, mock.url, repo)
+  configureRepoCwd(sandbox.hermesHome, sandbox.userDataDir, mock.url, repo)
+
+  const builder = await RealSessionBuilder.start(sandbox.hermesHome)
+  try {
+    await builder.createSession({
+      cwd: repo,
+      title: SESSION_TITLE,
+      turns: ['create a repo-backed e2e session'],
+    })
+  } finally {
+    await builder.close()
+  }
 
   const { app, page } = await launchDesktop(buildAppEnv(sandbox))
   fixture = {
@@ -102,18 +116,11 @@ test.beforeAll(async () => {
 
   await waitForAppReady(fixture, 120_000)
 
-  // The coding rail, and thus the ⌘⇧B worktree dialog, mounts only after the
-  // session resolves a cwd that holds a repo. This happens on the first turn.
-  const composer = page.locator('[contenteditable="true"]').first()
-  await composer.click()
-  await composer.type('create a repo-backed e2e session', { delay: 2 })
-  await page.keyboard.press('Enter')
-  await page.waitForFunction(
-    prompt => (document.querySelector('[data-slot="aui_thread-viewport"]')?.textContent ?? '').includes(prompt),
-    'create a repo-backed e2e session',
-    { timeout: 15_000 },
-  )
-  await expect(page.locator('.coding-status-bar')).toContainText('main')
+  // Resume a real session whose durable gateway metadata is pinned to the repo.
+  const sessionRow = page.locator('[data-slot="sidebar"] button').filter({ hasText: SESSION_TITLE }).first()
+  await sessionRow.click()
+  await expect(page.getByText('create a repo-backed e2e session', { exact: true })).toBeVisible({ timeout: 30_000 })
+  await expect(page.locator('.coding-status-bar')).toContainText('main', { timeout: 30_000 })
 })
 
 test.afterAll(async () => {
@@ -205,6 +212,7 @@ test('creating a branch with ctrl-shift-b updates the composer git-status branch
 
   await page.getByRole('button', { name: 'New worktree' }).click()
 
+  await expect(page.getByText('create a repo-backed e2e session', { exact: true })).toHaveCount(0, { timeout: 15_000 })
   await expect(codingRow).toContainText(BRANCH_NAME, { timeout: 15_000 })
 
   // The dialog must close and stay closed. No empty second dialog can remain

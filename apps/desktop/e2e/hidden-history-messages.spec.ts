@@ -140,6 +140,15 @@ test('live verify-on-stop continuations stay out of the transcript', async ({}, 
     ).toBe(true)
     expect(fs.existsSync(changedFile), 'The scripted write_file call should edit only the sandbox project').toBe(true)
     await expect(transcript).not.toContainText('[System: You edited code in this turn')
+
+    // The verification trigger remains in history. After the scripted
+    // continuation is exhausted, a later streamed turn must route normally.
+    const followUp = 'E2E normal follow-up after verification script'
+    await composer.click()
+    await composer.type(followUp)
+    await page.keyboard.press('Enter')
+    await expect(transcript).toContainText(MOCK_REPLY, { timeout: 30_000 })
+    expect(mock.receivedPrompts).toContain(followUp)
     await page.screenshot({ path: testInfo.outputPath('live-verification-nudge.png') })
   } finally {
     await fixture.cleanup()

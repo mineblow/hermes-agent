@@ -47,15 +47,35 @@ export {
   DATA_URL_READ_MIN_MAX_MB
 } from './data-url-read-max'
 export {
+  type AttachmentCapability,
+  type AttachmentMode,
+  type ClientAttachParams,
+  type ClientAttachResult,
+  type ClientCapability,
   type ConnectionState,
+  type DurableResyncReason,
+  type DurableResyncRequest,
+  type GatewayClientIdStorage,
   type GatewayClientOptions,
   type GatewayEvent,
   type GatewayEventName,
+  type GatewayReadyPayload,
   type GatewayRequestId,
+  getOrCreateGatewayClientId,
   type JsonRpcErrorPayload,
   type JsonRpcFrame,
   JsonRpcGatewayClient,
   JsonRpcGatewayError,
+  type MultiClientMethod,
+  type SessionAttachmentSnapshot,
+  type SessionAttachmentsParams,
+  type SessionAttachmentsResult,
+  type SessionAttachParams,
+  type SessionAttachResult,
+  type SessionDetachParams,
+  type SessionDetachResult,
+  type SessionEventsSinceParams,
+  type SessionEventsSinceResult,
   type WebSocketLike
 } from './json-rpc-gateway'
 export { skillInvocationText } from './skill-scaffold'

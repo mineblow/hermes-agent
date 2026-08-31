@@ -1515,6 +1515,27 @@ describe('createGatewayEventHandler', () => {
     ).toBe(false)
   })
 
+  it('rehydrates the active TUI session from durable identity after runtime owner loss', () => {
+    const appended: Msg[] = []
+    const ctx = buildCtx(appended)
+    const resumeById = vi.fn()
+    ctx.session.resumeById = resumeById
+    const onEvent = createGatewayEventHandler(ctx)
+
+    patchUiState({ sid: 'live-session' })
+    onEvent({
+      payload: {
+        durable_session_ids: ['stored-session'],
+        session_ids: ['live-session']
+      },
+      type: 'session.runtime_owner_lost'
+    } as any)
+
+    expect(resumeById).toHaveBeenCalledOnce()
+    expect(resumeById).toHaveBeenCalledWith('stored-session')
+    expect(getUiState().status).toBe('recovering session…')
+  })
+
   it('persists an abandoned (timed-out) clarify into the transcript when the clarify tool completes', () => {
     const appended: Msg[] = []
     const onEvent = createGatewayEventHandler(buildCtx(appended))

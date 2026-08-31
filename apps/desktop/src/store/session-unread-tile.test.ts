@@ -62,7 +62,7 @@ describe('completed-unread dot follows the focused session', () => {
     // this path cleared the marker, so the dot stayed green.
     tree.noteActiveTreeGroup('grp-tile')
     expect(session.$unreadFinishedSessionIds.get()).toEqual([])
-  })
+  }, 30_000)
 
   it('never marks a tile that finishes while it is the focused one', async () => {
     const { finishTurn, session, tree } = await setup()

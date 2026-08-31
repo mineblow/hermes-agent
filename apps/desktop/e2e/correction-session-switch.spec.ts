@@ -13,6 +13,8 @@ import { type MockBackendFixture, setupMockBackend, waitForAppReady } from './fi
 import { CORRECTION_SWITCH_TRIGGER, MOCK_REPLY } from './mock-server'
 
 const OTHER_SESSION_PROMPT = 'E2E persisted session used for a warm resume.'
+const OTHER_SESSION_TITLE = MOCK_REPLY.replace(/\.$/, '')
+const CURRENT_SESSION_TITLE = `${OTHER_SESSION_TITLE} #2`
 const ORIGINAL_PROMPT = `${CORRECTION_SWITCH_TRIGGER}: original prompt must remain singular after a correction.`
 const CORRECTION = 'E2E correction must stay after the original prompt.'
 const TOOL_STARTED = 'Checking the long-running task before I continue.'
@@ -20,6 +22,7 @@ const CORRECTED_REPLY = 'The corrected task finished.'
 const INFERENCE_SWITCH_TRIGGER = 'E2E_INFERENCE_SWITCH_TRIGGER'
 const INFERENCE_PROMPT = `${INFERENCE_SWITCH_TRIGGER}: original inference prompt must remain singular.`
 const INFERENCE_CORRECTION = `${INFERENCE_SWITCH_TRIGGER}: correction sent while inference is live.`
+const POST_CORRECTION_FOLLOW_UP = 'E2E normal follow-up after correction script'
 
 // Inactive tabs stay mounted under a data-pane-hidden ancestor. Match the
 // renderer's keep-alive visibility policy instead of relying on DOM order.
@@ -130,23 +133,18 @@ async function openFreshDraft(page: Page, priorSessionText: string): Promise<voi
 }
 
 async function openSidebarSession(page: Page, sidebarText: string, expectedTranscriptText: string): Promise<void> {
-  const row = page.locator('[data-slot="sidebar"] button').filter({ hasText: sidebarText }).first()
+  const row = page.locator('[data-slot="sidebar"] button').filter({ hasText: sidebarText }).last()
   await row.waitFor({ state: 'visible', timeout: 30_000 })
   await row.click()
   await waitForTranscriptText(page, expectedTranscriptText)
 }
 
 async function reopenOriginalSession(page: Page): Promise<void> {
-  // A still-running tool has not generated a final title yet, so the sidebar
-  // retains the source prompt as its provisional session title.
-  await openSidebarSession(page, ORIGINAL_PROMPT, ORIGINAL_PROMPT)
+  await openSidebarSession(page, CURRENT_SESSION_TITLE, ORIGINAL_PROMPT)
 }
 
 async function reopenInferenceSession(page: Page): Promise<void> {
-  const row = page.locator('[data-slot="sidebar"] button').filter({ hasText: INFERENCE_PROMPT }).first()
-  await row.waitFor({ state: 'visible', timeout: 30_000 })
-  await row.click()
-  await waitForTranscriptText(page, INFERENCE_PROMPT)
+  await openSidebarSession(page, CURRENT_SESSION_TITLE, INFERENCE_PROMPT)
 }
 
 function relevantOrder(messages: string[]): string[] {
@@ -209,7 +207,7 @@ test.describe('correction session switch', () => {
 
     // Reproduce the observed race: switch to another persisted session while
     // the foreground tool is live, then return before its redirect settles.
-    await openSidebarSession(page, MOCK_REPLY, OTHER_SESSION_PROMPT)
+    await openSidebarSession(page, OTHER_SESSION_TITLE, OTHER_SESSION_PROMPT)
     await reopenOriginalSession(page)
     await page.waitForTimeout(500)
     await page.screenshot({ path: testInfo.outputPath('correction-after-warm-resume.png') })
@@ -220,6 +218,11 @@ test.describe('correction session switch', () => {
 
     await waitForTranscriptText(page, CORRECTED_REPLY)
     expect(steerTurnOrder(await transcriptMessageOrder(page))).toEqual([ORIGINAL_PROMPT, CORRECTION, CORRECTED_REPLY])
+
+    // Historical correction markers remain in the request. Once every
+    // scripted turn is consumed, a new streamed prompt must route normally.
+    await send(page, POST_CORRECTION_FOLLOW_UP)
+    await waitForTranscriptText(page, MOCK_REPLY)
   })
 
   test('keeps an inference-time correction visible through a warm session switch', async ({}, testInfo: TestInfo) => {
@@ -236,7 +239,7 @@ test.describe('correction session switch', () => {
     await send(page, INFERENCE_CORRECTION)
     await waitForTranscriptText(page, INFERENCE_CORRECTION)
 
-    await openSidebarSession(page, MOCK_REPLY, OTHER_SESSION_PROMPT)
+    await openSidebarSession(page, OTHER_SESSION_TITLE, OTHER_SESSION_PROMPT)
     await reopenInferenceSession(page)
 
     expect(await textNodeOccurrences(page, INFERENCE_PROMPT)).toBe(1)

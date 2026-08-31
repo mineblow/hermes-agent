@@ -31,7 +31,8 @@ class RecordingTransport:
     def wait_for_count(self, count: int) -> None:
         with self._condition:
             assert self._condition.wait_for(
-                lambda: len(self.frames) >= count, timeout=5,
+                lambda: len(self.frames) >= count,
+                timeout=5,
             ), f"transport received fewer than {count} frames"
 
 
@@ -60,22 +61,21 @@ def test_attachment_modes_parse_and_reject_invalid_values():
 
 def test_capabilities_are_immutable_and_match_protocol_contract():
     assert AttachmentMode.OBSERVE.capabilities == frozenset({"observe"})
-    assert AttachmentMode.CONTROL.capabilities == frozenset(
-        {
-            "observe",
-            "prompt.submit",
-            "session.steer",
-            "session.interrupt",
-            "approval.respond",
-            "clarify.respond",
-            "ui.respond",
-        }
-    )
+    assert AttachmentMode.CONTROL.capabilities == frozenset({
+        "observe",
+        "prompt.submit",
+        "session.steer",
+        "session.interrupt",
+        "approval.respond",
+        "clarify.respond",
+        "ui.respond",
+    })
     assert isinstance(AttachmentMode.CONTROL.capabilities, frozenset)
 
     supplied_capabilities = {"observe"}
     snapshot = AttachmentSnapshot(
-        client_id="client", mode=AttachmentMode.OBSERVE,
+        client_id="client",
+        mode=AttachmentMode.OBSERVE,
         capabilities=supplied_capabilities,  # type: ignore[arg-type]
     )
     supplied_capabilities.add("mutated")
@@ -89,10 +89,14 @@ def test_attach_is_idempotent_and_updates_mode_without_duplicate_delivery():
     transport = RecordingTransport()
     try:
         first = hub.attach(
-            transport, client_id="client-a", mode=AttachmentMode.OBSERVE,
+            transport,
+            client_id="client-a",
+            mode=AttachmentMode.OBSERVE,
         )
         second = hub.attach(
-            transport, client_id="client-a", mode=AttachmentMode.CONTROL,
+            transport,
+            client_id="client-a",
+            mode=AttachmentMode.CONTROL,
         )
 
         assert first.mode is AttachmentMode.OBSERVE
@@ -147,6 +151,31 @@ def test_publish_copies_one_frame_per_subscriber_and_returns_before_delivery():
         hub.close()
 
 
+def test_publish_can_wait_until_every_transport_write_completes():
+    hub = SessionEventHub()
+    blocked = BlockingTransport()
+    completed = threading.Event()
+
+    def publish() -> None:
+        assert hub.publish({"event": "resolved"}, wait_for_delivery=True) is True
+        completed.set()
+
+    try:
+        hub.attach(blocked, client_id="blocked", mode=AttachmentMode.OBSERVE)
+        worker = threading.Thread(target=publish)
+        worker.start()
+        _wait(blocked.written, "blocking writer was not entered")
+        assert not completed.is_set()
+        blocked.release.set()
+        _wait(completed, "synchronous publication did not acknowledge delivery")
+        worker.join(timeout=5)
+        assert not worker.is_alive()
+        assert blocked.frames == [{"event": "resolved"}]
+    finally:
+        blocked.release.set()
+        hub.close()
+
+
 def test_concurrent_publishers_have_one_identical_delivery_order():
     hub = SessionEventHub()
     left = RecordingTransport()
@@ -163,8 +192,7 @@ def test_concurrent_publishers_have_one_identical_delivery_order():
         hub.attach(left, client_id="left", mode=AttachmentMode.OBSERVE)
         hub.attach(right, client_id="right", mode=AttachmentMode.OBSERVE)
         workers = [
-            threading.Thread(target=publish, args=(source,))
-            for source in ("a", "b")
+            threading.Thread(target=publish, args=(source,)) for source in ("a", "b")
         ]
         for worker in workers:
             worker.start()
@@ -210,8 +238,7 @@ def test_prepare_runs_inside_the_total_publication_order_before_fanout():
         hub.attach(left, client_id="left", mode=AttachmentMode.OBSERVE)
         hub.attach(right, client_id="right", mode=AttachmentMode.OBSERVE)
         workers = [
-            threading.Thread(target=publish, args=(source,))
-            for source in ("a", "b")
+            threading.Thread(target=publish, args=(source,)) for source in ("a", "b")
         ]
         for worker in workers:
             worker.start()
@@ -225,6 +252,69 @@ def test_prepare_runs_inside_the_total_publication_order_before_fanout():
 
         assert left.frames == right.frames
         assert [frame["seq"] for frame in left.frames] == list(range(1, 41))
+    finally:
+        hub.close()
+
+
+def test_reconnect_does_not_wait_for_blocked_stale_writer():
+    hub = SessionEventHub()
+    stale = BlockingTransport()
+    replacement = RecordingTransport()
+    attach_done = threading.Event()
+    attach_error = []
+    try:
+        hub.attach(stale, client_id="stable-blocked", mode=AttachmentMode.OBSERVE)
+        assert hub.publish({"event": "block-stale"})
+        _wait(stale.written, "stale transport did not enter write")
+
+        def reconnect() -> None:
+            try:
+                hub.attach(
+                    replacement,
+                    client_id="stable-blocked",
+                    mode=AttachmentMode.CONTROL,
+                )
+            except Exception as exc:
+                attach_error.append(exc)
+            finally:
+                attach_done.set()
+
+        worker = threading.Thread(target=reconnect)
+        worker.start()
+        assert attach_done.wait(timeout=1), "reconnect waited for stale writer shutdown"
+        assert attach_error == []
+        assert hub.has_transport(replacement)
+        stale.release.set()
+        worker.join(timeout=5)
+    finally:
+        stale.release.set()
+        hub.close()
+
+
+def test_reconnect_replaces_transport_by_stable_client_id():
+    cleaned = []
+    cleanup_done = threading.Event()
+
+    def cleanup(transport: object) -> None:
+        cleaned.append(transport)
+        cleanup_done.set()
+
+    hub = SessionEventHub(on_detach=cleanup)
+    stale = RecordingTransport()
+    replacement = RecordingTransport()
+    try:
+        hub.attach(stale, client_id="stable-window", mode=AttachmentMode.OBSERVE)
+        hub.attach(replacement, client_id="stable-window", mode=AttachmentMode.CONTROL)
+
+        assert hub.count() == 1
+        assert hub.has_transport(stale) is False
+        assert hub.has_transport(replacement) is True
+        _wait(cleanup_done, "stale reconnect generation was not cleaned up")
+        assert cleaned == [stale]
+        assert hub.publish({"event": "after-reconnect"})
+        replacement.wait_for_count(1)
+        assert stale.frames == []
+        assert replacement.frames == [{"event": "after-reconnect"}]
     finally:
         hub.close()
 
@@ -385,7 +475,8 @@ def test_detach_and_close_stop_workers_and_are_idempotent():
     assert hub.count() == 0
     assert hub.publish({"ignored": True}) is False
     assert not any(
-        thread.is_alive() and thread.name.startswith("session-event-writer-worker-cleanup")
+        thread.is_alive()
+        and thread.name.startswith("session-event-writer-worker-cleanup")
         for thread in threading.enumerate()
     )
 
@@ -407,6 +498,27 @@ def test_writes_do_not_hold_registry_or_publication_locks():
         hub.attach(transport, client_id="reentrant", mode=AttachmentMode.CONTROL)
         assert hub.publish({"event": 1})
         _wait(reentered, "transport write blocked on a hub lock")
+    finally:
+        hub.close()
+
+
+def test_capability_lookup_is_bound_to_attached_transport():
+    hub = SessionEventHub()
+    observer = RecordingTransport()
+    controller = RecordingTransport()
+    stranger = RecordingTransport()
+    try:
+        hub.attach(observer, client_id="observer", mode=AttachmentMode.OBSERVE)
+        hub.attach(controller, client_id="controller", mode=AttachmentMode.CONTROL)
+
+        observer_capabilities = hub.require(observer, "observe")
+        controller_capabilities = hub.require(controller, "prompt.submit")
+        assert observer_capabilities is None
+        assert controller_capabilities is None
+        with pytest.raises(PermissionError, match="requires capability"):
+            hub.require(observer, "prompt.submit")
+        with pytest.raises(PermissionError, match="not attached"):
+            hub.require(stranger, "observe")
     finally:
         hub.close()
 

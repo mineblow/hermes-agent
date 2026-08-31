@@ -123,7 +123,9 @@ test.describe('sidebar states — subagent and background dot coexist', () => {
 
   test.beforeAll(async () => {
     restartMockServer()
-    fixture = await setupMockBackend()
+    fixture = await setupMockBackend({
+      extraConfig: 'approvals:\n  mode: off',
+    })
     await waitForAppReady(fixture, 120_000)
   })
 
@@ -190,6 +192,7 @@ test.describe('sidebar states — cross-session dot transition', () => {
   test.beforeAll(async () => {
     restartMockServer()
     fixture = await setupMockBackend({
+      extraConfig: 'approvals:\n  mode: off',
       mockServer: { backgroundReleasePath: bgRelease.path },
     })
     await waitForAppReady(fixture, 120_000)

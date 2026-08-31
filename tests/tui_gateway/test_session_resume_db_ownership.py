@@ -100,7 +100,9 @@ def profile_dbs(monkeypatch, tmp_path):
     monkeypatch.setattr(server, "_enable_gateway_prompts", lambda: None)
     monkeypatch.setattr(server, "_find_live_session_by_key", lambda _key: None)
     monkeypatch.setattr(server, "_schedule_agent_build", lambda *a, **k: None)
-    monkeypatch.setattr(server, "_schedule_session_cap_enforcement", lambda *a, **k: None)
+    monkeypatch.setattr(
+        server, "_schedule_session_cap_enforcement", lambda *a, **k: None
+    )
     monkeypatch.setattr(server, "_maybe_schedule_auto_continue", lambda *a, **k: None)
     monkeypatch.setattr(server, "_default_session_cwd", lambda *a, **k: str(tmp_path))
     known = set(server._sessions)
@@ -111,9 +113,11 @@ def profile_dbs(monkeypatch, tmp_path):
 
 
 def _resume(**params):
-    return server.handle_request(
-        {"id": "1", "method": "session.resume", "params": params}
-    )
+    return server.handle_request({
+        "id": "1",
+        "method": "session.resume",
+        "params": params,
+    })
 
 
 def test_resume_closes_profile_db_when_session_not_found(profile_dbs):
@@ -171,11 +175,13 @@ def test_resume_closes_profile_db_on_live_session_fast_path(profile_dbs, monkeyp
     live_session = {}
     with server._sessions_lock:
         server._sessions["live-sid"] = live_session
-    monkeypatch.setattr(
-        server,
-        "_find_live_session_by_key",
-        lambda _key: ("live-sid", live_session),
-    )
+    runtime_lookups = []
+
+    def _find_runtime(runtime_key, profile_home=None):
+        runtime_lookups.append((runtime_key, profile_home))
+        return "live-sid", live_session
+
+    monkeypatch.setattr(server, "_find_live_session_by_runtime_key", _find_runtime)
     monkeypatch.setattr(
         server,
         "_live_session_payload",
@@ -186,6 +192,7 @@ def test_resume_closes_profile_db_on_live_session_fast_path(profile_dbs, monkeyp
     resp = _resume(session_id="s1", profile="work")
 
     assert resp["result"]["resumed"] == "s1"
+    assert runtime_lookups and runtime_lookups[0][0] == "s1"
     assert profile_dbs[0].closed == 1
 
 
@@ -241,9 +248,7 @@ def test_resume_hands_profile_db_to_deferred_history_worker(profile_dbs, monkeyp
     monkeypatch.setattr(server, "_start_agent_build", lambda *_args, **_kwargs: None)
 
     try:
-        resp = _resume(
-            session_id="s1", profile="work", defer_history=True
-        )
+        resp = _resume(session_id="s1", profile="work", defer_history=True)
         sid = resp["result"]["session_id"]
         db = profile_dbs[0]
         assert history_started.wait(timeout=1.0)
@@ -257,7 +262,9 @@ def test_resume_hands_profile_db_to_deferred_history_worker(profile_dbs, monkeyp
         release_history.set()
 
 
-def test_resume_keeps_profile_db_open_after_ownership_transfer(profile_dbs, monkeypatch):
+def test_resume_keeps_profile_db_open_after_ownership_transfer(
+    profile_dbs, monkeypatch
+):
     """A COMPLETED resume transfers the handle to the agent — do not close it.
 
     Guards the other direction: closing here would hand the live session a dead
@@ -374,9 +381,7 @@ def test_resume_eager_never_transfers_shared_launch_db(profile_dbs, monkeypatch)
     monkeypatch.setattr(server, "_init_session", _fake_init_session)
     monkeypatch.setattr(server, "_set_session_context", lambda _target: [])
     monkeypatch.setattr(server, "_clear_session_context", lambda _tokens: None)
-    monkeypatch.setattr(
-        server, "_stored_session_runtime_overrides", lambda _found: {}
-    )
+    monkeypatch.setattr(server, "_stored_session_runtime_overrides", lambda _found: {})
     monkeypatch.setattr(server, "_session_info", lambda agent, *a: {"model": "test"})
 
     resp = _resume(session_id="s1", eager_build=True)

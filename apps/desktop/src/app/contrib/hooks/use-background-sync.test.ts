@@ -77,6 +77,7 @@ function makeRefresh(resolveSession: ActiveTranscriptRefreshDeps['resolveSession
     reconcileActiveTranscript({
       activeSessionIdRef,
       busyRef,
+      getSessionState: sessionId => states.get(sessionId),
       requestSequenceRef,
       resolveSession,
       selectedStoredSessionIdRef,
@@ -260,6 +261,47 @@ describe('active transcript refresh', () => {
     // Behavior assertions:
     expect(updaterCallCount).toBeGreaterThan(0)
     expect(getLatestSessionMessages).toHaveBeenCalledWith(TILE_STORED_ID)
+  })
+
+  it('preserves an accepted correction when a hidden tile refreshes from lagging persisted history', async () => {
+    const runtimeId = 'runtime-correction-tile'
+    const storedId = 'stored-correction-tile'
+    const state = createClientSessionState(storedId)
+    state.messages = [
+      { id: 'stored-user', role: 'user', parts: [{ type: 'text', text: 'original prompt' }] },
+      {
+        id: 'assistant-stream-before-correction',
+        role: 'assistant',
+        parts: [{ type: 'text', text: 'work already shown' }],
+        interim: true
+      },
+      { id: 'user-correction', role: 'user', parts: [{ type: 'text', text: 'accepted correction' }] }
+    ]
+    const states = new Map([[runtimeId, state]])
+
+    vi.mocked(getLatestSessionMessages).mockResolvedValue({
+      messages: [{ content: 'original prompt', role: 'user', timestamp: 1 }],
+      session_id: storedId
+    } as never)
+
+    await reconcileTileTranscriptsForTest({
+      tiles: [{ runtimeId, storedSessionId: storedId }],
+      busyRef: { current: false },
+      requestSequenceRef: { current: 0 },
+      signatureRef: { current: new Map<string, string>() },
+      updateSessionState: (sessionId, updater) => {
+        const next = updater(states.get(sessionId) ?? createClientSessionState(storedId))
+        states.set(sessionId, next)
+
+        return next
+      }
+    })
+
+    expect(states.get(runtimeId)?.messages.map(message => message.parts[0])).toEqual([
+      expect.objectContaining({ text: 'original prompt' }),
+      expect.objectContaining({ text: 'work already shown' }),
+      expect.objectContaining({ text: 'accepted correction' })
+    ])
   })
 
   it('skips the tile fetch entirely when nothing changed (signature-gated)', async () => {
@@ -530,6 +572,46 @@ describe('reconcileActiveTranscript', () => {
     expect(fixture.updateSessionState).toHaveBeenCalledTimes(1)
   })
 
+  it('keeps the completed live final when durable tool history contains pre-tool commentary', async () => {
+    const fixture = makeRefresh()
+    fixture.state.messages = [
+      { id: 'user-live', parts: [{ text: 'question', type: 'text' }], role: 'user' },
+      {
+        completedAt: 4,
+        id: 'assistant-stream-live',
+        parts: [
+          { result: 'done', toolCallId: 'call-1', toolName: 'todo', type: 'tool-call' },
+          { text: 'Final answer.', type: 'text' }
+        ],
+        pending: false,
+        role: 'assistant'
+      }
+    ]
+    vi.mocked(getLatestSessionMessages).mockResolvedValue({
+      messages: [
+        { content: 'question', id: 1, role: 'user', timestamp: 1 },
+        {
+          content: 'First I will check.',
+          id: 2,
+          role: 'assistant',
+          timestamp: 2,
+          tool_calls: [{ function: { arguments: '{}', name: 'todo' }, id: 'call-1' }]
+        },
+        { content: 'done', role: 'tool', timestamp: 3, tool_call_id: 'call-1', tool_name: 'todo' },
+        { content: 'Final answer.', id: 3, role: 'assistant', timestamp: 4 }
+      ],
+      session_id: ACTIVE_STORED_ID
+    } as never)
+
+    await fixture.refresh()
+
+    const assistant = fixture.states.get(ACTIVE_RUNTIME_ID)?.messages.at(-1)
+
+    expect(assistant?.parts.map(part => part.type)).toEqual(['tool-call', 'text'])
+    expect(assistant?.parts.find(part => part.type === 'text')?.text).toBe('Final answer.')
+    expect(assistant?.rowId).toBe(2)
+  })
+
   it('preserves a local assistant error while hydrating authoritative messages', async () => {
     const fixture = makeRefresh()
     fixture.state.messages = [
@@ -575,6 +657,34 @@ describe('reconcileActiveTranscript', () => {
 
     expect(fixture.updateSessionState).not.toHaveBeenCalled()
   })
+
+  it('discards stored history when the live transcript changes in flight', async () => {
+    const fixture = makeRefresh()
+    let resolve: ((value: unknown) => void) | undefined
+    vi.mocked(getLatestSessionMessages).mockReturnValueOnce(
+      new Promise(currentResolve => {
+        resolve = currentResolve
+      }) as never
+    )
+
+    const request = fixture.refresh()
+
+    const completedMessages = [
+      { id: 'live-user', parts: [{ text: 'question', type: 'text' as const }], role: 'user' as const },
+      {
+        id: 'live-assistant',
+        parts: [{ text: 'authoritative final', type: 'text' as const }],
+        role: 'assistant' as const
+      }
+    ]
+
+    fixture.state.messages = completedMessages
+    resolve?.(transcript('stale streamed commentary'))
+    await request
+
+    expect(fixture.states.get(ACTIVE_RUNTIME_ID)?.messages).toBe(completedMessages)
+  })
+
 })
 
 describe('windowIsActivelyViewed', () => {

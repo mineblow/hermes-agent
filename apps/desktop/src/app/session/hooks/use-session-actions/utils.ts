@@ -78,6 +78,38 @@ function isLiveTailRow(message: ChatMessage): boolean {
   )
 }
 
+function settledLiveToolTimelineSupersedes(authoritative: ChatMessage, local: ChatMessage): boolean {
+  if (
+    authoritative.role !== 'assistant' ||
+    local.role !== 'assistant' ||
+    local.pending === true ||
+    local.completedAt === undefined ||
+    local.error
+  ) {
+    return false
+  }
+
+  const authoritativeToolIds = authoritative.parts.flatMap(part =>
+    part.type === 'tool-call' ? [part.toolCallId] : []
+  )
+
+  const localToolIds = local.parts.flatMap(part => (part.type === 'tool-call' ? [part.toolCallId] : []))
+
+  if (
+    localToolIds.length === 0 ||
+    authoritativeToolIds.length !== localToolIds.length ||
+    authoritativeToolIds.some((id, index) => id !== localToolIds[index])
+  ) {
+    return false
+  }
+
+  const normalize = (value: string) => value.replace(/\s+/g, ' ').trim()
+  const authoritativeText = normalize(chatMessageText(authoritative))
+  const localText = normalize(chatMessageText(local))
+
+  return Boolean(localText && authoritativeText.endsWith(localText))
+}
+
 /**
  * True when `next` is a pure forward extension of the previous *answer* text.
  * Empty previous answer never accepts a dump as an extension — that is how the
@@ -337,6 +369,16 @@ export function reconcileResumeMessages(nextMessages: ChatMessage[], previousMes
     // localPendingSupersedes) so a different turn at the same ordinal cannot
     // hijack the slot.
     if (localPendingSupersedes(previous, message)) {
+      return withAuthoritativeTurnState(previous, message)
+    }
+
+    // A just-finished live tool turn has already replaced streamed pre-tool
+    // commentary with message.complete's authoritative final text. Persisted
+    // history still contains the model's internal assistant/tool cycles, and a
+    // background refresh coalesces those cycles into one durable row. Keep the
+    // settled live presentation when ordered tool-call identity proves this is
+    // the same turn and the durable row ends with the exact live final.
+    if (settledLiveToolTimelineSupersedes(message, previous)) {
       return withAuthoritativeTurnState(previous, message)
     }
 

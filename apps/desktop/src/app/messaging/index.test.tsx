@@ -3,6 +3,8 @@ import { act, cleanup, fireEvent, render, screen, waitFor } from '@testing-libra
 import { MemoryRouter } from 'react-router'
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 
+import { MessagingView } from './index'
+import { $settingsScopeOverride } from '@/store/settings-scope'
 import type { MessagingPlatformInfo } from '@/types/hermes'
 
 const getMessagingPlatforms = vi.fn()
@@ -75,7 +77,6 @@ afterEach(() => {
 })
 
 async function renderMessaging() {
-  const { MessagingView } = await import('./index')
   let result: ReturnType<typeof render>
   await act(async () => {
     result = render(
@@ -84,14 +85,11 @@ async function renderMessaging() {
       </MemoryRouter>
     )
   })
-
   return result!
 }
 
 describe('MessagingView profile scope', () => {
   it('follows the active profile instead of targeting primary when there is no override', async () => {
-    const { $settingsScopeOverride } = await import('@/store/settings-scope')
-
     $settingsScopeOverride.set(null)
     getMessagingPlatforms.mockResolvedValue({ platforms: [platform()] })
 
@@ -167,8 +165,9 @@ describe('MessagingView pairing', () => {
 
     await renderMessaging()
 
+    const approve = await screen.findByRole('button', { name: 'Approve' })
     await act(async () => {
-      fireEvent.click(await screen.findByRole('button', { name: 'Approve' }))
+      fireEvent.click(approve)
     })
 
     expect(await screen.findByRole('button', { name: 'Approve' })).toBeTruthy()

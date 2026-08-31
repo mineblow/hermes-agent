@@ -44,12 +44,21 @@ _replay_lock = threading.Lock()
 # ``params`` dict (bare event: type/session_id/seq/payload) — the exact shape
 # the client's dispatch path consumes.
 _replay_buffers: "OrderedDict[str, deque]" = OrderedDict()
-_replay_next_seq: dict[str, int] = {}
+_replay_next_seq: "OrderedDict[str, int]" = OrderedDict()
 
 
 def replay_epoch() -> str:
     """Opaque token identifying this server process's seq numbering."""
     return _REPLAY_EPOCH
+
+
+def _roll_replay_epoch_locked() -> None:
+    """Start a new bounded numbering epoch and update retained snapshots."""
+    global _REPLAY_EPOCH
+    _REPLAY_EPOCH = uuid.uuid4().hex
+    for buffer in _replay_buffers.values():
+        for _seq, event in buffer:
+            event["epoch"] = _REPLAY_EPOCH
 
 
 def _stamp_event(obj: dict) -> None:
@@ -69,19 +78,26 @@ def _stamp_event(obj: dict) -> None:
     # hooks from running while replay state is locked.
     recorded_params = json.loads(json.dumps(params, ensure_ascii=False))
     with _replay_lock:
+        if (
+            sid not in _replay_next_seq
+            and len(_replay_next_seq) >= _REPLAY_SESSIONS_MAX
+        ):
+            oldest_sid, _oldest_seq = _replay_next_seq.popitem(last=False)
+            _replay_buffers.pop(oldest_sid, None)
+            # A bounded counter map necessarily permits numbering to restart
+            # for an evicted runtime. Rotate the explicit epoch first so no
+            # client can mistake the new seq=1 for an old event.
+            _roll_replay_epoch_locked()
         seq = _replay_next_seq.get(sid, 0) + 1
         _replay_next_seq[sid] = seq
         params["seq"] = seq
+        params["epoch"] = _REPLAY_EPOCH
         recorded_params["seq"] = seq
+        recorded_params["epoch"] = _REPLAY_EPOCH
         buf = _replay_buffers.get(sid)
         if buf is None:
             buf = deque(maxlen=_REPLAY_BUFFER_MAX)
             _replay_buffers[sid] = buf
-            while len(_replay_buffers) > _REPLAY_SESSIONS_MAX:
-                _oldest_sid, _oldest_buf = _replay_buffers.popitem(last=False)
-                # Keep the sequence counter for the life of this replay epoch.
-                # Reusing seq=1 after buffer eviction would make clients with a
-                # prior watermark silently ignore every future event.
         buf.append((seq, recorded_params))
 
 
@@ -143,6 +159,7 @@ def replay_stats() -> dict:
     with _replay_lock:
         return {
             "sessions": len(_replay_buffers),
+            "sequence_sessions": len(_replay_next_seq),
             "events": sum(len(b) for b in _replay_buffers.values()),
             "max_per_session": _REPLAY_BUFFER_MAX,
         }

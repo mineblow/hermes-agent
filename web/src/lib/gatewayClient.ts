@@ -16,6 +16,7 @@
 import {
   JsonRpcGatewayClient,
   buildHermesWebSocketUrl,
+  getOrCreateGatewayClientId,
   type ConnectionState,
   type GatewayEvent,
   type GatewayEventName,
@@ -26,9 +27,22 @@ import { maybeReloadForLoopbackWsAuthFailure } from "@/lib/dashboard-auth-reload
 
 export type { ConnectionState, GatewayEvent, GatewayEventName };
 
+function webClientId(): string {
+  try {
+    return getOrCreateGatewayClientId("web", globalThis.sessionStorage);
+  } catch {
+    return getOrCreateGatewayClientId("web", null);
+  }
+}
+
 export class GatewayClient extends JsonRpcGatewayClient {
   constructor() {
     super({
+      clientAttachment: {
+        client_id: webClientId(),
+        protocol_version: 1,
+        surface: "web",
+      },
       closedErrorMessage: "WebSocket closed",
       connectErrorMessage: "WebSocket connection failed",
       notConnectedErrorMessage: "gateway not connected",

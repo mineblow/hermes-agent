@@ -33,14 +33,17 @@ from typing import Any, Callable, Optional, Protocol, runtime_checkable
 # Errno values that mean "the peer is gone" rather than "the host has a
 # real I/O problem".  Anything outside this set re-raises so it surfaces
 # in the crash log instead of looking like a clean disconnect.
-_PEER_GONE_ERRNOS = frozenset({
-    errno.EPIPE,        # write to closed pipe (POSIX)
-    errno.ECONNRESET,   # peer reset the connection
-    errno.EBADF,        # fd closed under us
-    errno.ESHUTDOWN,    # transport endpoint shut down
-    getattr(errno, "WSAECONNRESET", -1),  # win32 mapping (no-op on POSIX)
-    getattr(errno, "WSAESHUTDOWN", -1),
-} - {-1})
+_PEER_GONE_ERRNOS = frozenset(
+    {
+        errno.EPIPE,  # write to closed pipe (POSIX)
+        errno.ECONNRESET,  # peer reset the connection
+        errno.EBADF,  # fd closed under us
+        errno.ESHUTDOWN,  # transport endpoint shut down
+        getattr(errno, "WSAECONNRESET", -1),  # win32 mapping (no-op on POSIX)
+        getattr(errno, "WSAESHUTDOWN", -1),
+    }
+    - {-1}
+)
 
 logger = logging.getLogger(__name__)
 
@@ -55,7 +58,9 @@ logger = logging.getLogger(__name__)
 # those, JSON-RPC frames will accumulate in the buffer and the TUI
 # will hang waiting for ``gateway.ready``.  Default stays off so the
 # existing flush-after-write behaviour is unchanged.
-_DISABLE_FLUSH = (os.environ.get("HERMES_TUI_GATEWAY_NO_FLUSH", "") or "").strip().lower() in {
+_DISABLE_FLUSH = (
+    os.environ.get("HERMES_TUI_GATEWAY_NO_FLUSH", "") or ""
+).strip().lower() in {
     "1",
     "true",
     "yes",
@@ -66,6 +71,9 @@ _DISABLE_FLUSH = (os.environ.get("HERMES_TUI_GATEWAY_NO_FLUSH", "") or "").strip
 @runtime_checkable
 class Transport(Protocol):
     """Minimal interface every transport implements."""
+
+    connection_id: str
+    client_id: Optional[str]
 
     def write(self, obj: dict) -> bool:
         """Emit one JSON frame. Return ``False`` when the peer is gone."""
@@ -105,11 +113,13 @@ class StdioTransport:
     existing test suite relies on (``monkeypatch.setattr(server, "_real_stdout", ...)``).
     """
 
-    __slots__ = ("_stream_getter", "_lock")
+    __slots__ = ("_stream_getter", "_lock", "connection_id", "client_id")
 
     def __init__(self, stream_getter: Callable[[], Any], lock: threading.Lock) -> None:
         self._stream_getter = stream_getter
         self._lock = lock
+        self.connection_id = "stdio"
+        self.client_id = "stdio"
 
     def write(self, obj: dict) -> bool:
         """Return ``True`` on success, ``False`` ONLY when the peer is gone.
@@ -207,6 +217,14 @@ class TeeTransport:
             except Exception:
                 pass
         return ok
+
+    @property
+    def connection_id(self) -> str:
+        return self._primary.connection_id
+
+    @property
+    def client_id(self) -> Optional[str]:
+        return self._primary.client_id
 
     def close(self) -> None:
         try:

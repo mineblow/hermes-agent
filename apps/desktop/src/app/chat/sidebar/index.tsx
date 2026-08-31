@@ -117,6 +117,7 @@ import {
   $messagingPlatformTotals,
   $messagingSessions,
   $messagingTruncated,
+  $newChatWorkspaceTarget,
   $sessionProfilesTruncated,
   $sessions,
   $sessionsLoading,
@@ -150,6 +151,7 @@ import { SidebarLoadMoreRow } from './load-more-row'
 import { orderByIds, reconcileOrderIds, resolveManualSessionOrderIds, sameIds } from './order'
 import { filterSessionsByProfileScope } from './profile-scope'
 import { ProfileRail } from './profile-switcher'
+import { shouldSyncProjectCwd } from './project-cwd-sync'
 import { ProjectDialog } from './project-dialog'
 import {
   excludeProjectSessions,
@@ -426,6 +428,7 @@ export function ChatSidebar({
   const activeProjectId = useStore($activeProjectId)
   const projectScope = useStore($projectScope)
   const currentCwd = useStore($currentCwd)
+  const newChatWorkspaceTarget = useStore($newChatWorkspaceTarget)
   const gatewayState = useStore($gatewayState)
   const dismissedAutoProjects = useStore($dismissedAutoProjectIds)
   const newSessionCombo = useStore($bindings)['session.new']?.[0]
@@ -1075,11 +1078,14 @@ export function ChatSidebar({
     (project: SidebarProjectTree) => {
       const target = projectTreeCwd(project)
 
-      if (target && target !== currentCwd) {
+      if (
+        target &&
+        shouldSyncProjectCwd({ currentCwd, newChatWorkspaceTarget, projectTarget: target })
+      ) {
         setCurrentCwd(target)
       }
     },
-    [currentCwd]
+    [currentCwd, newChatWorkspaceTarget]
   )
 
   // eslint-disable-next-line no-restricted-syntax -- legitimate non-atom ref write (see eslint rule comment)

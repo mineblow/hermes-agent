@@ -621,25 +621,30 @@ No redesign of the Desktop UI is part of this PR.
 
 ## Task 15: Runtime-host boundary and cross-process behavior
 
-**Objective:** Make the supported ownership boundary explicit and prevent users from mistaking independent processes for shared clients.
+**Objective:** Enforce one canonical mutable runtime across authenticated local gateway processes while retaining safe process-local behavior where authenticated IPC is unavailable.
 
 **Files:**
-- Modify: TUI Gateway status/welcome metadata
-- Modify: relevant Dashboard/Desktop connection status types/tests
-- Modify: documentation
-- Modify cross-process lease tests only if behavior changes
+- Add: canonical runtime-owner registry and Unix proxy transport
+- Modify: TUI Gateway resume/dispatch/teardown paths
+- Modify: shared reconnect and durable-resync handling
+- Modify: owner/proxy protocol and spawned-process tests
 
 **Contract:**
 
-- `runtime_host_id` and replay epoch identify one live host instance.
-- Multiple clients get one shared runtime only when connected to the same host endpoint/profile.
-- Independent processes that directly resume the same durable session do not attempt event federation. The existing SQLite session turn lease remains the fail-closed writer fence.
-- If a client reconnects to a different host epoch, it treats live replay as unavailable and reconstructs from durable history/status.
-- Shared-filesystem active/active multi-host ownership remains unsupported because PID liveness and SQLite WAL are host-local.
+- `SessionDB.session_runtime_key()` resolves every compression/continuation segment to one canonical durable runtime root.
+- Registry ownership is keyed by both that root and the normalized Hermes profile/state home, so independent profiles cannot collide.
+- A process atomically claims the root before constructing an `AIAgent`; concurrent builders in the winning process additionally single-flight on the profile-scoped root.
+- Followers use a same-UID Unix-domain proxy bound to the exact owner ID and generation. Registry files contain routing/liveness metadata only, never credentials.
+- A same-UID process does not attest a browser identity. Proxy hello frames therefore reject `auth_identity`; locally verified principals scope stable reconnect routes without being forwarded as trusted owner metadata.
+- Negotiated capabilities cross the proxy and are owner-validated against the fixed allowlist. An omitted capability declaration preserves legacy full authority; an explicit empty list remains unprivileged.
+- Proxy event writes use independent bounded queues. Responses remain point-to-point, owner-stamped events are not restamped, stale owner generations cannot publish, and timeout/owner loss returns `-32072` with `outcome: unknown` and `retryable: false`.
+- Stable clients can replace a physical connection and recover remote routes only under the same locally verified principal. Replay truncation, epoch change, runtime-host change, and owner loss request durable reconstruction.
+- On platforms without authenticated Unix peer credentials (`SO_PEERCRED`), normal sessions remain process-local instead of claiming unsupported cross-process guarantees.
+- The SQLite turn lease remains defense in depth for persistence fencing; it is not the canonical runtime registry.
 
-**Test:** two process-local runtimes cannot corrupt one transcript; a changed host epoch triggers durable resync rather than replay stitching.
+**Test:** spawned-process claim races elect one owner; concurrent eager resumes build once; real Unix proxy tests cover response routing, event delivery, capabilities, reconnect, stale generations, timeout, owner loss, and profile isolation.
 
-A distributed broker or cross-host mutable AIAgent is explicitly out of scope because it would violate the chosen single-runtime-host architecture. “Whole multi-client support” means all clients connect to that host, not that one Python object is distributed across machines.
+A distributed broker, cross-machine mutable `AIAgent`, and unauthenticated network proxy are explicitly out of scope. The supported cross-process topology is authenticated local IPC to one canonical runtime owner.
 
 ---
 
@@ -660,8 +665,8 @@ Document:
 - replay and overflow behavior
 - disconnect/orphan policy
 - approval/clarification authority
-- same-host requirement and cross-process durable lease
-- backward compatibility for old clients/backends
+- canonical local-process owner/proxy topology and profile-scoped ownership
+- backward compatibility and authenticated-IPC platform fallback
 - no new `.env` settings
 
 Run documentation link/build checks required by repository CI.

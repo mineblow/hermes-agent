@@ -756,4 +756,13 @@ export type GatewayEvent =
       type: 'message.complete'
     }
   | { payload?: { usage?: Usage }; session_id?: string; type: 'session.usage' }
+  | {
+      payload?: {
+        durable_session_ids?: string[]
+        recovered_session_ids?: string[]
+        session_ids?: string[]
+      }
+      session_id?: string
+      type: 'session.runtime_owner_lost'
+    }
   | { payload?: { message?: string }; session_id?: string; type: 'error' }

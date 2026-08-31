@@ -3,12 +3,11 @@ import concurrent.futures
 import json
 import threading
 import time
+import uuid
 
 from hermes_cli import mcp_startup
 from tui_gateway import server
 from tui_gateway import ws as ws_mod
-
-
 
 
 def _run_disconnect(monkeypatch, seed):
@@ -35,8 +34,11 @@ def _run_disconnect(monkeypatch, seed):
     created = []
     real_transport = ws_mod.WSTransport
     monkeypatch.setattr(
-        ws_mod, "WSTransport",
-        lambda ws, loop, **kw: created.append(real_transport(ws, loop, **kw)) or created[-1],
+        ws_mod,
+        "WSTransport",
+        lambda ws, loop, **kw: (
+            created.append(real_transport(ws, loop, **kw)) or created[-1]
+        ),
     )
 
     class FakeWS:
@@ -82,9 +84,9 @@ def test_ws_disconnect_reaps_flagged_session_and_closes_worker(monkeypatch):
         server._sessions.clear()
 
 
-
-
-def test_ws_connection_registers_then_disconnect_unregisters_live_transport(monkeypatch):
+def test_ws_connection_registers_then_disconnect_unregisters_live_transport(
+    monkeypatch,
+):
     """A connected client must be tracked in the live-transport registry so a
     session-less global broadcast (skin.changed from the background watcher)
     reaches it, and dropped on disconnect so no stale write targets a dead peer.
@@ -120,8 +122,6 @@ def test_ws_disconnect_releases_wake_word_owner(monkeypatch):
     assert released == created
 
 
-
-
 def test_ws_starts_mcp_discovery_before_ready(monkeypatch):
     import tui_gateway.entry as entry
 
@@ -129,7 +129,9 @@ def test_ws_starts_mcp_discovery_before_ready(monkeypatch):
     events = []
 
     monkeypatch.setattr(server, "_WS_ORPHAN_REAP_GRACE_S", 0)
-    monkeypatch.setattr(entry, "ensure_mcp_discovery_started", lambda: calls.append("mcp"))
+    monkeypatch.setattr(
+        entry, "ensure_mcp_discovery_started", lambda: calls.append("mcp")
+    )
 
     class FakeWS:
         async def accept(self):
@@ -155,18 +157,14 @@ def test_ws_starts_mcp_discovery_before_ready(monkeypatch):
 
 def test_ws_ready_advertises_heartbeat_and_ping_is_inline(monkeypatch):
     sent = []
-    inbound = iter(
-        [
-            json.dumps(
-                {
-                    "jsonrpc": "2.0",
-                    "id": "heartbeat-1",
-                    "method": "gateway.ping",
-                    "params": {},
-                }
-            )
-        ]
-    )
+    inbound = iter([
+        json.dumps({
+            "jsonrpc": "2.0",
+            "id": "heartbeat-1",
+            "method": "gateway.ping",
+            "params": {},
+        })
+    ])
     monkeypatch.setattr(server, "_WS_ORPHAN_REAP_GRACE_S", 0)
 
     class FakeWS:
@@ -190,6 +188,26 @@ def test_ws_ready_advertises_heartbeat_and_ping_is_inline(monkeypatch):
     ready = sent[0]["params"]
     assert ready["type"] == "gateway.ready"
     assert ready["payload"]["heartbeat"] is True
+    uuid.UUID(hex=ready["payload"]["connection_id"])
+    assert ready["payload"]["runtime_host_id"] == server._backend_id_for_this_process()
+    assert ready["payload"]["multi_client_sessions"] == 1
+    assert ready["payload"]["capabilities"] == [
+        "client.attach",
+        "session.attach",
+        "session.detach",
+        "session.attachments",
+    ]
+    assert ready["payload"]["multi_client"] == {
+        "protocol_version": 1,
+        "attachment_modes": ["observe", "control"],
+        "methods": [
+            "client.attach",
+            "session.attach",
+            "session.detach",
+            "session.attachments",
+            "session.events.since",
+        ],
+    }
     assert sent[1] == {
         "jsonrpc": "2.0",
         "result": {"ok": True},
@@ -234,6 +252,30 @@ def test_ws_transport_serializes_concurrent_sends():
         loop.close()
 
 
+def test_ws_transport_mints_unique_connection_identity():
+    loop = asyncio.new_event_loop()
+    try:
+        first = ws_mod.WSTransport(object(), loop)
+        second = ws_mod.WSTransport(object(), loop)
+
+        uuid.UUID(hex=first.connection_id)
+        uuid.UUID(hex=second.connection_id)
+        assert first.connection_id != second.connection_id
+        assert first.client_id is None
+        assert second.client_id is None
+    finally:
+        loop.close()
+
+
+def test_stdio_transport_has_stable_implicit_identity():
+    from tui_gateway.transport import StdioTransport
+
+    transport = StdioTransport(lambda: None, threading.Lock())
+
+    assert transport.connection_id == "stdio"
+    assert transport.client_id == "stdio"
+
+
 def test_ws_transport_preserves_cross_batch_order():
     async def scenario():
         entered = []
@@ -270,5 +312,3 @@ def test_ws_transport_preserves_cross_batch_order():
         assert entered == ["A1", "A2", "B1", "B2"]
 
     asyncio.run(scenario())
-
-
