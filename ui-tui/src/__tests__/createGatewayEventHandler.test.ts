@@ -1026,6 +1026,17 @@ describe('createGatewayEventHandler', () => {
     expect(getUiState().status).toBe('recovering session…')
   })
 
+  it('on gateway.ready after websocket reattachment, keeps the already-live session', () => {
+    const ctx = buildCtx([])
+
+    patchUiState({ sid: 'still-live', status: 'gateway reconnecting' })
+    createGatewayEventHandler(ctx)({ payload: {}, type: 'gateway.ready' } as any)
+
+    expect(ctx.session.resumeById).not.toHaveBeenCalled()
+    expect(ctx.session.newSession).not.toHaveBeenCalled()
+    expect(getUiState()).toMatchObject({ sid: 'still-live', status: 'ready' })
+  })
+
   it('on gateway.ready with auto_resume on and a recent session, resumes it', async () => {
     const appended: Msg[] = []
     const newSession = vi.fn()
@@ -1534,6 +1545,39 @@ describe('createGatewayEventHandler', () => {
     expect(resumeById).toHaveBeenCalledOnce()
     expect(resumeById).toHaveBeenCalledWith('stored-session')
     expect(getUiState().status).toBe('recovering session…')
+  })
+
+  it('adopts a gateway-recovered live session without resuming its durable session a second time', () => {
+    const ctx = buildCtx([])
+    const onEvent = createGatewayEventHandler(ctx)
+
+    patchUiState({ sid: 'live-old' })
+    onEvent({
+      payload: {
+        durable_session_ids: ['durable-session'],
+        recovered_session_ids: ['live-new'],
+        session_ids: ['live-old']
+      },
+      type: 'session.runtime_owner_lost'
+    } as any)
+
+    expect(ctx.session.resumeById).not.toHaveBeenCalled()
+    expect(getUiState().sid).toBe('live-new')
+    expect(getUiState().status).toBe('ready')
+  })
+
+  it('renders peer message.user rows once by message ID even when prompt text is identical', () => {
+    const appended: Msg[] = []
+    const onEvent = createGatewayEventHandler(buildCtx(appended))
+
+    onEvent({ payload: { message_id: 'peer-1', text: 'same prompt', timestamp: 10 }, type: 'message.user' } as any)
+    onEvent({ payload: { message_id: 'peer-1', text: 'same prompt', timestamp: 10 }, type: 'message.user' } as any)
+    onEvent({ payload: { message_id: 'peer-2', text: 'same prompt', timestamp: 11 }, type: 'message.user' } as any)
+
+    expect(appended.filter(message => message.role === 'user')).toEqual([
+      { createdAt: 10, messageId: 'peer-1', role: 'user', text: 'same prompt' },
+      { createdAt: 11, messageId: 'peer-2', role: 'user', text: 'same prompt' }
+    ])
   })
 
   it('persists an abandoned (timed-out) clarify into the transcript when the clarify tool completes', () => {

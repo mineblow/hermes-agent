@@ -412,6 +412,11 @@ def _(rid, params: dict) -> dict:
             busy_transport,
             queued=bool(params.get("queued")),
             origin_client_id=_legacy_client_id_for_transport(busy_transport),
+            display_kind=display_kind,
+            client_message_id=client_message_id,
+            display_text=display_text,
+            submitted_at=submitted_at,
+            attachment_refs=attachment_refs,
         )
         if busy_response is not None:
             return busy_response

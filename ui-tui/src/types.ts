@@ -135,6 +135,8 @@ export interface Msg {
   // rehydrate, wall clock at append time for live rows). Rendered as a dim
   // [HH:MM] label when `display.timestamps` is on (#41531).
   createdAt?: number
+  /** Stable client-authored identity used to reconcile optimistic and peer rows. */
+  messageId?: string
   thinking?: string
   // MoA reference-model output stored in `thinking` (see turnController's
   // recordMoaReference): unlike ordinary model reasoning, this is the

@@ -157,6 +157,9 @@ export class GatewayClient extends EventEmitter {
   private logs = new CircularBuffer<string>(MAX_GATEWAY_LOG_LINES)
   private pending = new Map<string, Pending>()
   private durableSessionIds = new Map<string, string>()
+  private sessionWatermarks = new Map<string, { epoch: string; seq: number }>()
+  private pendingSessionAttach = new Set<string>()
+  private queuedSessionEvents = new Map<string, GatewayEvent[]>()
   private runtimeHostId: string | null = null
   private bufferedEvents = new CircularBuffer<GatewayEvent>(MAX_BUFFERED_EVENTS)
   private pendingExit: number | null | undefined
@@ -346,7 +349,9 @@ export class GatewayClient extends EventEmitter {
     // attached to a discarded child / socket.
     this.rejectPending(new Error('gateway restarting'))
     this.ready = false
-    this.subscribed = false
+    // `drain()` establishes the EventEmitter subscription for the lifetime of
+    // this client, not one transport. Preserve it across websocket reconnects
+    // so replay + restored live delivery do not remain buffered forever.
     // Invalidate any pending deferred drain() flush from a prior transport so
     // its queued microtask becomes a no-op (it captured the old generation).
     this.drainGeneration += 1
@@ -393,6 +398,15 @@ export class GatewayClient extends EventEmitter {
     // recovery subscriber may call start() immediately, and start() cancels this
     // timer so there is only one recovery owner.
     this.scheduleReconnect()
+
+    // A websocket transport drop does not destroy same-host live sessions.
+    // Keep the UI's active sid intact while this client reconnects and
+    // session.attach restores the server-side subscription. Emitting `exit`
+    // here would make useMainApp clear sid and independently session.resume the
+    // same durable conversation.
+    if (this.attachUrl && this.durableSessionIds.size > 0) {
+      return
+    }
 
     if (this.subscribed) {
       this.emit('exit', code)
@@ -736,11 +750,106 @@ export class GatewayClient extends EventEmitter {
     }
   }
 
+  private publishSessionEvent(ev: GatewayEvent, attachmentReplay = false) {
+    const wire = ev as GatewayEvent & { epoch?: unknown; seq?: unknown }
+    const sessionId = typeof ev.session_id === 'string' ? ev.session_id : ''
+
+    if (sessionId && this.pendingSessionAttach.has(sessionId) && !attachmentReplay) {
+      const queued = this.queuedSessionEvents.get(sessionId) ?? []
+
+      queued.push(ev)
+      this.queuedSessionEvents.set(sessionId, queued)
+
+      return
+    }
+
+    if (sessionId && typeof wire.seq === 'number' && Number.isInteger(wire.seq) && wire.seq >= 0) {
+      const epoch = typeof wire.epoch === 'string' ? wire.epoch : ''
+      const previous = this.sessionWatermarks.get(sessionId)
+
+      if (previous?.epoch === epoch && wire.seq <= previous.seq) {
+        return
+      }
+
+      this.sessionWatermarks.set(sessionId, { epoch, seq: wire.seq })
+    }
+
+    if (ev.type === 'session.runtime_owner_lost') {
+      const payload = (ev.payload ?? {}) as { session_ids?: unknown }
+
+      const sessionIds = Array.isArray(payload.session_ids)
+        ? payload.session_ids.filter((value): value is string => typeof value === 'string')
+        : []
+
+      this.publish({
+        ...ev,
+        payload: {
+          durable_session_ids: sessionIds.map(id => this.durableSessionIds.get(id) ?? ''),
+          session_ids: sessionIds
+        }
+      })
+    } else {
+      this.publish(ev)
+    }
+  }
+
+  private async restoreSessionAttachments(replayEpoch: string) {
+    for (const sessionId of this.durableSessionIds.keys()) {
+      const watermark = this.sessionWatermarks.get(sessionId)
+      const lastSeenSeq = watermark?.epoch === replayEpoch ? watermark.seq : 0
+
+      this.pendingSessionAttach.add(sessionId)
+      this.queuedSessionEvents.set(sessionId, [])
+
+      try {
+        const result = await this.request<{
+          events?: unknown
+          latest_seq?: unknown
+          replay_epoch?: unknown
+        }>('session.attach', {
+          last_seen_seq: lastSeenSeq,
+          mode: 'control',
+          session_id: sessionId
+        }, false)
+
+        const events = Array.isArray(result?.events)
+          ? result.events.map(asGatewayEvent).filter((event): event is GatewayEvent => event !== null)
+          : []
+
+        events.sort((a, b) => Number((a as { seq?: unknown }).seq ?? 0) - Number((b as { seq?: unknown }).seq ?? 0))
+
+        for (const event of events) {
+          this.publishSessionEvent(event, true)
+        }
+
+        const queued = this.queuedSessionEvents.get(sessionId) ?? []
+        queued.sort((a, b) => Number((a as { seq?: unknown }).seq ?? 0) - Number((b as { seq?: unknown }).seq ?? 0))
+
+        for (const event of queued) {
+          this.publishSessionEvent(event, true)
+        }
+
+        if (typeof result?.latest_seq === 'number' && Number.isInteger(result.latest_seq)) {
+          const epoch = typeof result.replay_epoch === 'string' ? result.replay_epoch : replayEpoch
+          const current = this.sessionWatermarks.get(sessionId)
+
+          if (!current || current.epoch !== epoch || result.latest_seq > current.seq) {
+            this.sessionWatermarks.set(sessionId, { epoch, seq: result.latest_seq })
+          }
+        }
+      } finally {
+        this.pendingSessionAttach.delete(sessionId)
+        this.queuedSessionEvents.delete(sessionId)
+      }
+    }
+  }
+
   private publishReadyAfterAttachment(ev: GatewayEvent) {
     const payload = ev.payload as
       | {
           capabilities?: unknown
           multi_client?: { methods?: unknown }
+          replay_epoch?: unknown
           runtime_host_id?: unknown
         }
       | undefined
@@ -755,6 +864,12 @@ export class GatewayClient extends EventEmitter {
     const runtimeHostChanged = this.runtimeHostId !== null &&
       nextRuntimeHostId !== null &&
       this.runtimeHostId !== nextRuntimeHostId
+
+    const sameRuntimeHostReconnect = this.runtimeHostId !== null &&
+      nextRuntimeHostId !== null &&
+      this.runtimeHostId === nextRuntimeHostId
+
+    const replayEpoch = typeof payload?.replay_epoch === 'string' ? payload.replay_epoch : ''
 
     if (!capabilities.includes('client.attach') && !methods.includes('client.attach')) {
       if (nextRuntimeHostId !== null) {
@@ -796,6 +911,8 @@ export class GatewayClient extends EventEmitter {
     }).then(async () => {
       if (runtimeHostChanged) {
         await this.reconstructSessionsAfterHostTakeover()
+      } else if (sameRuntimeHostReconnect && (capabilities.includes('session.attach') || methods.includes('session.attach'))) {
+        await this.restoreSessionAttachments(replayEpoch)
       }
     }).then(
       () => {
@@ -835,22 +952,8 @@ export class GatewayClient extends EventEmitter {
       if (ev) {
         if (ev.type === 'gateway.ready') {
           this.publishReadyAfterAttachment(ev)
-        } else if (ev.type === 'session.runtime_owner_lost') {
-          const payload = (ev.payload ?? {}) as { session_ids?: unknown }
-
-          const sessionIds = Array.isArray(payload.session_ids)
-            ? payload.session_ids.filter((value): value is string => typeof value === 'string')
-            : []
-
-          this.publish({
-            ...ev,
-            payload: {
-              durable_session_ids: sessionIds.map(sessionId => this.durableSessionIds.get(sessionId) ?? ''),
-              session_ids: sessionIds
-            }
-          })
         } else {
-          this.publish(ev)
+          this.publishSessionEvent(ev)
         }
       }
     }

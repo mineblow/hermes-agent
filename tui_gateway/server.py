@@ -1223,6 +1223,17 @@ def _pop_session_by_id(sid: str) -> dict | None:
     return session
 
 
+def _pop_session_if_current(sid: str, expected: dict) -> dict | None:
+    """Atomically claim ``expected`` for teardown without popping a replacement."""
+    with _sessions_lock:
+        if _sessions.get(sid) is not expected:
+            return None
+        expected["_closing"] = True
+        _sessions.pop(sid, None)
+    expected["_sid"] = sid
+    return expected
+
+
 def _teardown_popped_session(
     session: dict | None, *, end_reason: str = "tui_close"
 ) -> bool:
@@ -3263,6 +3274,18 @@ _SESSION_RPC_CAPABILITIES = {
     "mcp.setup.respond": "ui.respond",
     "sudo.respond": "ui.respond",
     "secret.respond": "ui.respond",
+    # All other mutations of a live shared runtime require controller authority.
+    # Keep this explicit so observer-visible read RPCs remain usable while new
+    # mutators must be classified here before they can cross network ingress.
+    "session.close": "session.steer",
+    "session.undo": "session.steer",
+    "session.branch": "session.steer",
+    "prompt.background": "session.steer",
+    "image.attach": "session.steer",
+    "image.attach_bytes": "session.steer",
+    "pdf.attach": "session.steer",
+    "file.attach": "session.steer",
+    "image.detach": "session.steer",
 }
 
 
@@ -10280,6 +10303,11 @@ def _enqueue_prompt(
     *,
     origin_client_id: str | None = None,
     request_id: str | None = None,
+    display_kind: str | None = None,
+    client_message_id: str | None = None,
+    display_text: str | None = None,
+    submitted_at: float | None = None,
+    attachment_refs: list[str] | None = None,
 ) -> None:
     """Stash a message to run as the very next turn once the live one ends.
 
@@ -10291,6 +10319,16 @@ def _enqueue_prompt(
     sent it even if the session transport is rebound meanwhile.
     """
     image_paths = list(image_paths or [])
+    if client_message_id:
+        queued_entries = ([session.get("queued_prompt")] if session.get("queued_prompt") else []) + list(
+            session.get("queued_prompts") or []
+        )
+        if any(
+            isinstance(entry, dict)
+            and entry.get("client_message_id") == client_message_id
+            for entry in queued_entries
+        ):
+            return
     # #84417: scrub any live-turn self-duplicates first so the consecutive-text
     # merge below cannot glue "{original}\\n\\n{later}" and re-fire original
     # on drain after a later correction settles.
@@ -10298,13 +10336,28 @@ def _enqueue_prompt(
     # Never queue a text-only self-copy of the live inflight user prompt. The
     # live turn already owns that text; draining it after settle would restart
     # the same user turn as a fresh agent invocation.
-    if not image_paths and isinstance(text, str):
+    if not client_message_id and not image_paths and isinstance(text, str):
         turn = session.get("inflight_turn")
         original = str(turn.get("user") or "").strip() if isinstance(turn, dict) else ""
         if original and text.strip() == original:
             return
     legacy_envelope = origin_client_id is None and request_id is None
     queued = {"text": text}
+    queued.update(
+        {
+            key: value
+            for key, value in {
+                "display_kind": display_kind,
+                "client_message_id": client_message_id,
+                "display_text": display_text,
+                "submitted_at": submitted_at,
+                "attachment_refs": (
+                    list(attachment_refs) if attachment_refs is not None else None
+                ),
+            }.items()
+            if value is not None
+        }
+    )
     if legacy_envelope:
         # Compatibility for internal/older call sites while RPC ingress is
         # migrated. Multi-client envelopes carry origin, never a destination.
@@ -10323,6 +10376,8 @@ def _enqueue_prompt(
         and not existing.get("image_paths")
         and not image_paths
         and not session.get("queued_prompts")
+        and not existing.get("client_message_id")
+        and not client_message_id
         and (
             legacy_envelope
             or existing.get("origin_client_id") == queued.get("origin_client_id")
@@ -10355,6 +10410,8 @@ def _sanitize_queued_entry_vs_inflight_user(entry: Any, original: str) -> dict |
     """
     if not original or not isinstance(entry, dict):
         return entry if isinstance(entry, dict) else None
+    if entry.get("client_message_id"):
+        return entry
     if entry.get("image_paths"):
         return entry
     text = entry.get("text")
@@ -10463,6 +10520,11 @@ def _handle_busy_submit(
     queued: bool = False,
     *,
     origin_client_id: str | None = None,
+    display_kind: str | None = None,
+    client_message_id: str | None = None,
+    display_text: str | None = None,
+    submitted_at: float | None = None,
+    attachment_refs: list[str] | None = None,
 ) -> dict | None:
     """Apply the ``display.busy_input_mode`` policy to a prompt that lands while
     a turn is in flight, instead of rejecting it with ``session busy``.
@@ -10555,6 +10617,11 @@ def _handle_busy_submit(
             image_paths=image_paths,
             origin_client_id=origin_client_id,
             request_id=str(rid) if origin_client_id is not None else None,
+            display_kind=display_kind,
+            client_message_id=client_message_id,
+            display_text=display_text,
+            submitted_at=submitted_at,
+            attachment_refs=attachment_refs,
         )
         session["last_active"] = time.time()
 
@@ -10616,6 +10683,13 @@ def _drain_queued_prompt(rid, sid: str, session: dict) -> bool:
             session["running"] = False
             return True
     dispatch_failed = False
+    submit_metadata = {
+        "display_kind": queued.get("display_kind"),
+        "client_message_id": queued.get("client_message_id"),
+        "display_text": queued.get("display_text"),
+        "submitted_at": queued.get("submitted_at"),
+        "attachment_refs": queued.get("attachment_refs"),
+    }
     try:
         if use_compute_host:
             if queued.get("image_paths"):
@@ -10626,6 +10700,7 @@ def _drain_queued_prompt(rid, sid: str, session: dict) -> bool:
                     queued["text"],
                     image_paths=queued["image_paths"],
                     queued_prompt_generation=queue_generation,
+                    **submit_metadata,
                 )
             else:
                 resp = _submit_prompt_to_compute_host(
@@ -10634,6 +10709,7 @@ def _drain_queued_prompt(rid, sid: str, session: dict) -> bool:
                     session,
                     queued["text"],
                     queued_prompt_generation=queue_generation,
+                    **submit_metadata,
                 )
             if resp.get("error"):
                 message = str(
@@ -10655,6 +10731,7 @@ def _drain_queued_prompt(rid, sid: str, session: dict) -> bool:
                     queued_prompt_generation=queue_generation,
                     origin_client_id=queued.get("origin_client_id"),
                     request_id=queued.get("request_id"),
+                    **submit_metadata,
                 )
             else:
                 _run_prompt_submit(
@@ -10665,6 +10742,7 @@ def _drain_queued_prompt(rid, sid: str, session: dict) -> bool:
                     queued_prompt_generation=queue_generation,
                     origin_client_id=queued.get("origin_client_id"),
                     request_id=queued.get("request_id"),
+                    **submit_metadata,
                 )
     except Exception as exc:
         print(
@@ -11064,13 +11142,8 @@ def _schedule_resume_hydration(
                 {"message": message, "phase": "history", "status": "failed"},
             )
             _emit("error", sid, {"message": message})
-            with _sessions_lock:
-                discarded = (
-                    _sessions.pop(sid, None) if _sessions.get(sid) is session else None
-                )
-            lease = (discarded or {}).get("active_session_lease")
-            if lease is not None:
-                lease.release()
+            discarded = _pop_session_if_current(sid, session)
+            _teardown_popped_session(discarded, end_reason="resume_failed")
         finally:
             if close_db and hasattr(db, "close"):
                 try:

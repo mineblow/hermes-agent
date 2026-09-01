@@ -67,6 +67,7 @@ export {
   JsonRpcGatewayClient,
   JsonRpcGatewayError,
   type MultiClientMethod,
+  type RuntimeSessionRebound,
   type SessionAttachmentSnapshot,
   type SessionAttachmentsParams,
   type SessionAttachmentsResult,

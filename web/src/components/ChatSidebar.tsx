@@ -121,8 +121,15 @@ export function ChatSidebar({
   // counter is the dependency on purpose — it's not read in the memo body,
   // it's the signal that says "rebuild the client".
   const [version, setVersion] = useState(0);
-  // eslint-disable-next-line react-hooks/exhaustive-deps
-  const gw = useMemo(() => new GatewayClient(), [version]);
+  const gw = useMemo(
+    () => {
+      void version;
+      return new GatewayClient({
+        onDurableResyncRequired: () => setVersion((current) => current + 1),
+      });
+    },
+    [version],
+  );
 
   const [state, setState] = useState<ConnectionState>("idle");
   const [info, setInfo] = useState<SessionInfo>({});

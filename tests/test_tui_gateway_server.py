@@ -540,6 +540,15 @@ def test_session_attach_rejects_invalid_replay_watermark(watermark):
         ("mcp.setup.respond", "ui.respond"),
         ("sudo.respond", "ui.respond"),
         ("secret.respond", "ui.respond"),
+        ("session.close", "session.steer"),
+        ("session.undo", "session.steer"),
+        ("session.branch", "session.steer"),
+        ("prompt.background", "session.steer"),
+        ("image.attach", "session.steer"),
+        ("image.attach_bytes", "session.steer"),
+        ("pdf.attach", "session.steer"),
+        ("file.attach", "session.steer"),
+        ("image.detach", "session.steer"),
     ],
 )
 def test_dispatch_enforces_attachment_capability_before_handler(rpc_method, capability):
@@ -586,6 +595,70 @@ def test_dispatch_enforces_attachment_capability_before_handler(rpc_method, capa
         server._methods[rpc_method] = original
         server._sessions.pop("capability-sid", None)
         server._teardown_session(session)
+
+
+def test_busy_queue_preserves_durable_user_metadata_and_message_identity(monkeypatch):
+    session = {
+        "history_lock": threading.Lock(),
+        "running": False,
+        "inflight_turn": {"user": "repeat me"},
+    }
+    metadata = {
+        "display_kind": "hidden",
+        "display_text": "Repeat me",
+        "submitted_at": 1_725_000_000.5,
+        "attachment_refs": ["attachment://one"],
+    }
+
+    server._enqueue_prompt(
+        session,
+        "repeat me",
+        None,
+        origin_client_id="client-a",
+        request_id="request-a",
+        client_message_id="message-a",
+        **metadata,
+    )
+    server._enqueue_prompt(
+        session,
+        "repeat me",
+        None,
+        origin_client_id="client-a",
+        request_id="request-b",
+        client_message_id="message-b",
+        **metadata,
+    )
+    # A transport retry is idempotent by stable message identity.
+    server._enqueue_prompt(
+        session,
+        "repeat me",
+        None,
+        origin_client_id="client-a",
+        request_id="request-b-retry",
+        client_message_id="message-b",
+        **metadata,
+    )
+
+    assert session["queued_prompt"]["client_message_id"] == "message-a"
+    assert [entry["client_message_id"] for entry in session["queued_prompts"]] == [
+        "message-b"
+    ]
+
+    captured = []
+    monkeypatch.setattr(server, "_session_uses_compute_host", lambda _session: False)
+    monkeypatch.setattr(
+        server,
+        "_run_prompt_submit",
+        lambda *args, **kwargs: captured.append((args, kwargs)),
+    )
+
+    assert server._drain_queued_prompt("drain", "sid", session) is True
+    kwargs = captured[0][1]
+    assert kwargs["client_message_id"] == "message-a"
+    assert kwargs["display_kind"] == "hidden"
+    assert kwargs["display_text"] == "Repeat me"
+    assert kwargs["submitted_at"] == 1_725_000_000.5
+    assert kwargs["attachment_refs"] == ["attachment://one"]
 
 
 def test_mutating_rpc_ingress_is_serialized_per_live_runtime():
@@ -15440,12 +15513,18 @@ def test_session_create_close_race_does_not_orphan_worker(monkeypatch):
     )
     monkeypatch.setattr(_approval, "load_permanent_allowlist", lambda: None)
 
-    # Start: session.create spawns _build thread, returns synchronously
-    resp = server.handle_request({
-        "id": "1",
-        "method": "session.create",
-        "params": {"cols": 80},
-    })
+    # Start: session.create spawns _build thread, returns synchronously. Keep
+    # one real transport bound across create/close so the live session grants
+    # and later verifies controller capability at the network boundary.
+    transport = _LifecycleTransport("create-close-race-controller")
+    resp = _dispatch_sync(
+        {
+            "id": "1",
+            "method": "session.create",
+            "params": {"cols": 80},
+        },
+        transport,
+    )
     assert resp.get("result"), f"got error: {resp.get('error')}"
     sid = resp["result"]["session_id"]
     own_key = resp["result"]["stored_session_id"]
@@ -15460,11 +15539,14 @@ def test_session_create_close_race_does_not_orphan_worker(monkeypatch):
     # Build thread is blocked in _slow_make_agent.  Close the session
     # NOW — this pops _sessions[sid] before _build can install the
     # worker/notify.
-    close_resp = server.handle_request({
-        "id": "2",
-        "method": "session.close",
-        "params": {"session_id": sid},
-    })
+    close_resp = _dispatch_sync(
+        {
+            "id": "2",
+            "method": "session.close",
+            "params": {"session_id": sid},
+        },
+        transport,
+    )
     assert close_resp.get("result", {}).get("closed") is True
 
     # At this point session.close saw slash_worker=None (never eagerly

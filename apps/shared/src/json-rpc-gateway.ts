@@ -48,6 +48,11 @@ export interface DurableResyncRequest {
   reason: DurableResyncReason
   session_id: string
 }
+export interface RuntimeSessionRebound {
+  durable_session_id: string
+  new_session_id: string
+  old_session_id: string
+}
 export type GatewayRequestId = number | string
 export type AttachmentMode = 'observe' | 'control'
 export type AttachmentCapability =
@@ -266,6 +271,7 @@ export interface GatewayClientOptions {
   heartbeatDeadlineMs?: number
   heartbeatIntervalMs?: number
   onDurableResyncRequired?: (request: DurableResyncRequest) => void
+  onRuntimeSessionRebound?: (rebound: RuntimeSessionRebound) => void
   /** Return true to intercept the default closed-state transition. */
   onSocketClose?: (event: CloseEvent) => boolean | void
   requestIdPrefix?: string
@@ -322,8 +328,14 @@ export class JsonRpcGatewayClient {
   private readonly eventHandlers = new Map<string, Set<(event: GatewayEvent) => void>>()
   private readonly stateHandlers = new Set<(state: ConnectionState) => void>()
   private readonly options: Required<
-    Omit<GatewayClientOptions, 'clientAttachment' | 'onDurableResyncRequired' | 'socketFactory'>
-  > & Pick<GatewayClientOptions, 'clientAttachment' | 'onDurableResyncRequired' | 'socketFactory'>
+    Omit<
+      GatewayClientOptions,
+      'clientAttachment' | 'onDurableResyncRequired' | 'onRuntimeSessionRebound' | 'socketFactory'
+    >
+  > & Pick<
+    GatewayClientOptions,
+    'clientAttachment' | 'onDurableResyncRequired' | 'onRuntimeSessionRebound' | 'socketFactory'
+  >
   private negotiatingConnect: {
     reject: (error: Error) => void
     resolve: () => void
@@ -341,6 +353,7 @@ export class JsonRpcGatewayClient {
       heartbeatIntervalMs: options.heartbeatIntervalMs ?? DEFAULT_HEARTBEAT_INTERVAL_MS,
       notConnectedErrorMessage: options.notConnectedErrorMessage ?? 'gateway not connected',
       onDurableResyncRequired: options.onDurableResyncRequired,
+      onRuntimeSessionRebound: options.onRuntimeSessionRebound,
       onSocketClose: options.onSocketClose ?? (() => false),
       requestIdPrefix: options.requestIdPrefix ?? 'r',
       requestTimeoutMs: options.requestTimeoutMs ?? DEFAULT_REQUEST_TIMEOUT_MS,
@@ -904,8 +917,16 @@ export class JsonRpcGatewayClient {
           this.options.onDurableResyncRequired?.(resync)
 
           if (tracked?.durableSessionId) {
-            void this.request('session.resume', {
+            void this.request<{ session_id?: string }>('session.resume', {
               session_id: tracked.durableSessionId
+            }).then(result => {
+              if (typeof result?.session_id === 'string' && result.session_id) {
+                this.options.onRuntimeSessionRebound?.({
+                  durable_session_id: tracked.durableSessionId!,
+                  new_session_id: result.session_id,
+                  old_session_id: sessionId
+                })
+              }
             }).catch((error: unknown) => {
               this.dispatchEvent({
                 type: 'error',
@@ -1047,7 +1068,10 @@ export class JsonRpcGatewayClient {
       // One RPC per known session keeps params flat; sessions are few (<20).
       const results = await Promise.allSettled(
         entries.map(([sid, lastSeen]) =>
-          this.request<{ events?: Array<{ type: string; session_id?: string; seq?: number; payload?: unknown }> }>(
+          this.request<{
+            events?: Array<{ type: string; session_id?: string; seq?: number; payload?: unknown }>
+            truncated?: boolean
+          }>(
             'session.events.since',
             { session_id: sid, last_seen: lastSeen },
             REPLAY_REQUEST_TIMEOUT_MS
@@ -1055,8 +1079,22 @@ export class JsonRpcGatewayClient {
         )
       )
 
-      for (const result of results) {
+      for (const [index, result] of results.entries()) {
         if (result.status !== 'fulfilled' || !Array.isArray(result.value?.events)) {
+          continue
+        }
+
+        const [sessionId] = entries[index]
+
+        if (result.value.truncated === true) {
+          this.lastSeenSeq.delete(sessionId)
+          const durableSessionId = this.trackedSessions.get(sessionId)?.durableSessionId
+          this.options.onDurableResyncRequired?.({
+            ...(durableSessionId ? { durable_session_id: durableSessionId } : {}),
+            reason: 'replay_truncated',
+            session_id: sessionId
+          })
+
           continue
         }
 

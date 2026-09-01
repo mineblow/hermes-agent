@@ -1173,6 +1173,27 @@ export function resetTileRuntimeBindings(
   }
 }
 
+export function rebindRuntimeSession(oldRuntimeId: string, newRuntimeId: string) {
+  if (!oldRuntimeId || !newRuntimeId || oldRuntimeId === newRuntimeId) {
+    return
+  }
+
+  const previousState = $sessionStates.get()[oldRuntimeId]
+
+  if (previousState) {
+    dropSessionState(oldRuntimeId)
+    publishSessionState(newRuntimeId, previousState)
+  }
+
+  const tiles = $sessionTiles.get()
+
+  if (tiles.some(tile => tile.runtimeId === oldRuntimeId)) {
+    $sessionTiles.set(
+      tiles.map(tile => (tile.runtimeId === oldRuntimeId ? { ...tile, runtimeId: newRuntimeId } : tile))
+    )
+  }
+}
+
 /** Unbind ONE reclaimed runtime from whichever tile holds it — the targeted
  *  sibling of resetTileRuntimeBindings. The reconnect-time reset can't cover a
  *  backend reclaim: the WS re-dials immediately, but the orphan reaper fires a

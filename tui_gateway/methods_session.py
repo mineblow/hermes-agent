@@ -3555,10 +3555,21 @@ def _(rid, params: dict) -> dict:
             _sessions[new_sid]["active_session_lease"] = lease
             _sessions[new_sid]["runtime_owner_lease"] = branch_runtime_owner_lease
     except Exception as e:
-        if lease is not None:
-            lease.release()
-        if branch_runtime_owner_lease is not None and new_sid not in _sessions:
-            branch_runtime_owner_lease.release()
+        partial = _sessions.get(new_sid)
+        discarded = (
+            _pop_session_if_current(new_sid, partial) if partial is not None else None
+        )
+        if discarded is not None:
+            if lease is not None:
+                discarded.setdefault("active_session_lease", lease)
+            if branch_runtime_owner_lease is not None:
+                discarded.setdefault("runtime_owner_lease", branch_runtime_owner_lease)
+            _teardown_popped_session(discarded, end_reason="branch_init_failed")
+        else:
+            if lease is not None:
+                lease.release()
+            if branch_runtime_owner_lease is not None:
+                branch_runtime_owner_lease.release()
         return _err(rid, 5000, f"agent init failed on branch: {e}")
     finally:
         if branch_owns_db and branch_db is not None:

@@ -334,6 +334,92 @@ describe('GatewayClient websocket attach mode', () => {
     gw.kill()
   })
 
+  it('reattaches a live session with its replay watermark and restores event delivery after same-host reconnect', async () => {
+    process.env.HERMES_TUI_GATEWAY_URL = 'ws://gateway.test/api/ws?token=abc'
+    const gw = new GatewayClient()
+    const events: any[] = []
+    const exits: Array<null | number> = []
+
+    gw.on('event', event => events.push(event))
+    gw.on('exit', code => exits.push(code))
+    gw.start()
+    gw.drain()
+    await Promise.resolve()
+    const first = FakeWebSocket.instances[0]!
+    first.open()
+    first.message(JSON.stringify({
+      jsonrpc: '2.0', method: 'event',
+      params: { type: 'gateway.ready', payload: {
+        capabilities: ['client.attach', 'session.attach'], replay_epoch: 'epoch-1', runtime_host_id: 'host-1'
+      } }
+    }))
+    await vi.waitFor(() => expect(first.sent).toHaveLength(1))
+    const firstAttach = JSON.parse(first.sent[0] ?? '{}') as { id: string }
+    first.message(JSON.stringify({ id: firstAttach.id, jsonrpc: '2.0', result: { ok: true } }))
+    await vi.waitFor(() => expect(events.some(event => event.type === 'gateway.ready')).toBe(true))
+
+    const create = gw.request('session.create', {})
+    await vi.waitFor(() => expect(first.sent).toHaveLength(2))
+    const createFrame = JSON.parse(first.sent[1] ?? '{}') as { id: string }
+    first.message(JSON.stringify({
+      id: createFrame.id, jsonrpc: '2.0',
+      result: { session_id: 'live-session', stored_session_id: 'durable-session' }
+    }))
+    await create
+    first.message(JSON.stringify({
+      jsonrpc: '2.0', method: 'event',
+      params: { epoch: 'epoch-1', payload: { text: 'before drop' }, seq: 7, session_id: 'live-session', type: 'message.delta' }
+    }))
+
+    first.close(1011)
+    gw.start()
+    await Promise.resolve()
+    const second = FakeWebSocket.instances[1]!
+    second.open()
+    second.message(JSON.stringify({
+      jsonrpc: '2.0', method: 'event',
+      params: { type: 'gateway.ready', payload: {
+        capabilities: ['client.attach', 'session.attach'], replay_epoch: 'epoch-1', runtime_host_id: 'host-1'
+      } }
+    }))
+    await vi.waitFor(() => expect(second.sent).toHaveLength(1))
+    const clientAttach = JSON.parse(second.sent[0] ?? '{}') as { id: string }
+    second.message(JSON.stringify({ id: clientAttach.id, jsonrpc: '2.0', result: { ok: true } }))
+    await vi.waitFor(() => expect(second.sent).toHaveLength(2))
+
+    const sessionAttach = JSON.parse(second.sent[1] ?? '{}') as {
+      id: string
+      method: string
+      params: { last_seen_seq: number; mode: string; session_id: string }
+    }
+
+    expect(sessionAttach).toMatchObject({
+      method: 'session.attach',
+      params: { last_seen_seq: 7, mode: 'control', session_id: 'live-session' }
+    })
+    second.message(JSON.stringify({
+      id: sessionAttach.id, jsonrpc: '2.0',
+      result: {
+        events: [
+          { epoch: 'epoch-1', payload: { text: 'replayed' }, seq: 8, session_id: 'live-session', type: 'message.delta' }
+        ],
+        latest_seq: 8, replay_epoch: 'epoch-1', session_id: 'live-session'
+      }
+    }))
+
+    await vi.waitFor(() => expect(events.some(event => event.payload?.text === 'replayed')).toBe(true))
+    expect(exits).toEqual([])
+    second.message(JSON.stringify({
+      jsonrpc: '2.0', method: 'event',
+      params: { epoch: 'epoch-1', payload: { text: 'live again' }, seq: 9, session_id: 'live-session', type: 'message.delta' }
+    }))
+    await vi.waitFor(() => expect(events.map(event => event.payload?.text).filter(Boolean).slice(-2)).toEqual([
+      'replayed',
+      'live again'
+    ]))
+    gw.kill()
+  })
+
   it('negotiates a stable TUI identity before publishing gateway readiness', async () => {
     process.env.HERMES_TUI_GATEWAY_URL = 'ws://gateway.test/api/ws?token=abc'
     const gw = new GatewayClient()

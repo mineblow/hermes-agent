@@ -29,6 +29,7 @@ import { applyDelegationStatus, getDelegationState } from './delegationStore.js'
 import type { GatewayEventHandlerContext } from './interfaces.js'
 import { getOverlayState, patchOverlayState } from './overlayStore.js'
 import { flashGoodVibes, flashPet } from './petFlashStore.js'
+import { isLocalClientMessageId } from './submissionCore.js'
 import { turnController } from './turnController.js'
 import { getTurnState } from './turnStore.js'
 import { getUiState, patchUiState } from './uiStore.js'
@@ -434,6 +435,7 @@ export function createGatewayEventHandler(ctx: GatewayEventHandlerContext): (ev:
   // an abandoned-prompt record, so the tool.complete and message.complete
   // paths can't both persist the same prompt twice.
   const persistedAbandonedClarify = new Set<string>()
+  const seenPeerUserMessageIds = new Set<string>()
 
   // When a clarify prompt is dismissed without an answer (the backend _block
   // timed out and returned an empty string), the live ClarifyPrompt overlay is
@@ -666,6 +668,15 @@ export function createGatewayEventHandler(ctx: GatewayEventHandlerContext): (ev:
       void rpc('wake.start', { surface: 'tui' }).catch(() => undefined)
     }
 
+    // An attached websocket reconnect preserves the live runtime. GatewayClient
+    // has already restored session.attach (including replay) before publishing
+    // ready, so do not forge or resume another session on top of it.
+    if (getUiState().sid) {
+      patchUiState({ status: 'ready' })
+
+      return
+    }
+
     rpc<CommandsCatalogResponse>('commands.catalog', {})
       .then(r => {
         if (!r?.pairs) {
@@ -769,10 +780,17 @@ export function createGatewayEventHandler(ctx: GatewayEventHandlerContext): (ev:
           ? ev.payload.durable_session_ids
           : []
 
+        const recoveredSessionIds = Array.isArray(ev.payload?.recovered_session_ids)
+          ? ev.payload.recovered_session_ids
+          : []
+
         const index = sessionIds.findIndex((sessionId: unknown) => sessionId === sid)
         const durableSessionId = index >= 0 ? durableSessionIds[index] : undefined
+        const recoveredSessionId = index >= 0 ? recoveredSessionIds[index] : undefined
 
-        if (typeof durableSessionId === 'string' && durableSessionId) {
+        if (typeof recoveredSessionId === 'string' && recoveredSessionId) {
+          patchUiState({ sid: recoveredSessionId, status: 'ready' })
+        } else if (typeof durableSessionId === 'string' && durableSessionId) {
           resumeById(durableSessionId)
           patchUiState({ status: 'recovering session…' })
         }
@@ -797,6 +815,24 @@ export function createGatewayEventHandler(ctx: GatewayEventHandlerContext): (ev:
         }))
 
         setHistoryItems(prev => prev.map(m => (m.kind === 'intro' ? { ...m, info } : m)))
+
+        return
+      }
+
+      case 'message.user': {
+        const messageId = ev.payload?.message_id?.trim()
+
+        if (!messageId || seenPeerUserMessageIds.has(messageId) || isLocalClientMessageId(messageId)) {
+          return
+        }
+
+        seenPeerUserMessageIds.add(messageId)
+        appendMessage({
+          createdAt: typeof ev.payload.timestamp === 'number' ? ev.payload.timestamp : undefined,
+          messageId,
+          role: 'user',
+          text: ev.payload.text ?? ''
+        })
 
         return
       }

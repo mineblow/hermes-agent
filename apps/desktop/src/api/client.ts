@@ -1,4 +1,9 @@
-import { getOrCreateGatewayClientId, JsonRpcGatewayClient } from '@hermes/shared'
+import {
+  type DurableResyncRequest,
+  getOrCreateGatewayClientId,
+  JsonRpcGatewayClient,
+  type RuntimeSessionRebound
+} from '@hermes/shared'
 
 import type { HermesApiRequest } from '@/global'
 
@@ -25,11 +30,24 @@ const DEFAULT_GATEWAY_REQUEST_TIMEOUT_MS = 30_000
 // ever fires when the turn itself would have been abandoned server-side.
 export const PROMPT_SUBMIT_REQUEST_TIMEOUT_MS = 1_800_000
 
+export function desktopGatewayClientId(): string {
+  try {
+    return getOrCreateGatewayClientId('desktop', globalThis.sessionStorage)
+  } catch {
+    return getOrCreateGatewayClientId('desktop', null)
+  }
+}
+
+export interface HermesGatewayRecoveryOptions {
+  onDurableResyncRequired?: (request: DurableResyncRequest) => void
+  onRuntimeSessionRebound?: (rebound: RuntimeSessionRebound) => void
+}
+
 export class HermesGateway extends JsonRpcGatewayClient {
-  constructor() {
+  constructor(recovery: HermesGatewayRecoveryOptions = {}) {
     super({
       clientAttachment: {
-        client_id: getOrCreateGatewayClientId('desktop', null),
+        client_id: desktopGatewayClientId(),
         protocol_version: 1,
         surface: 'desktop'
       },
@@ -37,6 +55,8 @@ export class HermesGateway extends JsonRpcGatewayClient {
       connectErrorMessage: 'Could not connect to Hermes gateway',
       createRequestId: nextId => nextId,
       notConnectedErrorMessage: 'Hermes gateway is not connected',
+      onDurableResyncRequired: recovery.onDurableResyncRequired,
+      onRuntimeSessionRebound: recovery.onRuntimeSessionRebound,
       requestTimeoutMs: DEFAULT_GATEWAY_REQUEST_TIMEOUT_MS
     })
   }

@@ -4,6 +4,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 
 import type { ClientSessionState } from '@/app/types'
 import { createClientSessionState } from '@/lib/chat-runtime'
+import { $activeSessionId } from '@/store/session'
 import { $sessionStates, $sessionTiles, publishSessionState } from '@/store/session-states'
 import type { RpcEvent } from '@/types/hermes'
 
@@ -128,5 +129,54 @@ describe('session.reclaimed', () => {
 
     expect(wiringCache.has('live-gone')).toBe(false)
     expect(wiringCache.has('live-kept')).toBe(true)
+  })
+})
+
+describe('runtime recovery events', () => {
+  it('rebinds the active renderer state and tile from the old runtime id to the recovered id', () => {
+    mountStream()
+    const state = createClientSessionState('stored-1')
+    wiringCache.set('live-before', state)
+    publishSessionState('live-before', state)
+    $activeSessionId.set('live-before')
+    $sessionTiles.set([{ runtimeId: 'live-before', storedSessionId: 'stored-1' }])
+
+    act(() => stream.handleEvent({
+      type: 'session.runtime_recovered',
+      session_id: 'live-after',
+      payload: {
+        durable_session_id: 'stored-1',
+        new_session_id: 'live-after',
+        old_session_id: 'live-before'
+      }
+    } as RpcEvent))
+
+    expect($activeSessionId.get()).toBe('live-after')
+    expect(wiringCache.has('live-before')).toBe(false)
+    expect(wiringCache.get('live-after')).toBe(state)
+    expect($sessionStates.get()['live-before']).toBeUndefined()
+    expect($sessionStates.get()['live-after']).toBe(state)
+    expect($sessionTiles.get()[0].runtimeId).toBe('live-after')
+  })
+
+  it('hydrates durable history when replay can no longer be complete', () => {
+    const hydrate = vi.fn(async () => undefined)
+    stream = renderMessageStream(ACTIVE_SID, {
+      activeGatewayProfile: ACTIVE_PROFILE,
+      queryClient,
+      hydrateFromStoredSession: hydrate
+    })
+
+    act(() => stream.handleEvent({
+      type: 'session.durable_resync_required',
+      session_id: ACTIVE_SID,
+      payload: {
+        durable_session_id: 'stored-1',
+        reason: 'replay_truncated',
+        session_id: ACTIVE_SID
+      }
+    } as RpcEvent))
+
+    expect(hydrate).toHaveBeenCalledWith(3, 'stored-1', ACTIVE_SID)
   })
 })
