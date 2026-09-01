@@ -20,7 +20,8 @@
 - [x] Phase 1, Task 4: cleanup commit and fork push (`72f11d25f`)
 - [x] Phase 2, Task 3: authenticated two-WebSocket acceptance
 - [x] Phase 2, Task 4: complete live-event families and races
-- [ ] Phase 3, Task 5: transport-neutral runtime protocol (in progress)
+- [x] Phase 3, Task 5: transport-neutral runtime protocol
+- [ ] Phase 3, Task 6: async GatewayRunner frontend client (in progress)
 
 ---
 
@@ -180,6 +181,8 @@ rejection. The canonical five-file gate passes 817/817 under
 
 ### Task 5: Separate runtime protocol primitives from TUI presentation
 
+Status: complete.
+
 **Objective:** Let non-TUI frontends use the canonical owner without importing TUI rendering or request handlers.
 
 **Files:**
@@ -196,6 +199,15 @@ rejection. The canonical five-file gate passes 817/817 under
 - runtime protocol contains no Discord/Desktop/TUI rendering types.
 
 **TDD:** Move one behavior at a time behind tests while keeping the existing TUI proxy byte-compatible where required.
+
+**Result:** `hermes_cli/live_runtime_protocol.py` now owns dependency-free
+frontend hello, stable input, ordered runtime event, point-to-point control
+response, replay watermark, principal, identity, capability, attachment, and
+busy-policy validation. The neutral capability vocabulary uses
+`interaction.respond`; the existing proxy's `ui.respond` survives only in an
+explicit legacy compatibility set. `tui_gateway/runtime_proxy.py` delegates
+shared version/client/capability validation while retaining its existing hello
+wire shape. The canonical two-file gate passes 46/46.
 
 ### Task 6: Add an async frontend client for `GatewayRunner`
 

@@ -369,6 +369,26 @@ def test_handshake_rejects_owner_id_or_generation_mismatch():
             )
 
 
+def test_transport_neutral_protocol_extraction_keeps_proxy_hello_byte_compatible():
+    from hermes_cli.live_runtime_protocol import LIVE_RUNTIME_PROTOCOL_VERSION
+
+    owner = _owner()
+
+    assert runtime_proxy.handshake_frame(
+        owner,
+        client_id="client-a",
+        negotiated_capabilities=frozenset({"observe", "prompt.submit"}),
+    ) == {
+        "kind": "hello",
+        "protocol": LIVE_RUNTIME_PROTOCOL_VERSION,
+        "conversation_key": owner.conversation_key,
+        "owner_id": owner.owner_id,
+        "generation": owner.generation,
+        "client_id": "client-a",
+        "negotiated_capabilities": ["observe", "prompt.submit"],
+    }
+
+
 def test_handshake_rejects_unattested_auth_identity():
     owner = _owner()
     payload = runtime_proxy.handshake_frame(owner, client_id="client-a")

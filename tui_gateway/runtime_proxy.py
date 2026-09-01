@@ -22,9 +22,15 @@ from hermes_cli.live_runtime_owners import (
     claim_runtime_owner,
     lookup_runtime_owner,
 )
-from tui_gateway.session_events import SUPPORTED_CAPABILITIES
+from hermes_cli.live_runtime_protocol import (
+    LEGACY_PROXY_CAPABILITIES,
+    LIVE_RUNTIME_PROTOCOL_VERSION,
+    LiveRuntimeProtocolError,
+    validate_capabilities,
+    validate_client_id,
+)
 
-RUNTIME_PROXY_PROTOCOL_VERSION = 1
+RUNTIME_PROXY_PROTOCOL_VERSION = LIVE_RUNTIME_PROTOCOL_VERSION
 # Resume transcripts and tool results can legitimately exceed the old 512 KiB
 # ceiling. Keep the authenticated local transport bounded, but align it with a
 # practical websocket/message ceiling rather than rejecting normal sessions.
@@ -208,8 +214,10 @@ def handshake_frame(
     client_id: str,
     negotiated_capabilities: frozenset[str] | None = None,
 ) -> dict[str, Any]:
-    if not isinstance(client_id, str) or not client_id.strip():
-        raise ValueError("client_id must be a non-empty string")
+    try:
+        validate_client_id(client_id)
+    except LiveRuntimeProtocolError as exc:
+        raise ValueError("client_id must be a non-empty string") from exc
     frame: dict[str, Any] = {
         "kind": "hello",
         "protocol": RUNTIME_PROXY_PROTOCOL_VERSION,
@@ -258,17 +266,15 @@ def validate_handshake(
     raw_capabilities = frame.get("negotiated_capabilities")
     if raw_capabilities is None:
         return client_id, None
-    if (
-        not isinstance(raw_capabilities, list)
-        or len(raw_capabilities) > len(SUPPORTED_CAPABILITIES)
-        or len(set(raw_capabilities)) != len(raw_capabilities)
-        or any(
-            not isinstance(capability, str) or capability not in SUPPORTED_CAPABILITIES
-            for capability in raw_capabilities
-        )
-    ):
+    if not isinstance(raw_capabilities, list):
         raise RuntimeProxyProtocolError("invalid negotiated capabilities")
-    return client_id, frozenset(raw_capabilities)
+    try:
+        return client_id, validate_capabilities(
+            raw_capabilities,
+            supported=LEGACY_PROXY_CAPABILITIES,
+        )
+    except LiveRuntimeProtocolError as exc:
+        raise RuntimeProxyProtocolError("invalid negotiated capabilities") from exc
 
 
 def encode_frame(frame: dict[str, Any]) -> bytes:
