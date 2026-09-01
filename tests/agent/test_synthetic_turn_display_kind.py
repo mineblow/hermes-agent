@@ -104,3 +104,19 @@ def test_a_real_user_turn_stays_untyped(agent_db):
 
     row, = [r for r in db.get_messages_as_conversation(sid) if r["role"] == "user"]
     assert row.get("display_kind") is None
+
+
+def test_real_user_turn_can_persist_identity_metadata_without_display_kind(agent_db):
+    agent, db, sid = agent_db
+
+    _build(
+        agent,
+        user_message="keep going",
+        persist_user_display_metadata={"client_message_id": "desktop-message-1"},
+    )
+
+    row, = [r for r in db.get_messages_as_conversation(sid) if r["role"] == "user"]
+    assert row.get("display_kind") is None
+    assert row["display_metadata"] == {
+        "client_message_id": "desktop-message-1"
+    }

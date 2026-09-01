@@ -749,8 +749,8 @@ def build_turn_context(
     # build strips both fields from every outgoing copy.
     if persist_user_display_kind:
         user_msg["display_kind"] = persist_user_display_kind
-        if persist_user_display_metadata:
-            user_msg["display_metadata"] = persist_user_display_metadata
+    if persist_user_display_metadata:
+        user_msg["display_metadata"] = persist_user_display_metadata
 
     append_message(messages, user_msg)
     current_turn_user_idx = len(messages) - 1

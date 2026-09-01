@@ -17,8 +17,9 @@
 - [x] Phase 1, Task 1: branch scope manifest
 - [x] Phase 1, Task 2: unrelated-diff and formatter-churn cleanup
 - [x] Phase 1, Task 3: scoped regression and security gates
-- [ ] Phase 1, Task 4: commit and push cleanup
-- [ ] Phase 2 onward
+- [x] Phase 1, Task 4: cleanup commit and fork push (`72f11d25f`)
+- [x] Phase 2, Task 3: authenticated two-WebSocket acceptance
+- [ ] Phase 2, Task 4: complete live-event families and races (in progress)
 
 ---
 
@@ -113,6 +114,8 @@ Status: complete in the working tree; commit pending the Task 3 gate.
 
 ### Task 3: Add real two-WebSocket acceptance coverage
 
+Status: complete.
+
 **Objective:** Prove Desktop/TUI/web semantics through the actual authenticated ASGI WebSocket boundary.
 
 **Files:**
@@ -130,6 +133,15 @@ Status: complete in the working tree; commit pending the Task 3 gate.
 8. One `run_conversation()` and one durable row exist per accepted ID.
 
 **Gate:** Focused WebSocket tests pass under `scripts/run_tests.sh`.
+
+**Result:** `tests/test_tui_gateway_ws.py` now drives three authenticated
+clients through the real `/api/ws` ASGI route. It proves controller and
+observer attachment, fail-closed observer mutation, ordered durable
+`message.user` fan-out, reconnect replay without gaps or duplicates, same-ID
+exactly-once retry, and same-text/different-ID execution. The RED scenario
+exposed idle retries executing twice; prompt admission now keeps a bounded
+accepted-ID ledger and reconstructs it from durable user-row metadata.
+`scripts/run_tests.sh tests/test_tui_gateway_ws.py` passes 10/10.
 
 ### Task 4: Cover complete live-event families and races
 

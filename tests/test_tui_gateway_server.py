@@ -661,6 +661,25 @@ def test_busy_queue_preserves_durable_user_metadata_and_message_identity(monkeyp
     assert kwargs["attachment_refs"] == ["attachment://one"]
 
 
+def test_accepted_client_message_identity_hydrates_from_durable_history():
+    session = {
+        "history": [
+            {
+                "role": "user",
+                "content": "hello",
+                "_db_persisted": True,
+                "display_metadata": {"client_message_id": "durable-message-1"},
+            }
+        ]
+    }
+
+    assert server._client_message_id_is_accepted(
+        session, "durable-message-1"
+    ) is True
+    assert session["accepted_client_message_ids"] == ["durable-message-1"]
+    assert server._client_message_id_is_accepted(session, "new-message") is False
+
+
 def test_mutating_rpc_ingress_is_serialized_per_live_runtime():
     first_controller = _LifecycleTransport("serialized-first")
     second_controller = _LifecycleTransport("serialized-second")

@@ -10170,6 +10170,63 @@ def _maybe_schedule_auto_continue(sid: str, session: dict, session_key: str) -> 
     return {"attempt": attempt, "interrupted_at": marker["started_at"]}
 
 
+_ACCEPTED_CLIENT_MESSAGE_IDS_LIMIT = 2048
+
+
+def _client_message_id_is_accepted(session: dict, client_message_id: str | None) -> bool:
+    """Return whether this stable client identity already owns an accepted turn.
+
+    Callers hold ``history_lock`` so admission and the transition to ``running``
+    remain one atomic decision across every attached controller.
+    """
+    if not client_message_id:
+        return False
+    if client_message_id in session.get("accepted_client_message_ids", ()):
+        return True
+    for history in (
+        session.get("history") or [],
+        session.get("display_history_prefix") or [],
+    ):
+        for message in history:
+            if not isinstance(message, dict) or message.get("role") != "user":
+                continue
+            metadata = message.get("display_metadata")
+            if (
+                isinstance(metadata, dict)
+                and metadata.get("client_message_id") == client_message_id
+            ):
+                _remember_accepted_client_message_id(session, client_message_id)
+                return True
+    return False
+
+
+def _remember_accepted_client_message_id(
+    session: dict, client_message_id: str | None
+) -> None:
+    """Remember accepted identities with bounded per-runtime retention."""
+    if not client_message_id:
+        return
+    accepted = session.setdefault("accepted_client_message_ids", [])
+    if client_message_id in accepted:
+        return
+    accepted.append(client_message_id)
+    overflow = len(accepted) - _ACCEPTED_CLIENT_MESSAGE_IDS_LIMIT
+    if overflow > 0:
+        del accepted[:overflow]
+
+
+def _forget_accepted_client_message_id(
+    session: dict, client_message_id: str | None
+) -> None:
+    """Roll back an admission that was cancelled before execution started."""
+    if not client_message_id:
+        return
+    accepted = session.get("accepted_client_message_ids")
+    if isinstance(accepted, list):
+        with contextlib.suppress(ValueError):
+            accepted.remove(client_message_id)
+
+
 def _enqueue_prompt(
     session: dict,
     text: Any,
@@ -10528,6 +10585,11 @@ def _drain_queued_prompt(rid, sid: str, session: dict) -> bool:
         session["queued_prompt"] = queued_prompts.pop(0) if queued_prompts else None
         if not queued_prompts:
             session.pop("queued_prompts", None)
+        queued_client_message_id = queued.get("client_message_id")
+        if _client_message_id_is_accepted(session, queued_client_message_id):
+            session["running"] = False
+            return bool(session.get("queued_prompt"))
+        _remember_accepted_client_message_id(session, queued_client_message_id)
         session["running"] = True
         if queued.get("transport") is not None:
             session["transport"] = queued["transport"]
@@ -10549,6 +10611,7 @@ def _drain_queued_prompt(rid, sid: str, session: dict) -> bool:
                 session["queued_prompts"] = rest
             else:
                 session.pop("queued_prompts", None)
+            _forget_accepted_client_message_id(session, queued_client_message_id)
             session["running"] = False
             return True
     dispatch_failed = False
@@ -13330,6 +13393,9 @@ def _run_prompt_submit(
                     _build_persist_user_message(prompt, images, run_message) if images else prompt
                 ),
             }
+            persist_user_display_metadata = dict(display_metadata or {})
+            if client_message_id:
+                persist_user_display_metadata["client_message_id"] = client_message_id
             # Type a synthesized turn at turn START so the crash persist writes
             # its row as a timeline event, instead of leaving a raw user bubble
             # until the turn ends — and forever if it never does, which is
@@ -13344,7 +13410,13 @@ def _run_prompt_submit(
                 run_kwargs["task_id"] = session["session_key"]
             if display_kind and "persist_user_display_kind" in _run_params:
                 run_kwargs["persist_user_display_kind"] = display_kind
-                run_kwargs["persist_user_display_metadata"] = display_metadata
+            if (
+                persist_user_display_metadata
+                and "persist_user_display_metadata" in _run_params
+            ):
+                run_kwargs[
+                    "persist_user_display_metadata"
+                ] = persist_user_display_metadata
             # Auto-titling now fires inside the turn prologue (shared by every
             # surface). Hand the agent this session's live-rename hook so the
             # sidebar repaints the moment a title lands, rather than waiting

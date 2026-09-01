@@ -363,6 +363,16 @@ def _(rid, params: dict) -> dict:
         return err
     if (limit_message := _ensure_active_session_slot(sid, session)) is not None:
         return _err(rid, 4090, limit_message)
+    with session["history_lock"]:
+        if _client_message_id_is_accepted(session, client_message_id):
+            return _ok(
+                rid,
+                {
+                    "status": "duplicate",
+                    "duplicate": True,
+                    "client_message_id": client_message_id,
+                },
+            )
     # Which desktop window this message was typed into. Rewritten on every
     # submit, because one session can be driven from the app window and the HUD
     # in turn: a stale "hud" would tell the model the user is still floating
@@ -841,6 +851,16 @@ def _(rid, params: dict) -> dict:
                             )
             session["history"] = truncated
             session["history_version"] = int(session.get("history_version", 0)) + 1
+        if _client_message_id_is_accepted(session, client_message_id):
+            return _ok(
+                rid,
+                {
+                    "status": "duplicate",
+                    "duplicate": True,
+                    "client_message_id": client_message_id,
+                },
+            )
+        _remember_accepted_client_message_id(session, client_message_id)
         session["running"] = True
         session["_turn_cancel_requested"] = False
         session["last_active"] = time.time()
@@ -894,6 +914,7 @@ def _(rid, params: dict) -> dict:
         from hermes_state import is_disk_full_error
 
         with session["history_lock"]:
+            _forget_accepted_client_message_id(session, client_message_id)
             session["running"] = False
             session["last_active"] = time.time()
             _clear_inflight_turn(session)

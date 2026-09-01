@@ -315,3 +315,268 @@ def test_ws_transport_preserves_cross_batch_order():
         assert entered == ["A1", "A2", "B1", "B2"]
 
     asyncio.run(scenario())
+
+
+def test_authenticated_asgi_websockets_share_one_durable_ordered_session(
+    monkeypatch, tmp_path
+):
+    """Exercise controller/observer semantics through the real ``/api/ws`` route."""
+    from fastapi.testclient import TestClient
+    from hermes_cli import web_server
+
+
+    run_prompts: list[str] = []
+    durable_rows: list[dict] = []
+
+    class Agent:
+        model = "test-model"
+        provider = "test-provider"
+        base_url = "https://example.invalid"
+        api_key = object()
+        api_mode = "test"
+
+        def run_conversation(
+            self, prompt, conversation_history=None, stream_callback=None, **_kwargs
+        ):
+            run_prompts.append(prompt)
+            durable_rows.append(
+                {
+                    "message_id": f"message-{len(run_prompts)}",
+                    "text": "same visible text",
+                }
+            )
+            self._on_user_message_persisted()
+            stream_callback(f"reply-{len(run_prompts)}")
+            return {
+                "final_response": f"reply-{len(run_prompts)}",
+                "messages": [
+                    {"role": "user", "content": prompt},
+                    {"role": "assistant", "content": f"reply-{len(run_prompts)}"},
+                ],
+            }
+
+    def receive_rpc(socket, request_id):
+        events = []
+        while True:
+            frame = socket.receive_json()
+            if frame.get("id") == request_id:
+                return frame, events
+            events.append(frame)
+
+    def rpc(socket, request_id, method, params=None):
+        socket.send_json(
+            {
+                "jsonrpc": "2.0",
+                "id": request_id,
+                "method": method,
+                "params": params or {},
+            }
+        )
+        return receive_rpc(socket, request_id)
+
+    def receive_through(socket, event_type):
+        events = []
+        while True:
+            frame = socket.receive_json()
+            events.append(frame)
+            if (frame.get("params") or {}).get("type") == event_type:
+                return events
+
+    def receive_until(socket, predicate):
+        events = []
+        while True:
+            frame = socket.receive_json()
+            events.append(frame)
+            if predicate(frame):
+                return events
+
+    old_auth_required = getattr(web_server.app.state, "auth_required", False)
+    previous_sessions = dict(server._sessions)
+    server._sessions.clear()
+    server._live_transports.clear()
+    web_server.app.state.auth_required = False
+    monkeypatch.setattr(web_server, "_DASHBOARD_EMBEDDED_CHAT_ENABLED", True)
+    monkeypatch.setattr(web_server, "_ws_request_is_allowed", lambda _ws: True)
+    monkeypatch.setattr(server, "_completion_cwd", lambda params=None: str(tmp_path))
+    monkeypatch.setattr(server, "_schedule_session_cap_enforcement", lambda: None)
+    monkeypatch.setattr(server, "_schedule_ws_orphan_reap", lambda _sid: None)
+    monkeypatch.setattr(server, "_start_agent_build", lambda _sid, _session: None)
+
+    monkeypatch.setattr(server, "make_stream_renderer", lambda _cols: None)
+    monkeypatch.setattr(server, "render_message", lambda _raw, _cols: None)
+    monkeypatch.setattr(server, "_get_db", lambda: None)
+
+    url = f"/api/ws?token={web_server._SESSION_TOKEN}"
+    client = TestClient(web_server.app)
+    try:
+        with client.websocket_connect(url) as controller_a:
+            assert controller_a.receive_json()["params"]["type"] == "gateway.ready"
+            assert "result" in rpc(
+                controller_a,
+                "client-a",
+                "client.attach",
+                {"client_id": "controller-a"},
+            )[0]
+            created, _ = rpc(controller_a, "create", "session.create")
+            sid = created["result"]["session_id"]
+            session = server._sessions[sid]
+            session["agent"] = Agent()
+            session["agent_ready"].set()
+
+            with client.websocket_connect(url) as controller_c:
+                assert controller_c.receive_json()["params"]["type"] == "gateway.ready"
+                rpc(
+                    controller_c,
+                    "client-c",
+                    "client.attach",
+                    {"client_id": "controller-c"},
+                )
+                attached_c, _ = rpc(
+                    controller_c,
+                    "attach-c",
+                    "session.attach",
+                    {"session_id": sid, "mode": "control"},
+                )
+                assert attached_c["result"]["mode"] == "control"
+
+                with client.websocket_connect(url) as observer_b:
+                    assert observer_b.receive_json()["params"]["type"] == "gateway.ready"
+                    rpc(
+                        observer_b,
+                        "client-b",
+                        "client.attach",
+                        {"client_id": "observer-b"},
+                    )
+                    attached_b, _ = rpc(
+                        observer_b,
+                        "attach-b",
+                        "session.attach",
+                        {"session_id": sid, "mode": "observe"},
+                    )
+                    assert attached_b["result"]["mode"] == "observe"
+
+                    denied, _ = rpc(
+                        observer_b,
+                        "observer-submit",
+                        "prompt.submit",
+                        {"session_id": sid, "text": "must fail"},
+                    )
+                    assert denied["error"]["code"] == 4003
+
+                    accepted, events_a = rpc(
+                        controller_a,
+                        "submit-1",
+                        "prompt.submit",
+                        {
+                            "session_id": sid,
+                            "text": "model-facing prompt",
+                            "display_text": "same visible text",
+                            "client_message_id": "message-1",
+                            "submitted_at": 1000.0,
+                        },
+                    )
+                    assert accepted["result"]["status"] == "streaming"
+                    events_a.extend(receive_through(controller_a, "message.complete"))
+                    events_a.extend(
+                        receive_until(
+                            controller_a,
+                            lambda frame: (
+                                (frame.get("params") or {}).get("type")
+                                == "session.info"
+                                and not (
+                                    (frame.get("params") or {}).get("payload") or {}
+                                ).get("running", True)
+                            ),
+                        )
+                    )
+                    events_c = receive_through(controller_c, "message.complete")
+                    events_b = receive_through(observer_b, "message.user")
+                    observer_seq = events_b[-1]["params"]["seq"]
+
+                    for events in (events_a, events_c):
+                        event_types = [frame["params"]["type"] for frame in events]
+                        assert event_types.index("message.user") < event_types.index(
+                            "message.delta"
+                        )
+                        assert event_types.index("message.delta") < event_types.index(
+                            "message.complete"
+                        )
+                    assert events_b[-1]["params"]["payload"] == {
+                        "message_id": "message-1",
+                        "text": "same visible text",
+                        "timestamp": 1000.0,
+                    }
+
+                with client.websocket_connect(url) as observer_b_reconnected:
+                    assert (
+                        observer_b_reconnected.receive_json()["params"]["type"]
+                        == "gateway.ready"
+                    )
+                    rpc(
+                        observer_b_reconnected,
+                        "client-b-reconnect",
+                        "client.attach",
+                        {"client_id": "observer-b"},
+                    )
+                    replayed, _ = rpc(
+                        observer_b_reconnected,
+                        "attach-b-reconnect",
+                        "session.attach",
+                        {
+                            "session_id": sid,
+                            "mode": "observe",
+                            "last_seen_seq": observer_seq,
+                        },
+                    )
+                    replay = replayed["result"]["events"]
+                    assert replay
+                    assert all(event["seq"] > observer_seq for event in replay)
+                    assert len({event["seq"] for event in replay}) == len(replay)
+                    assert not any(
+                        event["type"] == "message.user"
+                        and event["payload"].get("message_id") == "message-1"
+                        for event in replay
+                    )
+
+                duplicate, _ = rpc(
+                    controller_a,
+                    "retry-1",
+                    "prompt.submit",
+                    {
+                        "session_id": sid,
+                        "text": "model-facing prompt",
+                        "display_text": "same visible text",
+                        "client_message_id": "message-1",
+                        "submitted_at": 1001.0,
+                    },
+                )
+                assert duplicate["result"]["duplicate"] is True
+
+                distinct, _ = rpc(
+                    controller_a,
+                    "submit-2",
+                    "prompt.submit",
+                    {
+                        "session_id": sid,
+                        "text": "model-facing prompt",
+                        "display_text": "same visible text",
+                        "client_message_id": "message-2",
+                        "submitted_at": 1002.0,
+                    },
+                )
+                assert distinct["result"]["status"] == "streaming"
+                receive_through(controller_a, "message.complete")
+                receive_through(controller_c, "message.complete")
+
+                assert run_prompts == ["model-facing prompt", "model-facing prompt"]
+                assert durable_rows == [
+                    {"message_id": "message-1", "text": "same visible text"},
+                    {"message_id": "message-2", "text": "same visible text"},
+                ]
+    finally:
+        web_server.app.state.auth_required = old_auth_required
+        for sid, session in list(server._sessions.items()):
+            server._sessions.pop(sid, None)
+            server._teardown_session(session)
+        server._sessions.update(previous_sessions)
+        server._live_transports.clear()
