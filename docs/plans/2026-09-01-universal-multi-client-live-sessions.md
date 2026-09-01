@@ -21,7 +21,8 @@
 - [x] Phase 2, Task 3: authenticated two-WebSocket acceptance
 - [x] Phase 2, Task 4: complete live-event families and races
 - [x] Phase 3, Task 5: transport-neutral runtime protocol
-- [ ] Phase 3, Task 6: async GatewayRunner frontend client (in progress)
+- [x] Phase 3, Task 6: async GatewayRunner frontend client
+- [ ] Phase 4, Task 7: platform-neutral attachment state (in progress)
 
 ---
 
@@ -211,6 +212,8 @@ wire shape. The canonical two-file gate passes 46/46.
 
 ### Task 6: Add an async frontend client for `GatewayRunner`
 
+Status: complete.
+
 **Objective:** Provide a bounded, reconnecting async client for the canonical runtime owner.
 
 **Files:**
@@ -230,6 +233,15 @@ wire shape. The canonical two-file gate passes 46/46.
 - no retries after an unknown execution outcome.
 
 **Gate:** Existing TUI proxy tests and new async-client tests both pass.
+
+**Result:** `gateway/live_runtime_client.py` provides an injected-transport
+async client with bounded inbound/outbound queues, request correlation,
+ordered callback delivery, generation fencing, replay-watermark reconnect,
+truncation resync signaling, caller cancellation, and clean shutdown. Sent
+requests fail with `UnknownExecutionOutcome` after transport loss and are never
+retried. Superseded connections close before reconnect and stale inbound
+frames are discarded in favor of replay from the last callback-delivered
+watermark. The canonical client/proxy gate passes 40/40.
 
 ---
 
