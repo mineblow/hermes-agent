@@ -1158,7 +1158,7 @@ class TeamsAdapter(BasePlatformAdapter):
                 ),
             )
 
-        resolve_gateway_approval(session_key, choice)
+        count = resolve_gateway_approval(session_key, choice)
 
         label_map = {
             "once": "✅ Allowed (once)",
@@ -1174,7 +1174,15 @@ class TeamsAdapter(BasePlatformAdapter):
             body.append(TextBlock(text=f"```\n{cmd}\n```", wrap=True))
         if desc:
             body.append(TextBlock(text=f"Reason: {desc}", wrap=True, isSubtle=True))
-        body.append(TextBlock(text=label_map[choice], wrap=True, weight="Bolder"))
+        if not count:
+            decision_text = "⌛ Approval expired or was resolved elsewhere"
+        elif ":interaction:" in session_key:
+            decision_text = (
+                "⏳ Response submitted; awaiting active runtime confirmation"
+            )
+        else:
+            decision_text = label_map[choice]
+        body.append(TextBlock(text=decision_text, wrap=True, weight="Bolder"))
 
         return InvokeResponse(
             status=200,

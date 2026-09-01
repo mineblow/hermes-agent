@@ -3129,43 +3129,46 @@ def _approval_request_payload(data: dict | None) -> dict:
     return payload
 
 
-def _pending_clarify_request_payload(sid: str) -> dict | None:
-    """Read the clarify prompt still blocking a session, if there is one.
-
-    Clarify prompts share `_block()`'s pending registry, so a reconnecting
-    client whose transport was detached when `clarify.request` was emitted
-    would otherwise never see the question — the agent thread stays parked on
-    the Event until timeout. Same replay contract as `pending_approval`: a
-    read-only snapshot, the registry stays authoritative and `clarify.respond`
-    with the embedded request_id resolves it.
-    """
+def _pending_clarify_request_payloads(sid: str) -> list[dict]:
+    """Read every clarify prompt still blocking a session."""
+    snapshots = []
     with _prompt_lock:
         for rid, (owner_sid, _ev) in _pending.items():
             if owner_sid != sid:
                 continue
             event, prompt_payload = _pending_prompt_payloads.get(rid, ("", {}))
-            if event == "clarify.request":
-                snapshot = dict(prompt_payload)
-                # Batch clarify: replay the answers locked so far, so a
-                # reconnecting client restores its per-question ✓ state
-                # instead of presenting every question as unanswered.
-                batch = _batch_clarify.get(rid)
-                if batch is not None and batch["answers"]:
-                    snapshot["answers"] = dict(batch["answers"])
-                return snapshot
-    return None
+            if event != "clarify.request":
+                continue
+            snapshot = dict(prompt_payload)
+            batch = _batch_clarify.get(rid)
+            if batch is not None and batch["answers"]:
+                snapshot["answers"] = dict(batch["answers"])
+            snapshots.append(snapshot)
+    return snapshots
+
+
+def _pending_clarify_request_payload(sid: str) -> dict | None:
+    """Read the oldest clarify prompt still blocking a session, if any."""
+    snapshots = _pending_clarify_request_payloads(sid)
+    return snapshots[0] if snapshots else None
+
+
+def _pending_approval_request_payloads(session_key: str) -> list[dict]:
+    """Read all unresolved approvals in a session."""
+    try:
+        from tools.approval import list_gateway_approvals
+
+        approvals = list_gateway_approvals(session_key)
+    except Exception:
+        logger.debug("failed to read pending approvals for %s", session_key, exc_info=True)
+        return []
+    return [_approval_request_payload(approval) for approval in approvals]
 
 
 def _pending_approval_request_payload(session_key: str) -> dict | None:
     """Read the oldest unresolved approval in a session, if there is one."""
-    try:
-        from tools.approval import get_pending_gateway_approval
-
-        approval = get_pending_gateway_approval(session_key)
-    except Exception:
-        logger.debug("failed to read pending approval for %s", session_key, exc_info=True)
-        return None
-    return _approval_request_payload(approval) if approval else None
+    approvals = _pending_approval_request_payloads(session_key)
+    return approvals[0] if approvals else None
 
 
 def _emit_approval_request(sid: str, data: dict | None) -> None:
@@ -3272,6 +3275,17 @@ _SESSION_RPC_CAPABILITIES = {
 
 def _authorization_session(method_name: str, params: dict) -> dict | None:
     """Resolve the live runtime whose capability protects one inbound RPC."""
+    # Clarification authority follows the server-owned pending request, never a
+    # caller-selected live session. request_id is a lookup hint; transport
+    # membership in the resolved session remains the authorization boundary.
+    if method_name == "clarify.respond":
+        request_id = str(params.get("request_id") or "")
+        if request_id:
+            with _prompt_lock:
+                pending = _pending.get(request_id)
+            if pending is not None:
+                return _sessions.get(pending[0])
+
     sid = str(params.get("session_id") or "")
     session = _sessions.get(sid) if sid else None
     if session is not None:
@@ -3299,6 +3313,20 @@ def _authorize_session_rpc(rid, method_name: str, params: dict) -> dict | None:
     capability = _SESSION_RPC_CAPABILITIES.get(method_name)
     if capability is None:
         return None
+    if method_name == "clarify.respond":
+        request_id = str(params.get("request_id") or "")
+        if request_id:
+            with _prompt_lock:
+                pending = _pending.get(request_id)
+                owner_available = (
+                    pending is None or pending[0] in _sessions
+                )
+            if (
+                pending is not None
+                and not owner_available
+                and current_transport() is not None
+            ):
+                return _err(rid, 4009, "clarification owner is unavailable")
     session = _authorization_session(method_name, params)
     if session is None:
         # Let the handler preserve its established not-found/expired response.
@@ -5172,6 +5200,9 @@ def _block(
 ) -> str:
     rid = uuid.uuid4().hex[:8]
     ev = threading.Event()
+    if timeout is not None and timeout >= 0:
+        payload["timeout_seconds"] = timeout
+        payload["expires_at"] = time.time() + timeout
     with _prompt_lock:
         _pending[rid] = (sid, ev)
         payload["request_id"] = rid
@@ -11382,10 +11413,15 @@ def _live_session_payload(
         payload["inflight"] = inflight
     if queued:
         payload["queued"] = queued
-    if approval := _pending_approval_request_payload(str(session.get("session_key") or "")):
-        payload["pending_approval"] = approval
-    if clarify := _pending_clarify_request_payload(sid):
-        payload["pending_clarify"] = clarify
+    session_key = str(session.get("session_key") or "")
+    approvals = _pending_approval_request_payloads(session_key)
+    clarifications = _pending_clarify_request_payloads(sid)
+    if approvals:
+        payload["pending_approval"] = approvals[0]
+        payload["pending_approvals"] = approvals
+    if clarifications:
+        payload["pending_clarify"] = clarifications[0]
+        payload["pending_clarifications"] = clarifications
     return payload
 
 
@@ -13465,6 +13501,8 @@ def _run_prompt_submit(
                     }
                     if attachment_refs:
                         payload["attachment_refs"] = list(attachment_refs)
+                    if display_metadata:
+                        payload["display_metadata"] = dict(display_metadata)
                     _emit("message.user", sid, payload)
                 _emit("sessions.changed", sid, {})
 
@@ -14386,45 +14424,55 @@ def _respond(rid, params, key, *, allow_expired=False):
     question_id = str(params.get("question_id") or "")
     resolution = None
     response = None
-    with _prompt_lock:
-        entry = _pending.get(r)
-        if not entry:
-            if allow_expired and r:
-                outcome = _clarification_outcome_locked(r) if key == "answer" else None
-                return _ok(rid, {"status": outcome or "expired"})
-            return _err(rid, 4009, f"no pending {key} request")
-        sid, ev = entry
-        batch = _batch_clarify.get(r)
-        if batch is not None and question_id:
-            # Per-question lock (multi-question clarify). The prompt lock makes
-            # the first valid response authoritative even when two attached
-            # controllers answer concurrently.
-            if question_id not in batch["qids"]:
-                return _err(rid, 4002, f"unknown question_id {question_id!r}")
-            if question_id in batch["answers"]:
-                return _ok(rid, {"status": "already_resolved"})
-            batch["answers"][question_id] = params.get(key, "")
-            remaining = [
-                qid for qid in batch["qids"] if qid not in batch["answers"]
-            ]
-            if not remaining:
+    network_clarification = key == "answer" and current_transport() is not None
+    session_guard = _sessions_lock if network_clarification else contextlib.nullcontext()
+    with session_guard:
+        with _prompt_lock:
+            entry = _pending.get(r)
+            if not entry:
+                if allow_expired and r:
+                    outcome = (
+                        _clarification_outcome_locked(r) if key == "answer" else None
+                    )
+                    return _ok(rid, {"status": outcome or "expired"})
+                return _err(rid, 4009, f"no pending {key} request")
+            sid, ev = entry
+            if network_clarification and _sessions.get(sid) is None:
+                return _err(rid, 4009, "clarification owner is unavailable")
+            requested_sid = str(params.get("session_id") or "")
+            if key == "answer" and requested_sid and requested_sid != sid:
+                return _err(rid, 4009, "no pending answer request for session")
+            batch = _batch_clarify.get(r)
+            if batch is not None and question_id:
+                # Per-question lock (multi-question clarify). The prompt lock makes
+                # the first valid response authoritative even when two attached
+                # controllers answer concurrently.
+                if question_id not in batch["qids"]:
+                    return _err(rid, 4002, f"unknown question_id {question_id!r}")
+                if question_id in batch["answers"]:
+                    return _ok(rid, {"status": "already_resolved"})
+                batch["answers"][question_id] = params.get(key, "")
+                remaining = [
+                    qid for qid in batch["qids"] if qid not in batch["answers"]
+                ]
+                if not remaining:
+                    ev.set()
+                response = {"status": "ok", "remaining": remaining}
+            else:
+                if r in _answers:
+                    return _ok(rid, {"status": "already_resolved"})
+                _answers[r] = params.get(key, "")
                 ev.set()
-            response = {"status": "ok", "remaining": remaining}
-        else:
-            if r in _answers:
-                return _ok(rid, {"status": "already_resolved"})
-            _answers[r] = params.get(key, "")
-            ev.set()
-            response = {"status": "ok"}
-        if key == "answer":
-            resolution = (
-                sid,
-                {
-                    "request_id": r,
-                    "question_id": question_id or None,
-                    "status": "resolved",
-                },
-            )
+                response = {"status": "ok"}
+            if key == "answer":
+                resolution = (
+                    sid,
+                    {
+                        "request_id": r,
+                        "question_id": question_id or None,
+                        "status": "resolved",
+                    },
+                )
     if resolution is not None and not _emit(
         "clarify.resolved",
         resolution[0],

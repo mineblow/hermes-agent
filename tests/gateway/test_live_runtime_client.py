@@ -40,6 +40,9 @@ class FakeConnection:
         runtime_id="runtime-1",
         replay_epoch="epoch-1",
         replay_truncated=False,
+        replay_seq=0,
+        resync_snapshot=None,
+        pending_interactions=None,
         on_send: Callable | None = None,
     ):
         self.owner = owner
@@ -47,6 +50,9 @@ class FakeConnection:
         self.runtime_id = runtime_id
         self.replay_epoch = replay_epoch
         self.replay_truncated = replay_truncated
+        self.replay_seq = replay_seq
+        self.resync_snapshot = resync_snapshot
+        self.pending_interactions = pending_interactions
         self.on_send = on_send
         self.sent = []
         self.inbound = asyncio.Queue()
@@ -55,7 +61,7 @@ class FakeConnection:
     async def send(self, frame):
         self.sent.append(frame)
         if frame["kind"] == "frontend.hello":
-            await self.inbound.put({
+            acknowledgement = {
                 "kind": "frontend.hello.ok",
                 "protocol": 1,
                 "owner_id": self.owner.owner_id,
@@ -65,7 +71,17 @@ class FakeConnection:
                 "replay_epoch": self.replay_epoch,
                 "accepted_capabilities": self.accepted_capabilities,
                 "replay_truncated": self.replay_truncated,
-            })
+                "replay_seq": self.replay_seq,
+            }
+            if self.replay_truncated:
+                acknowledgement["resync_snapshot"] = (
+                    self.resync_snapshot
+                    if self.resync_snapshot is not None
+                    else {"latest_assistant": None}
+                )
+            if self.pending_interactions is not None:
+                acknowledgement["pending_interactions"] = self.pending_interactions
+            await self.inbound.put(acknowledgement)
         if self.on_send is not None:
             result = self.on_send(self, frame)
             if asyncio.iscoroutine(result):
@@ -82,18 +98,199 @@ class FakeConnection:
 
 
 async def _client(owner_lookup, connector, **kwargs):
+    requested_capabilities = kwargs.pop(
+        "requested_capabilities",
+        {"observe", "prompt.submit", "clarify.respond"},
+    )
     return AsyncLiveRuntimeClient(
         conversation_key="durable-root",
         durable_root="durable-root",
         client_id="gateway-client-1",
         principal=PRINCIPAL,
         surface="gateway",
-        requested_capabilities={"observe", "prompt.submit", "clarify.respond"},
+        requested_capabilities=requested_capabilities,
         owner_lookup=owner_lookup,
         connector=connector,
         reconnect_delay=0,
         **kwargs,
     )
+
+
+@pytest.mark.asyncio
+async def test_reader_failure_drains_inflight_delivery_before_replay():
+    owner = _owner()
+    entered = asyncio.Event()
+    release = asyncio.Event()
+    delivered = []
+    connections = [
+        FakeConnection(owner),
+        FakeConnection(owner, replay_seq=1),
+    ]
+    connected = []
+
+    def connector(_owner):
+        connection = connections[len(connected)]
+        connected.append(connection)
+        return connection
+
+    async def on_event(event):
+        entered.set()
+        await release.wait()
+        delivered.append(event["seq"])
+
+    client = await _client(
+        lambda _key: owner,
+        connector,
+        on_event=on_event,
+        delivery_drain_timeout=1,
+    )
+    await client.start()
+    await connections[0].inbound.put({
+        "kind": "runtime.event",
+        "protocol": 1,
+        "runtime_id": "runtime-1",
+        "durable_session_id": "session-1",
+        "replay_epoch": "epoch-1",
+        "seq": 1,
+        "type": "message.complete",
+        "payload": {"text": "delivered"},
+    })
+    await asyncio.wait_for(entered.wait(), timeout=1)
+    await connections[0].inbound.put(EOFError("disconnected"))
+    await asyncio.sleep(0)
+
+    assert len(connected) == 1
+
+    release.set()
+    for _ in range(100):
+        if len(connected) == 2:
+            break
+        await asyncio.sleep(0.01)
+
+    assert delivered == [1]
+    assert len(connected) == 2
+    assert connections[1].sent[0]["replay"] == {"epoch": "epoch-1", "seq": 1}
+
+    await client.close()
+
+
+@pytest.mark.asyncio
+async def test_pending_interactions_are_delivered_before_attachment_is_ready():
+    owner = _owner()
+    restored = []
+    connection = FakeConnection(
+        owner,
+        accepted_capabilities=("observe", "interaction.respond"),
+        pending_interactions=[
+            {
+                "interaction_type": "approval",
+                "request_id": "approval-pending",
+                "payload": {"request_id": "approval-pending", "command": "deploy"},
+            }
+        ],
+    )
+
+    async def on_pending_interaction(interaction):
+        await asyncio.sleep(0)
+        restored.append(interaction)
+
+    client = await _client(
+        lambda _key: owner,
+        lambda _owner: connection,
+        requested_capabilities={"observe", "interaction.respond"},
+        on_pending_interaction=on_pending_interaction,
+    )
+
+    await client.start()
+
+    assert restored == [
+        {
+            "interaction_type": "approval",
+            "request_id": "approval-pending",
+            "payload": {"request_id": "approval-pending", "command": "deploy"},
+        }
+    ]
+    await client.close()
+
+
+@pytest.mark.asyncio
+async def test_close_hook_timeout_cannot_block_transport_shutdown():
+    owner = _owner()
+    connection = FakeConnection(owner)
+    blocked = asyncio.Event()
+
+    async def stalled_renderer_close():
+        blocked.set()
+        await asyncio.Future()
+
+    client = await _client(
+        lambda _key: owner,
+        lambda _owner: connection,
+        on_close=stalled_renderer_close,
+        close_hook_timeout=0.01,
+    )
+    await client.start()
+
+    await asyncio.wait_for(client.close(), timeout=0.2)
+
+    assert blocked.is_set()
+    assert connection.closed is True
+
+
+@pytest.mark.asyncio
+async def test_local_identity_registration_and_close_hooks_are_owned_by_client():
+    registered = []
+    closed = []
+    client = await _client(
+        lambda _key: None,
+        lambda _owner: None,
+        on_local_message_id=registered.append,
+        on_close=lambda: closed.append(True),
+    )
+
+    client.register_local_message_id("message-1")
+    await client.close()
+    await client.close()
+
+    assert registered == ["message-1"]
+    assert closed == [True]
+
+
+def test_truncated_hello_adopts_authoritative_replay_baseline():
+    resync = []
+    owner = _owner()
+    client = AsyncLiveRuntimeClient(
+        conversation_key="durable-root",
+        durable_root="durable-root",
+        client_id="gateway-client-1",
+        principal=PRINCIPAL,
+        surface="gateway",
+        requested_capabilities={"observe"},
+        owner_lookup=lambda _key: owner,
+        connector=lambda _owner: None,
+        on_resync_required=resync.append,
+    )
+    client._replay_epoch = "epoch-1"
+    client._last_seq = 3
+    client._accept_hello(
+        owner,
+        {
+            "kind": "frontend.hello.ok",
+            "protocol": 1,
+            "owner_id": owner.owner_id,
+            "generation": owner.generation,
+            "accepted_capabilities": ["observe"],
+            "runtime_id": "runtime-1",
+            "durable_session_id": "session-1",
+            "replay_epoch": "epoch-1",
+            "replay_truncated": True,
+            "replay_seq": 9,
+            "resync_snapshot": {"latest_assistant": None},
+        },
+    )
+
+    assert client.replay_watermark == ("epoch-1", 9)
+    assert len(resync) == 1
 
 
 @pytest.mark.asyncio
@@ -276,6 +473,7 @@ async def test_replay_truncation_requests_authoritative_durable_resync():
             "durable_session_id": "session-1",
             "runtime_id": "runtime-1",
             "replay_epoch": "epoch-1",
+            "snapshot": {"latest_assistant": None},
         }]
     finally:
         await client.close()

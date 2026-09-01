@@ -41,6 +41,11 @@ from typing import Any, Dict, Optional, Union
 # ── Message (assistant text) events ──────────────────────────────────────────
 
 @dataclass(frozen=True)
+class MessageStart:
+    """A canonical assistant turn has started."""
+
+
+@dataclass(frozen=True)
 class MessageChunk:
     """A delta of streamed assistant text.
 
@@ -66,6 +71,11 @@ class MessageStop:
     treating the turn as done.
     """
     final: bool = False
+    # Canonical runtime completion carries the authoritative final text. Local
+    # agent callbacks leave this unset and retain their existing explicit
+    # ``consumer.finish(final_text=...)`` lifecycle.
+    text: Optional[str] = None
+    status: Optional[str] = None
 
 
 @dataclass(frozen=True)
@@ -77,6 +87,30 @@ class Commentary:
     consumer renders it as its own message so it reads as a distinct beat.
     """
     text: str
+
+
+@dataclass(frozen=True)
+class PeerUserMessage:
+    """A durable user row submitted by another attached frontend.
+
+    Presentation only: the canonical owner already persisted this row before
+    publishing it, so gateway renderers must never write it to history again.
+    """
+
+    message_id: str
+    text: str
+    timestamp: float
+    attachment_refs: tuple[str, ...] = ()
+    display_metadata: Dict[str, Any] = field(default_factory=dict)
+
+
+@dataclass(frozen=True)
+class InteractionRequest:
+    """Transport-neutral approval or clarification presentation request."""
+
+    request_id: str
+    interaction_type: str
+    payload: Dict[str, Any] = field(default_factory=dict)
 
 
 # ── Tool-call events ─────────────────────────────────────────────────────────
@@ -98,6 +132,7 @@ class ToolCallChunk:
     # start and so "new"-mode dedup (only report when the tool changes) works
     # without the consumer tracking call order itself.
     index: int = 0
+    invocation_id: Optional[str] = None
 
 
 @dataclass(frozen=True)
@@ -114,6 +149,7 @@ class ToolCallFinished:
     duration: float = 0.0
     ok: bool = True
     index: int = 0
+    invocation_id: Optional[str] = None
 
 
 # ── Gateway control / lifecycle events ───────────────────────────────────────
@@ -149,9 +185,12 @@ class GatewayNotice:
 # than a marker base class) so a missing ``case`` in an exhaustive match is a
 # visible type error rather than a silent fall-through.
 StreamEvent = Union[
+    MessageStart,
     MessageChunk,
     MessageStop,
     Commentary,
+    PeerUserMessage,
+    InteractionRequest,
     ToolCallChunk,
     ToolCallFinished,
     LongToolHint,
@@ -160,9 +199,12 @@ StreamEvent = Union[
 
 
 __all__ = [
+    "MessageStart",
     "MessageChunk",
     "MessageStop",
     "Commentary",
+    "PeerUserMessage",
+    "InteractionRequest",
     "ToolCallChunk",
     "ToolCallFinished",
     "LongToolHint",

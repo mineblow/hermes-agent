@@ -25,6 +25,7 @@ except ModuleNotFoundError:
     pass
 
 import asyncio
+import hashlib
 import concurrent.futures
 import dataclasses
 import faulthandler
@@ -6979,6 +6980,64 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             registry_home=registry_home,
         )
 
+    def _make_live_runtime_renderer(self, source, *, on_interaction=None):
+        """Build one presentation-only canonical runtime renderer."""
+        from gateway.config import StreamingConfig
+        from gateway.display_config import resolve_display_setting
+        from gateway.stream_consumer import (
+            GatewayStreamConsumer,
+            LiveRuntimeStreamRenderer,
+        )
+
+        adapter = self._adapter_for_source(source)
+        if adapter is None:
+            raise RuntimeError("no platform adapter for canonical runtime output")
+        scfg = getattr(getattr(self, "config", None), "streaming", None)
+        if scfg is None:
+            scfg = StreamingConfig()
+        platform_key = _platform_config_key(source.platform)
+        platform_streaming = resolve_display_setting(
+            _load_gateway_config(), platform_key, "streaming"
+        )
+        streaming_enabled = (
+            scfg.enabled and scfg.transport != "off"
+            if platform_streaming is None
+            else bool(platform_streaming)
+        )
+        consumer_cfg, pause_typing = self._build_stream_consumer_config(
+            source,
+            scfg,
+            adapter,
+            on_missing_cursor="fallback",
+        )
+        if not streaming_enabled:
+            consumer_cfg.buffer_only = True
+            consumer_cfg.cursor = ""
+            consumer_cfg.transport = "edit"
+        metadata = self._thread_metadata_for_source(source)
+
+        def consumer_factory():
+            return GatewayStreamConsumer(
+                adapter=adapter,
+                chat_id=source.chat_id,
+                config=consumer_cfg,
+                metadata=metadata,
+                on_before_finalize=pause_typing,
+                run_still_current=lambda: True,
+            )
+
+        async def present_peer_user(event):
+            author = str(event.display_metadata.get("user_name") or "User").strip()
+            content = f"{author}: {event.text}" if author else event.text
+            await adapter.send(source.chat_id, content, metadata=metadata)
+
+        return LiveRuntimeStreamRenderer(
+            adapter,
+            consumer_factory,
+            on_peer_user=present_peer_user,
+            on_interaction=on_interaction,
+        )
+
     def _make_live_runtime_client(self, request):
         from gateway.live_runtime_client import AsyncLiveRuntimeClient
         from gateway.runtime_proxy_connection import RuntimeProxyAsyncConnection
@@ -6996,7 +7055,240 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 registry_home=registry_home,
             )
 
-        return AsyncLiveRuntimeClient(
+        interaction_tasks: dict[str, asyncio.Task] = {}
+        clarification_lock = asyncio.Lock()
+        client_holder = {}
+        interaction_session_key = self._session_key_for_source(request.source)
+        adapter = self._adapter_for_source(request.source)
+        metadata = self._thread_metadata_for_source(request.source)
+
+        async def wait_until_set(event, expires_at=None, timeout_seconds=None):
+            if (
+                isinstance(timeout_seconds, bool)
+                or not isinstance(timeout_seconds, (int, float))
+                or timeout_seconds < 0
+            ):
+                timeout_seconds = 300.0
+            if isinstance(expires_at, bool) or not isinstance(expires_at, (int, float)):
+                remaining = timeout_seconds
+            else:
+                remaining = min(
+                    timeout_seconds,
+                    max(0.0, expires_at - time.time()),
+                )
+            monotonic_deadline = asyncio.get_running_loop().time() + remaining
+            while not event.is_set():
+                remaining = monotonic_deadline - asyncio.get_running_loop().time()
+                if remaining <= 0:
+                    return False
+                await asyncio.sleep(min(0.25, remaining))
+            return True
+
+        async def run_interaction(event):
+            client = client_holder["client"]
+            if "interaction.respond" not in client.accepted_capabilities:
+                return
+            if event.interaction_type == "approval":
+                from tools import approval as approval_mod
+
+                data = dict(event.payload)
+                data["request_id"] = event.request_id
+                sender = getattr(type(adapter), "send_exec_approval", None)
+                approval_session_key = interaction_session_key
+                if sender is not None:
+                    correlation = hashlib.sha256(
+                        event.request_id.encode("utf-8")
+                    ).hexdigest()[:24]
+                    approval_session_key = (
+                        f"{interaction_session_key}:interaction:{correlation}"
+                    )
+                entry = approval_mod.register_external_gateway_approval(
+                    approval_session_key, data
+                )
+                try:
+                    if sender is not None:
+                        sent = await adapter.send_exec_approval(
+                            chat_id=request.source.chat_id,
+                            command=str(data.get("command") or ""),
+                            session_key=approval_session_key,
+                            description=str(
+                                data.get("description") or "dangerous command"
+                            ),
+                            metadata=metadata,
+                            allow_permanent=data.get("allow_permanent") is not False,
+                            allow_session=data.get("allow_session") is not False,
+                            smart_denied=bool(data.get("smart_denied")),
+                        )
+                    else:
+                        await adapter.send(
+                            request.source.chat_id,
+                            "Approval requires a controller-capable client; "
+                            "this adapter cannot safely correlate the response.",
+                            metadata=metadata,
+                        )
+                        return
+                    if not getattr(sent, "success", False):
+                        return
+                    if not await wait_until_set(
+                        entry.event,
+                        data.get("expires_at"),
+                        data.get("timeout_seconds"),
+                    ):
+                        return
+                    choice = entry.result
+                    if choice == "approve":
+                        choice = "once"
+                    if choice not in {"once", "session", "always", "deny"}:
+                        return
+                    response = {
+                        "interaction_type": "approval",
+                        "request_id": event.request_id,
+                        "choice": choice,
+                    }
+                    if entry.reason:
+                        response["reason"] = entry.reason
+                    owner_result = await asyncio.wait_for(
+                        client.respond_to_interaction(response), timeout=30.0
+                    )
+                    if isinstance(owner_result, dict):
+                        if owner_result.get("resolved"):
+                            confirmation = (
+                                "✅ Approved by the active runtime."
+                                if choice != "deny"
+                                else "❌ Denied by the active runtime."
+                            )
+                        elif owner_result.get("status") in {
+                            "expired",
+                            "already_resolved",
+                        }:
+                            confirmation = (
+                                "⌛ Approval expired or was resolved elsewhere; "
+                                "the command was not approved by this response."
+                            )
+                        else:
+                            confirmation = None
+                        if confirmation:
+                            await adapter.send(
+                                request.source.chat_id,
+                                confirmation,
+                                metadata=metadata,
+                            )
+                finally:
+                    approval_mod.cancel_external_gateway_approval(
+                        approval_session_key, entry
+                    )
+                return
+
+            if event.interaction_type == "clarification":
+                from tools import clarify_gateway as clarify_mod
+
+                async with clarification_lock:
+                    data = dict(event.payload)
+                    choices = data.get("choices")
+                    if not isinstance(choices, list):
+                        choices = None
+                    entry = clarify_mod.register(
+                        event.request_id,
+                        interaction_session_key,
+                        str(data.get("question") or "Clarification required"),
+                        choices,
+                        bool(data.get("multi_select")),
+                    )
+                    forwarded = False
+                    try:
+                        sender = getattr(type(adapter), "send_clarify", None)
+                        if sender is not None:
+                            sent = await adapter.send_clarify(
+                                chat_id=request.source.chat_id,
+                                question=entry.question,
+                                choices=entry.choices,
+                                clarify_id=event.request_id,
+                                session_key=interaction_session_key,
+                                metadata=metadata,
+                            )
+                        else:
+                            sent = None
+                        if not getattr(sent, "success", False):
+                            sent = await adapter.send(
+                                request.source.chat_id,
+                                entry.question,
+                                metadata=metadata,
+                            )
+                        if not getattr(sent, "success", False):
+                            return
+                        if not await wait_until_set(
+                            entry.event,
+                            data.get("expires_at"),
+                            data.get("timeout_seconds"),
+                        ):
+                            return
+                        answer = clarify_mod.wait_for_response(event.request_id, 0.001)
+                        if answer is None:
+                            return
+                        forwarded = True
+                        await asyncio.wait_for(
+                            client.respond_to_interaction(
+                                {
+                                    "interaction_type": "clarification",
+                                    "request_id": event.request_id,
+                                    "answer": answer,
+                                }
+                            ),
+                            timeout=30.0,
+                        )
+                    finally:
+                        if not forwarded:
+                            clarify_mod.resolve_gateway_clarify(event.request_id, "")
+                            clarify_mod.wait_for_response(event.request_id, 0.001)
+
+        def interaction_done(task, request_id):
+            interaction_tasks.pop(request_id, None)
+            if task.cancelled():
+                return
+            error = task.exception()
+            if error is not None:
+                logger.error(
+                    "live runtime interaction %s failed: %s",
+                    request_id,
+                    error,
+                )
+
+        def present_interaction(event):
+            if event.request_id in interaction_tasks:
+                return
+            if len(interaction_tasks) >= 64:
+                logger.error("live runtime interaction broker is full")
+                return
+            task = asyncio.create_task(run_interaction(event))
+            interaction_tasks[event.request_id] = task
+            task.add_done_callback(
+                lambda done, request_id=event.request_id: interaction_done(
+                    done, request_id
+                )
+            )
+
+        def restore_interaction(interaction):
+            present_interaction(
+                InteractionRequest(
+                    request_id=interaction["request_id"],
+                    interaction_type=interaction["interaction_type"],
+                    payload=dict(interaction["payload"]),
+                )
+            )
+
+        renderer = self._make_live_runtime_renderer(
+            request.source, on_interaction=present_interaction
+        )
+
+        async def close_presentation():
+            tasks = list(interaction_tasks.values())
+            for task in tasks:
+                task.cancel()
+            if tasks:
+                await asyncio.gather(*tasks, return_exceptions=True)
+            await renderer.close()
+
+        client = AsyncLiveRuntimeClient(
             conversation_key=request.conversation_key,
             durable_root=request.durable_root,
             client_id=request.stable_client_id,
@@ -7008,6 +7300,11 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             surface=request.surface,
             requested_capabilities=request.requested_capabilities,
             owner_lookup=owner_lookup,
+            on_event=renderer.on_event,
+            on_resync_required=renderer.reset,
+            on_pending_interaction=restore_interaction,
+            on_local_message_id=renderer.register_local_message_id,
+            on_close=close_presentation,
             connector=lambda owner: RuntimeProxyAsyncConnection(
                 owner=owner,
                 durable_session_id=request.durable_session_id,
@@ -7020,6 +7317,8 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 requested_capabilities=request.requested_capabilities,
             ),
         )
+        client_holder["client"] = client
+        return client
 
     async def _live_runtime_attachment_for_input(
         self,

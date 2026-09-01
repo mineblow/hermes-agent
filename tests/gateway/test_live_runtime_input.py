@@ -26,8 +26,13 @@ class RequestClient:
 
     def __init__(self):
         self.requests = []
+        self.operations = []
+
+    def register_local_message_id(self, message_id):
+        self.operations.append(("register", message_id))
 
     async def request(self, payload):
+        self.operations.append(("request", payload["message_id"]))
         self.requests.append(payload)
         return {"status": "accepted", "message_id": payload["message_id"]}
 
@@ -85,6 +90,12 @@ async def test_native_redelivery_maps_to_same_client_message_id():
     first_frame, retry_frame = attachment.client.requests
     assert first_frame["message_id"] == retry_frame["message_id"]
     assert first_frame["message_id"].startswith("gateway-message-v1:")
+    assert attachment.client.operations == [
+        ("register", first_frame["message_id"]),
+        ("request", first_frame["message_id"]),
+        ("register", retry_frame["message_id"]),
+        ("request", retry_frame["message_id"]),
+    ]
 
 
 @pytest.mark.asyncio

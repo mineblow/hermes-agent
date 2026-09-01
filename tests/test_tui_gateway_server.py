@@ -136,6 +136,16 @@ def test_clarification_barrier_fans_out_but_only_controller_can_release_it():
     hub.attach(controller, client_id=controller.client_id, mode=AttachmentMode.CONTROL)
     hub.attach(observer, client_id=observer.client_id, mode=AttachmentMode.OBSERVE)
     server._sessions[sid] = session
+    other_sid = "different-live-session"
+    other_session = _session()
+    other_controller = _LifecycleTransport("different-session-controller")
+    other_hub = server._ensure_session_event_hub(other_sid, other_session)
+    other_hub.attach(
+        other_controller,
+        client_id=other_controller.client_id,
+        mode=AttachmentMode.CONTROL,
+    )
+    server._sessions[other_sid] = other_session
     result: list[str] = []
     worker = threading.Thread(
         target=lambda: result.append(
@@ -165,6 +175,21 @@ def test_clarification_barrier_fans_out_but_only_controller_can_release_it():
         assert denied is not None and "error" in denied
         assert worker.is_alive()
 
+        cross_session = _dispatch_sync(
+            {
+                "id": "cross-session-answer",
+                "method": "clarify.respond",
+                "params": {
+                    "session_id": other_sid,
+                    "request_id": request_id,
+                    "answer": "yes",
+                },
+            },
+            other_controller,
+        )
+        assert cross_session is not None and "error" in cross_session
+        assert worker.is_alive()
+
         accepted = _dispatch_sync(
             {
                 "id": "controller-answer",
@@ -178,8 +203,92 @@ def test_clarification_barrier_fans_out_but_only_controller_can_release_it():
         assert not worker.is_alive()
         assert result == ["yes"]
     finally:
+        server._sessions.pop(other_sid, None)
+        other_hub.close()
         server._sessions.pop(sid, None)
         hub.close()
+
+
+def test_orphaned_clarification_fails_closed_before_response_mutation():
+    request_id = "orphaned-clarification"
+    event = threading.Event()
+    attacker_sid = "attacker-live-session"
+    attacker_session = _session()
+    attacker = _LifecycleTransport("attacker-controller")
+    attacker_hub = server._ensure_session_event_hub(attacker_sid, attacker_session)
+    attacker_hub.attach(
+        attacker,
+        client_id=attacker.client_id,
+        mode=AttachmentMode.CONTROL,
+    )
+    server._sessions[attacker_sid] = attacker_session
+    with server._prompt_lock:
+        server._pending[request_id] = ("missing-owner-session", event)
+    try:
+        denied = _dispatch_sync(
+            {
+                "id": "orphaned-answer",
+                "method": "clarify.respond",
+                "params": {"request_id": request_id, "answer": "yes"},
+            },
+            attacker,
+        )
+        assert denied is not None and "error" in denied
+        assert denied["error"]["code"] == 4009
+        assert not event.is_set()
+        assert request_id not in server._answers
+    finally:
+        with server._prompt_lock:
+            server._pending.pop(request_id, None)
+            server._answers.pop(request_id, None)
+        server._sessions.pop(attacker_sid, None)
+        attacker_hub.close()
+
+
+def test_clarification_revalidates_owner_atomically_before_mutation(monkeypatch):
+    request_id = "clarification-owner-race"
+    event = threading.Event()
+    owner_sid = "clarification-race-owner"
+    owner_session = _session()
+    controller = _LifecycleTransport("clarification-race-controller")
+    owner_hub = server._ensure_session_event_hub(owner_sid, owner_session)
+    owner_hub.attach(
+        controller,
+        client_id=controller.client_id,
+        mode=AttachmentMode.CONTROL,
+    )
+    server._sessions[owner_sid] = owner_session
+    with server._prompt_lock:
+        server._pending[request_id] = (owner_sid, event)
+
+    original_authorize = server._authorize_session_rpc
+
+    def authorize_then_remove_owner(rid, method_name, params):
+        result = original_authorize(rid, method_name, params)
+        with server._sessions_lock:
+            server._sessions.pop(owner_sid, None)
+        return result
+
+    monkeypatch.setattr(server, "_authorize_session_rpc", authorize_then_remove_owner)
+    try:
+        denied = _dispatch_sync(
+            {
+                "id": "racing-answer",
+                "method": "clarify.respond",
+                "params": {"request_id": request_id, "answer": "yes"},
+            },
+            controller,
+        )
+        assert denied is not None and "error" in denied
+        assert denied["error"]["code"] == 4009
+        assert not event.is_set()
+        assert request_id not in server._answers
+    finally:
+        with server._prompt_lock:
+            server._pending.pop(request_id, None)
+            server._answers.pop(request_id, None)
+        server._sessions.pop(owner_sid, None)
+        owner_hub.close()
 
 
 def test_approval_request_fans_out_but_only_controller_can_resolve(
@@ -433,6 +542,64 @@ def test_session_events_since_requires_attached_observer():
         server._sessions.pop("private-sid", None)
         server._teardown_session(session)
         event_replay.release_session("private-sid")
+
+
+def test_presentation_snapshot_is_bounded_and_observer_authorized():
+    from tui_gateway import event_replay
+
+    owner = _LifecycleTransport("owner")
+    stranger = _LifecycleTransport("stranger")
+    session = {
+        "history_lock": threading.Lock(),
+        "history": [
+            {"role": "user", "content": "secret prompt"},
+            {"role": "assistant", "content": "authoritative final", "_row_id": 7},
+        ],
+        "transport": owner,
+    }
+    server._attach_current_transport(
+        "snapshot-sid", session, "observe", transport=owner
+    )
+    server._sessions["snapshot-sid"] = session
+    try:
+        server._emit(
+            "message.complete",
+            "snapshot-sid",
+            {"text": "authoritative final"},
+        )
+        _wait_for_event(owner, "message.complete")
+        denied = _dispatch_sync(
+            {
+                "id": "denied",
+                "method": "session.presentation.snapshot",
+                "params": {"session_id": "snapshot-sid"},
+            },
+            stranger,
+        )
+        assert denied["error"]["code"] == 4003
+        assert "authoritative final" not in json.dumps(denied)
+
+        allowed = _dispatch_sync(
+            {
+                "id": "allowed",
+                "method": "session.presentation.snapshot",
+                "params": {"session_id": "snapshot-sid"},
+            },
+            owner,
+        )
+        assert allowed["result"] == {
+            "session_id": "snapshot-sid",
+            "reconcilable": True,
+            "latest_assistant": {
+                "text": "authoritative final",
+                "row_id": 7,
+                "completion_seq": 1,
+            },
+        }
+    finally:
+        server._sessions.pop("snapshot-sid", None)
+        server._teardown_session(session)
+        event_replay.release_session("snapshot-sid")
 
 
 def test_client_attach_is_idempotent_and_connection_bound():
@@ -16929,6 +17096,7 @@ def test_prompt_submit_fans_out_user_row_before_assistant_events(monkeypatch):
         "message_id": "user-pc1-123",
         "text": "hello from pc 1",
         "timestamp": 1234.5,
+        "display_metadata": {"platform": "discord", "user_id": "user-1"},
     }
     assert server._sessions["sid"]["agent"]._on_user_message_persisted is None
     assert server._sessions["sid"]["agent"].persist_user_display_metadata == {

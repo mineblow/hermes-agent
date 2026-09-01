@@ -47,7 +47,18 @@ async def test_message_event_reaches_real_authenticated_runtime_proxy_once(tmp_p
                 "id": request["id"],
                 "result": {"session_id": "live-session-1"},
             }
-        assert request["method"] == "prompt.submit"
+        if request["method"] == "session.events.since":
+            return {
+                "jsonrpc": "2.0",
+                "id": request["id"],
+                "result": {
+                    "events": [],
+                    "latest_seq": 0,
+                    "truncated": False,
+                    "epoch": "epoch-1",
+                },
+            }
+        assert request["method"] in {"prompt.submit", "approval.respond"}
         dispatched.append(request)
         return {
             "jsonrpc": "2.0",
@@ -135,6 +146,25 @@ async def test_message_event_reaches_real_authenticated_runtime_proxy_once(tmp_p
             "/tmp/document.pdf",
         ]
         assert dispatched[0]["params"]["image_paths"] == ["/tmp/image.png"]
+
+        response = await attachment.client.respond_to_interaction(
+            {
+                "interaction_type": "approval",
+                "request_id": "approval-1",
+                "choice": "once",
+            }
+        )
+        assert response == {"status": "streaming"}
+        assert [request["method"] for request in dispatched] == [
+            "prompt.submit",
+            "approval.respond",
+        ]
+        assert dispatched[1]["params"] == {
+            "session_id": "live-session-1",
+            "request_id": "approval-1",
+            "choice": "once",
+        }
+        assert all(request["method"] != "ui.respond" for request in dispatched)
     finally:
         await bridge.close_all()
         server.stop()

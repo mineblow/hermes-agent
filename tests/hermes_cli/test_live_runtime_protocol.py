@@ -170,3 +170,44 @@ def test_control_response_is_point_to_point_and_exactly_one_of_result_or_error()
             result={"ok": True},
             error={"code": 1, "message": "bad"},
         )
+
+
+@pytest.mark.parametrize(
+    "payload",
+    [
+        None,
+        {},
+        {"interaction_type": "approval", "request_id": "approval-1"},
+        {
+            "interaction_type": "approval",
+            "request_id": "approval-1",
+            "choice": "maybe",
+        },
+        {
+            "interaction_type": "clarification",
+            "request_id": "clarify-1",
+            "answer": 42,
+        },
+    ],
+)
+def test_interaction_response_rejects_malformed_payloads(payload):
+    with pytest.raises(protocol.LiveRuntimeProtocolError):
+        protocol.validate_interaction_response(payload)
+
+
+def test_interaction_response_validates_approval_and_clarification():
+    approval = {
+        "interaction_type": "approval",
+        "request_id": "approval-1",
+        "choice": "once",
+        "reason": "reviewed",
+    }
+    clarification = {
+        "interaction_type": "clarification",
+        "request_id": "clarify-1",
+        "question_id": "question-1",
+        "answer": "production",
+    }
+
+    assert protocol.validate_interaction_response(approval) == approval
+    assert protocol.validate_interaction_response(clarification) == clarification

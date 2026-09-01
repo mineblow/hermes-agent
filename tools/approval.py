@@ -2826,6 +2826,47 @@ def unregister_gateway_notify(session_key: str) -> None:
         entry.event.set()
 
 
+def register_external_gateway_approval(
+    session_key: str, approval_data: dict
+) -> _ApprovalEntry:
+    """Register an owner-issued approval for existing gateway UI resolvers."""
+    if not session_key:
+        raise ValueError("session_key is required")
+    entry = _ApprovalEntry(approval_data)
+    with _lock:
+        _gateway_queues.setdefault(session_key, []).append(entry)
+    return entry
+
+
+def cancel_external_gateway_approval(
+    session_key: str, entry: _ApprovalEntry
+) -> None:
+    """Remove one externally registered approval without resolving the owner."""
+    with _lock:
+        queue = _gateway_queues.get(session_key, [])
+        if entry in queue:
+            queue.remove(entry)
+        if not queue:
+            _gateway_queues.pop(session_key, None)
+    entry.event.set()
+
+
+def wait_external_gateway_approval(
+    session_key: str, entry: _ApprovalEntry, timeout: float
+) -> tuple[Optional[str], Optional[str]]:
+    """Wait for one externally registered approval and remove it on timeout."""
+    resolved = entry.event.wait(timeout=max(0.0, timeout))
+    if not resolved:
+        with _lock:
+            queue = _gateway_queues.get(session_key, [])
+            if entry in queue:
+                queue.remove(entry)
+            if not queue:
+                _gateway_queues.pop(session_key, None)
+        return None, None
+    return entry.result, entry.reason
+
+
 def resolve_gateway_approval(session_key: str, choice: str,
                              resolve_all: bool = False,
                              reason: Optional[str] = None,
@@ -4531,6 +4572,13 @@ def _await_gateway_decision(session_key: str, notify_cb, approval_data: dict,
         surface=surface,
     )
 
+    # Compute and publish the canonical deadline before notifying any frontend.
+    # Reconnecting presentation brokers use this exact wall-clock deadline so
+    # stale local cards disappear when the owner stops accepting responses.
+    timeout = _get_approval_timeout()
+    entry.data["timeout_seconds"] = max(timeout, 0)
+    entry.data["expires_at"] = time.time() + max(timeout, 0)
+
     # Notify the user (bridges sync agent thread → async gateway)
     try:
         notify_cb(dict(entry.data))
@@ -4549,13 +4597,8 @@ def _await_gateway_decision(session_key: str, notify_cb, approval_data: dict,
         )
         return {"resolved": False, "choice": None, "notify_failed": True}
 
-    # Block until the user responds or the canonical approval timeout elapses
-    # (default 300s). Poll in short slices so we can fire activity heartbeats
-    # every ~10s to the agent's inactivity tracker — otherwise the gateway
-    # watchdog kills the agent while the user is still responding. Mirrors
-    # _wait_for_process() cadence.
-    timeout = _get_approval_timeout()
-
+    # Block until the user responds or the canonical approval timeout elapses.
+    # Poll in short slices so we can fire activity heartbeats.
     try:
         from tools.environments.base import touch_activity_if_due
     except Exception:  # pragma: no cover

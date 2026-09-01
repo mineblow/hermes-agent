@@ -3035,7 +3035,9 @@ class RelayAdapter(BasePlatformAdapter):
                     "always": "✅ Approved permanently",
                     "deny": "❌ Denied",
                 }.get(choice, "Resolved")
-                if not count:
+                if count and ":interaction:" in session_key:
+                    label = "⏳ Response submitted; awaiting active runtime confirmation"
+                elif not count:
                     label = "⌛ Approval expired — no command was waiting."
                 # Acknowledge in-channel (the connector's prompt message can't
                 # be edited cross-platform yet — edit support varies; a short

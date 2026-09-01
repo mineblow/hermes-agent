@@ -15,6 +15,7 @@ from hermes_cli.live_runtime_protocol import (
     SUPPORTED_CAPABILITIES,
     LiveRuntimeProtocolError,
     frontend_hello,
+    validate_interaction_response,
     validate_runtime_event,
 )
 
@@ -50,6 +51,7 @@ class LiveRuntimeClosed(LiveRuntimeClientError):
 @dataclass
 class _OutboundRequest:
     request_id: str
+    kind: str
     payload: dict[str, Any]
     future: asyncio.Future[Any]
 
@@ -82,14 +84,23 @@ class AsyncLiveRuntimeClient:
             [RuntimeOwner], AsyncRuntimeConnection | Awaitable[AsyncRuntimeConnection]
         ],
         on_event: Callable[[dict[str, Any]], Any] | None = None,
-        on_resync_required: Callable[[dict[str, str]], Any] | None = None,
+        on_resync_required: Callable[[dict[str, Any]], Any] | None = None,
+        on_pending_interaction: Callable[[dict[str, Any]], Any] | None = None,
+        on_local_message_id: Callable[[str], Any] | None = None,
+        on_close: Callable[[], Any] | None = None,
         queue_size: int = 64,
         reconnect_delay: float = 0.1,
+        delivery_drain_timeout: float = 30.0,
+        close_hook_timeout: float = 2.0,
     ) -> None:
         if queue_size < 1:
             raise ValueError("queue_size must be positive")
         if reconnect_delay < 0:
             raise ValueError("reconnect_delay must not be negative")
+        if delivery_drain_timeout <= 0:
+            raise ValueError("delivery_drain_timeout must be positive")
+        if close_hook_timeout <= 0:
+            raise ValueError("close_hook_timeout must be positive")
         if not requested_capabilities <= SUPPORTED_CAPABILITIES:
             raise ValueError("unsupported frontend capability")
         self.conversation_key = conversation_key
@@ -102,7 +113,13 @@ class AsyncLiveRuntimeClient:
         self._connector = connector
         self._on_event = on_event
         self._on_resync_required = on_resync_required
+        self._on_pending_interaction = on_pending_interaction
+        self._on_local_message_id = on_local_message_id
+        self._on_close = on_close
+        self._close_hook_called = False
         self._reconnect_delay = reconnect_delay
+        self._delivery_drain_timeout = delivery_drain_timeout
+        self._close_hook_timeout = close_hook_timeout
         self._outbound: asyncio.Queue[_OutboundRequest] = asyncio.Queue(
             maxsize=queue_size
         )
@@ -116,6 +133,10 @@ class AsyncLiveRuntimeClient:
         self._fatal: BaseException | None = None
         self._first_connected = asyncio.Event()
         self._state_changed = asyncio.Condition()
+        self._dispatch_idle = asyncio.Event()
+        self._dispatch_idle.set()
+        self._resync_task: asyncio.Task[Any] | None = None
+        self._pending_interactions: list[dict[str, Any]] = []
         self._owner_id: str | None = None
         self._owner_generation = 0
         self._runtime_id: str | None = None
@@ -167,11 +188,21 @@ class AsyncLiveRuntimeClient:
             await asyncio.gather(waiter, return_exceptions=True)
 
     async def request(self, payload: Mapping[str, Any]) -> Any:
+        return await self._request("control.request", dict(payload))
+
+    async def respond_to_interaction(self, payload: Mapping[str, Any]) -> Any:
+        if "interaction.respond" not in self.accepted_capabilities:
+            raise LiveRuntimeProtocolError("interaction response is not authorized")
+        return await self._request(
+            "interaction.respond", validate_interaction_response(payload)
+        )
+
+    async def _request(self, kind: str, payload: dict[str, Any]) -> Any:
         if self._closing or self._runner is None:
             raise LiveRuntimeClosed("live runtime client is not running")
         loop = asyncio.get_running_loop()
         future: asyncio.Future[Any] = loop.create_future()
-        item = _OutboundRequest(uuid.uuid4().hex, dict(payload), future)
+        item = _OutboundRequest(uuid.uuid4().hex, kind, payload, future)
         try:
             self._outbound.put_nowait(item)
         except asyncio.QueueFull as exc:
@@ -181,6 +212,10 @@ class AsyncLiveRuntimeClient:
         except asyncio.CancelledError:
             future.cancel()
             raise
+
+    def register_local_message_id(self, message_id: str) -> None:
+        if self._on_local_message_id is not None:
+            self._on_local_message_id(message_id)
 
     async def wait_for_sequence(self, seq: int) -> None:
         async with self._state_changed:
@@ -214,6 +249,17 @@ class AsyncLiveRuntimeClient:
                 await asyncio.gather(self._runner, return_exceptions=True)
             return
         self._closing = True
+        if self._on_close is not None and not self._close_hook_called:
+            self._close_hook_called = True
+            try:
+                await asyncio.wait_for(
+                    _maybe_await(self._on_close()),
+                    timeout=self._close_hook_timeout,
+                )
+            except (Exception, asyncio.CancelledError):
+                # Presentation teardown must never strand the authenticated
+                # runtime transport or its pending request futures.
+                pass
         connection = self._connection
         if connection is not None:
             await connection.close()
@@ -313,15 +359,33 @@ class AsyncLiveRuntimeClient:
         )
         acknowledgement = await connection.recv()
         self._accept_hello(owner, acknowledgement)
+        if self._resync_task is not None:
+            task = self._resync_task
+            self._resync_task = None
+            await task
+        pending_interactions = self._pending_interactions
+        self._pending_interactions = []
+        for interaction in pending_interactions:
+            if self._on_pending_interaction is None:
+                raise LiveRuntimeProtocolError(
+                    "pending interaction has no presentation callback"
+                )
+            await _maybe_await(self._on_pending_interaction(interaction))
         await self._notify_state()
         self._first_connected.set()
 
-        tasks = {
-            asyncio.create_task(self._writer(connection)),
-            asyncio.create_task(self._reader(connection)),
-            asyncio.create_task(self._dispatcher()),
-        }
+        writer = asyncio.create_task(self._writer(connection))
+        reader = asyncio.create_task(self._reader(connection))
+        dispatcher = asyncio.create_task(self._dispatcher())
+        tasks = {writer, reader, dispatcher}
         done, pending = await asyncio.wait(tasks, return_when=asyncio.FIRST_EXCEPTION)
+        if dispatcher in pending and not self._dispatch_idle.is_set():
+            try:
+                await asyncio.wait_for(
+                    self._dispatch_idle.wait(), timeout=self._delivery_drain_timeout
+                )
+            except TimeoutError:
+                pass
         for task in pending:
             task.cancel()
         await asyncio.gather(*pending, return_exceptions=True)
@@ -366,11 +430,74 @@ class AsyncLiveRuntimeClient:
         self._runtime_id = runtime_id
         self._durable_session_id = durable_session_id
         self.accepted_capabilities = frozenset(capabilities)
-        if self._replay_epoch != replay_epoch:
+        pending_interactions = frame.get("pending_interactions", [])
+        if not isinstance(pending_interactions, list):
+            raise LiveRuntimeProtocolError("invalid pending interactions")
+        if pending_interactions and "interaction.respond" not in capabilities:
+            raise LiveRuntimeProtocolError(
+                "observer acknowledgement contains pending interactions"
+            )
+        normalized_pending = []
+        pending_ids = set()
+        for interaction in pending_interactions:
+            if not isinstance(interaction, dict):
+                raise LiveRuntimeProtocolError("invalid pending interaction")
+            interaction_type = interaction.get("interaction_type")
+            request_id = interaction.get("request_id")
+            payload = interaction.get("payload")
+            if (
+                interaction_type not in {"approval", "clarification"}
+                or not isinstance(request_id, str)
+                or not request_id.strip()
+                or request_id in pending_ids
+                or not isinstance(payload, dict)
+                or payload.get("request_id") != request_id
+            ):
+                raise LiveRuntimeProtocolError("invalid pending interaction")
+            pending_ids.add(request_id)
+            normalized_pending.append(
+                {
+                    "interaction_type": interaction_type,
+                    "request_id": request_id,
+                    "payload": dict(payload),
+                }
+            )
+        self._pending_interactions = normalized_pending
+        epoch_changed = self._replay_epoch != replay_epoch
+        if epoch_changed:
             self._replay_epoch = replay_epoch
             self._last_seq = 0
+        replay_seq = frame.get("replay_seq")
+        if (
+            isinstance(replay_seq, bool)
+            or not isinstance(replay_seq, int)
+            or replay_seq < self._last_seq
+        ):
+            raise LiveRuntimeProtocolError("invalid replay baseline")
+        if epoch_changed:
+            self._last_seq = replay_seq
         if frame.get("replay_truncated") is True:
-            self._signal_resync()
+            snapshot = frame.get("resync_snapshot")
+            latest_assistant = (
+                snapshot.get("latest_assistant") if isinstance(snapshot, dict) else None
+            )
+            if (
+                not isinstance(snapshot, dict)
+                or (
+                    latest_assistant is not None
+                    and (
+                        not isinstance(latest_assistant, dict)
+                        or not isinstance(latest_assistant.get("text"), str)
+                        or not latest_assistant["text"]
+                    )
+                )
+            ):
+                raise LiveRuntimeProtocolError("invalid presentation resync snapshot")
+            if not epoch_changed:
+                self._last_seq = replay_seq
+            self._signal_resync(snapshot)
+        elif not epoch_changed and replay_seq != self._last_seq:
+            raise LiveRuntimeProtocolError("unexpected replay baseline")
 
     async def _writer(self, connection: AsyncRuntimeConnection) -> None:
         while True:
@@ -381,7 +508,7 @@ class AsyncLiveRuntimeClient:
             try:
                 await connection.send(
                     {
-                        "kind": "control.request",
+                        "kind": item.kind,
                         "protocol": LIVE_RUNTIME_PROTOCOL_VERSION,
                         "request_id": item.request_id,
                         "payload": item.payload,
@@ -404,13 +531,17 @@ class AsyncLiveRuntimeClient:
     async def _dispatcher(self) -> None:
         while True:
             frame = await self._inbound.get()
-            kind = frame.get("kind") if isinstance(frame, dict) else None
-            if kind == "control.response":
-                self._dispatch_response(frame)
-            elif kind == "runtime.event":
-                await self._dispatch_event(frame)
-            else:
-                raise LiveRuntimeProtocolError("invalid runtime frame")
+            self._dispatch_idle.clear()
+            try:
+                kind = frame.get("kind") if isinstance(frame, dict) else None
+                if kind == "control.response":
+                    self._dispatch_response(frame)
+                elif kind == "runtime.event":
+                    await self._dispatch_event(frame)
+                else:
+                    raise LiveRuntimeProtocolError("invalid runtime frame")
+            finally:
+                self._dispatch_idle.set()
 
     def _dispatch_response(self, frame: dict[str, Any]) -> None:
         request_id = frame.get("request_id")
@@ -445,17 +576,19 @@ class AsyncLiveRuntimeClient:
         self._last_seq = seq
         await self._notify_state()
 
-    def _signal_resync(self) -> None:
+    def _signal_resync(self, snapshot: dict[str, Any] | None = None) -> None:
         if self._on_resync_required is None:
             return
-        signal = {
+        signal: dict[str, Any] = {
             "durable_session_id": str(self._durable_session_id),
             "runtime_id": str(self._runtime_id),
             "replay_epoch": str(self._replay_epoch),
         }
+        if snapshot is not None:
+            signal["snapshot"] = snapshot
         result = self._on_resync_required(signal)
         if inspect.isawaitable(result):
-            asyncio.create_task(result)
+            self._resync_task = asyncio.create_task(result)
 
     def _fail_all(self, error: BaseException) -> None:
         pending = self._pending

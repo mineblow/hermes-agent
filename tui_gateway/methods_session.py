@@ -3923,6 +3923,66 @@ def _(rid, params: dict) -> dict:
     })
 
 
+@method("session.presentation.snapshot")
+def _(rid, params: dict) -> dict:
+    """Return bounded authoritative state for a truncated presentation replay."""
+    sid = str(params.get("session_id") or "")
+    session = _sessions.get(sid)
+    if session is None:
+        return _err(rid, 4007, "session not live")
+    hub = session.get("event_hub")
+    transport = current_transport() or _stdio_transport
+    try:
+        if hub is None:
+            raise PermissionError("transport is not attached")
+        hub.require(transport, "observe")
+    except PermissionError:
+        return _err(rid, 4003, "session observe permission required")
+
+    history_lock = session.get("history_lock")
+    if history_lock is None:
+        history = list(session.get("history") or [])
+    else:
+        with history_lock:
+            history = list(session.get("history") or [])
+    messages = _history_to_messages(history)
+    latest_assistant = None
+    reconcilable = True
+    if messages and messages[-1].get("role") == "assistant":
+        text = messages[-1].get("text")
+        if isinstance(text, str) and text:
+            from tui_gateway import event_replay
+
+            completion = next(
+                (
+                    event
+                    for event in reversed(event_replay.events_since(sid, 0))
+                    if event.get("type") == "message.complete"
+                    and isinstance(event.get("payload"), dict)
+                    and event["payload"].get("text") == text
+                ),
+                None,
+            )
+            completion_seq = completion.get("seq") if completion is not None else None
+            if isinstance(completion_seq, int) and not isinstance(completion_seq, bool):
+                latest_assistant = {
+                    key: messages[-1][key]
+                    for key in ("text", "timestamp", "row_id")
+                    if key in messages[-1]
+                }
+                latest_assistant["completion_seq"] = completion_seq
+            else:
+                reconcilable = False
+    return _ok(
+        rid,
+        {
+            "session_id": sid,
+            "reconcilable": reconcilable,
+            "latest_assistant": latest_assistant,
+        },
+    )
+
+
 @method("session.events.stats")
 def _(rid, params: dict) -> dict:
     """Replay-buffer telemetry (ops/debug)."""

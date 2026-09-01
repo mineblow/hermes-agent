@@ -267,6 +267,42 @@ def validate_runtime_event(frame: Any) -> dict[str, Any]:
 _MISSING = object()
 
 
+def validate_interaction_response(payload: Any) -> dict[str, Any]:
+    if not isinstance(payload, Mapping):
+        raise LiveRuntimeProtocolError("invalid interaction response")
+    interaction_type = _nonempty(payload.get("interaction_type"), "interaction type")
+    request_id = _nonempty(payload.get("request_id"), "interaction request identity")
+    if interaction_type == "approval":
+        choice = payload.get("choice")
+        if choice not in {"once", "session", "always", "deny"}:
+            raise LiveRuntimeProtocolError("invalid approval response")
+        response = {
+            "interaction_type": interaction_type,
+            "request_id": request_id,
+            "choice": choice,
+        }
+        reason = payload.get("reason")
+        if reason is not None:
+            response["reason"] = str(reason)
+        return _plain_json(response, "interaction response")
+    if interaction_type == "clarification":
+        answer = payload.get("answer")
+        if not isinstance(answer, str):
+            raise LiveRuntimeProtocolError("invalid clarification response")
+        response = {
+            "interaction_type": interaction_type,
+            "request_id": request_id,
+            "answer": answer,
+        }
+        question_id = payload.get("question_id")
+        if question_id is not None:
+            response["question_id"] = _nonempty(
+                question_id, "clarification question identity"
+            )
+        return _plain_json(response, "interaction response")
+    raise LiveRuntimeProtocolError("unsupported interaction type")
+
+
 def control_response(
     request_id: str,
     *,

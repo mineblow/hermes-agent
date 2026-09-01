@@ -1,6 +1,10 @@
 from __future__ import annotations
 
+import asyncio
+import time
 from datetime import UTC, datetime
+from types import SimpleNamespace
+from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 
@@ -116,6 +120,391 @@ async def test_authorized_message_routes_to_canonical_scheduler_without_local_ag
     assert len(client.requests) == 1
     assert client.requests[0]["kind"] == "runtime.input"
     assert runner._running_agent_items() == []
+
+
+def test_runner_client_factory_registers_renderer_before_start(monkeypatch, tmp_path):
+    runner = _runner(tmp_path, _owner(tmp_path))
+
+    class Renderer:
+        async def on_event(self, _event):
+            pass
+
+        def register_local_message_id(self, _message_id):
+            pass
+
+        async def close(self):
+            pass
+
+        async def reset(self, _signal=None):
+            pass
+
+    renderer = Renderer()
+    interaction_callback = {}
+
+    def make_renderer(source, *, on_interaction=None):
+        interaction_callback["callback"] = on_interaction
+        return renderer
+
+    runner._make_live_runtime_renderer = make_renderer
+    runner._adapter_for_source = lambda _source: SimpleNamespace()
+    runner._thread_metadata_for_source = lambda _source: {}
+    captured = {}
+
+    class CapturingClient:
+        def __init__(self, **kwargs):
+            captured.update(kwargs)
+
+    monkeypatch.setattr(
+        "gateway.live_runtime_client.AsyncLiveRuntimeClient", CapturingClient
+    )
+    request = SimpleNamespace(
+        conversation_key="conversation-1",
+        durable_root="root-1",
+        stable_client_id="gateway-client-1",
+        principal_id="user-1",
+        surface="discord",
+        requested_capabilities=frozenset({"observe"}),
+        durable_session_id="session-1",
+        routing_key=SimpleNamespace(profile="worker"),
+        source=_source(),
+    )
+
+    runner._make_live_runtime_client(request)
+
+    assert captured["on_event"] == renderer.on_event
+    assert captured["on_resync_required"] == renderer.reset
+    assert captured["on_local_message_id"] == renderer.register_local_message_id
+    assert callable(captured["on_close"])
+    assert interaction_callback["callback"] is not None
+
+
+@pytest.mark.asyncio
+async def test_runner_correlates_native_approvals_and_normalizes_legacy_approve(
+    monkeypatch, tmp_path
+):
+    from gateway.stream_events import InteractionRequest
+    from tools.approval import resolve_gateway_approval
+
+    runner = _runner(tmp_path, _owner(tmp_path))
+    callbacks = {}
+
+    class Renderer:
+        async def on_event(self, _event):
+            pass
+
+        def register_local_message_id(self, _message_id):
+            pass
+
+        async def reset(self, _signal=None):
+            pass
+
+        async def close(self):
+            pass
+
+    def make_renderer(_source, *, on_interaction=None):
+        callbacks["interaction"] = on_interaction
+        return Renderer()
+
+    approval_keys = []
+    confirmations = []
+
+    class Adapter:
+        async def send_exec_approval(self, **kwargs):
+            approval_keys.append(kwargs["session_key"])
+            return SimpleNamespace(success=True)
+
+        async def send(self, _chat_id, text, **_kwargs):
+            confirmations.append(text)
+            return SimpleNamespace(success=True)
+
+    created = {}
+
+    class CapturingClient:
+        accepted_capabilities = frozenset({"observe", "interaction.respond"})
+
+        def __init__(self, **kwargs):
+            created["client"] = self
+            created["on_close"] = kwargs["on_close"]
+            self.responses = []
+
+        async def respond_to_interaction(self, response):
+            self.responses.append(response)
+            if response["request_id"] == "approval-1":
+                return {"status": "expired", "resolved": 0}
+            return {"status": "resolved", "resolved": 1}
+
+    runner._make_live_runtime_renderer = make_renderer
+    runner._adapter_for_source = lambda _source: Adapter()
+    runner._thread_metadata_for_source = lambda _source: {"thread_id": "thread-1"}
+    monkeypatch.setattr(
+        "gateway.live_runtime_client.AsyncLiveRuntimeClient", CapturingClient
+    )
+    request = SimpleNamespace(
+        conversation_key="conversation-1",
+        durable_root="root-1",
+        stable_client_id="gateway-client-1",
+        principal_id="user-1",
+        surface="discord",
+        requested_capabilities=frozenset({"observe", "interaction.respond"}),
+        durable_session_id="session-1",
+        routing_key=SimpleNamespace(profile="worker"),
+        source=_source(),
+    )
+    runner._make_live_runtime_client(request)
+
+    callbacks["interaction"](
+        InteractionRequest(
+            request_id="approval-1",
+            interaction_type="approval",
+            payload={"command": "first", "description": "first approval"},
+        )
+    )
+    callbacks["interaction"](
+        InteractionRequest(
+            request_id="approval-2",
+            interaction_type="approval",
+            payload={"command": "second", "description": "second approval"},
+        )
+    )
+    for _ in range(20):
+        if len(approval_keys) == 2:
+            break
+        await asyncio.sleep(0.01)
+
+    assert len(approval_keys) == 2
+    assert approval_keys[0] != approval_keys[1]
+    assert resolve_gateway_approval(approval_keys[1], "once") == 1
+    for _ in range(50):
+        if created["client"].responses:
+            break
+        await asyncio.sleep(0.01)
+    assert created["client"].responses == [
+        {
+            "interaction_type": "approval",
+            "request_id": "approval-2",
+            "choice": "once",
+        }
+    ]
+
+    assert resolve_gateway_approval(approval_keys[0], "approve") == 1
+    for _ in range(50):
+        if len(created["client"].responses) == 2:
+            break
+        await asyncio.sleep(0.01)
+    assert created["client"].responses[1] == {
+        "interaction_type": "approval",
+        "request_id": "approval-1",
+        "choice": "once",
+    }
+    assert confirmations == [
+        "✅ Approved by the active runtime.",
+        "⌛ Approval expired or was resolved elsewhere; "
+        "the command was not approved by this response.",
+    ]
+
+    real_wall_time = time.time()
+    monkeypatch.setattr("gateway.run.time.time", lambda: real_wall_time - 3600.0)
+    callbacks["interaction"](
+        InteractionRequest(
+            request_id="approval-expiring",
+            interaction_type="approval",
+            payload={
+                "command": "expired",
+                "description": "expired approval",
+                "expires_at": real_wall_time + 0.05,
+                "timeout_seconds": 0.05,
+            },
+        )
+    )
+    for _ in range(50):
+        if len(approval_keys) == 3:
+            break
+        await asyncio.sleep(0.01)
+    await asyncio.sleep(0.1)
+    assert resolve_gateway_approval(approval_keys[2], "once") == 0
+    await created["on_close"]()
+
+
+@pytest.mark.asyncio
+async def test_runner_forwards_native_clarification_to_canonical_owner(
+    monkeypatch, tmp_path
+):
+    from gateway.stream_events import InteractionRequest
+    from tools.clarify_gateway import resolve_gateway_clarify
+
+    runner = _runner(tmp_path, _owner(tmp_path))
+    callbacks = {}
+
+    class Renderer:
+        async def on_event(self, _event):
+            pass
+
+        def register_local_message_id(self, _message_id):
+            pass
+
+        async def reset(self, _signal=None):
+            pass
+
+        async def close(self):
+            pass
+
+    def make_renderer(_source, *, on_interaction=None):
+        callbacks["interaction"] = on_interaction
+        return Renderer()
+
+    presented = []
+
+    class Adapter:
+        async def send_clarify(self, **kwargs):
+            presented.append(kwargs["clarify_id"])
+            return SimpleNamespace(success=True)
+
+    created = {}
+
+    class CapturingClient:
+        accepted_capabilities = frozenset({"observe", "interaction.respond"})
+
+        def __init__(self, **kwargs):
+            created["client"] = self
+            created["on_close"] = kwargs["on_close"]
+            self.responses = []
+
+        async def respond_to_interaction(self, response):
+            self.responses.append(response)
+            return {"status": "accepted"}
+
+    runner._make_live_runtime_renderer = make_renderer
+    runner._adapter_for_source = lambda _source: Adapter()
+    runner._thread_metadata_for_source = lambda _source: {}
+    monkeypatch.setattr(
+        "gateway.live_runtime_client.AsyncLiveRuntimeClient", CapturingClient
+    )
+    request = SimpleNamespace(
+        conversation_key="conversation-1",
+        durable_root="root-1",
+        stable_client_id="gateway-client-1",
+        principal_id="user-1",
+        surface="discord",
+        requested_capabilities=frozenset({"observe", "interaction.respond"}),
+        durable_session_id="session-1",
+        routing_key=SimpleNamespace(profile="worker"),
+        source=_source(),
+    )
+    runner._make_live_runtime_client(request)
+
+    callbacks["interaction"](
+        InteractionRequest(
+            request_id="clarify-1",
+            interaction_type="clarification",
+            payload={"question": "Which environment?"},
+        )
+    )
+    callbacks["interaction"](
+        InteractionRequest(
+            request_id="clarify-2",
+            interaction_type="clarification",
+            payload={"question": "Which region?"},
+        )
+    )
+    for _ in range(20):
+        if presented:
+            break
+        await asyncio.sleep(0.01)
+
+    assert presented == ["clarify-1"]
+    assert resolve_gateway_clarify("clarify-2", "west") is False
+    assert resolve_gateway_clarify("clarify-1", "production") is True
+    for _ in range(50):
+        if presented == ["clarify-1", "clarify-2"]:
+            break
+        await asyncio.sleep(0.01)
+    assert presented == ["clarify-1", "clarify-2"]
+    assert resolve_gateway_clarify("clarify-2", "west") is True
+    for _ in range(50):
+        if len(created["client"].responses) == 2:
+            break
+        await asyncio.sleep(0.01)
+
+    assert created["client"].responses == [
+        {
+            "interaction_type": "clarification",
+            "request_id": "clarify-1",
+            "answer": "production",
+        },
+        {
+            "interaction_type": "clarification",
+            "request_id": "clarify-2",
+            "answer": "west",
+        },
+    ]
+    await created["on_close"]()
+
+
+@pytest.mark.asyncio
+async def test_runner_renderer_delivers_canonical_completion_once_without_persistence(
+    monkeypatch, tmp_path
+):
+    from gateway.stream_consumer import StreamConsumerConfig
+    from gateway.stream_events import Commentary, MessageChunk, MessageStop
+
+    runner = _runner(tmp_path, _owner(tmp_path))
+    runner.config = SimpleNamespace(
+        streaming=SimpleNamespace(enabled=False, transport="off")
+    )
+    runner._session_db = MagicMock()
+    adapter = SimpleNamespace(
+        send=AsyncMock(
+            return_value=SimpleNamespace(success=True, message_id="delivered-1")
+        ),
+        edit_message=AsyncMock(),
+        MAX_MESSAGE_LENGTH=4096,
+        REQUIRES_EDIT_FINALIZE=False,
+        SENDS_FINALIZE_NOTIFICATION=False,
+        platform_name="discord",
+    )
+
+    def render_message_event(event, sink):
+        if isinstance(event, MessageChunk):
+            sink.on_delta(event.text)
+        elif isinstance(event, Commentary):
+            sink.on_commentary(event.text)
+        elif isinstance(event, MessageStop) and event.final:
+            sink.finish(final_text=event.text)
+
+    adapter.render_message_event = render_message_event
+    adapter.format_tool_event = lambda *_args, **_kwargs: None
+    runner._adapter_for_source = lambda source: adapter
+    runner._thread_metadata_for_source = lambda source: {"thread_id": source.thread_id}
+    runner._build_stream_consumer_config = lambda *_args, **_kwargs: (
+        StreamConsumerConfig(buffer_only=True, transport="edit", cursor=""),
+        None,
+    )
+    monkeypatch.setattr(
+        "gateway.display_config.resolve_display_setting", lambda *_args: False
+    )
+    renderer = runner._make_live_runtime_renderer(_source())
+
+    def event(event_type, payload, seq):
+        return {
+            "kind": "runtime.event",
+            "protocol": 1,
+            "runtime_id": "runtime-1",
+            "durable_session_id": "session-1",
+            "replay_epoch": "epoch-1",
+            "seq": seq,
+            "type": event_type,
+            "payload": payload,
+        }
+
+    await renderer.on_event(event("message.delta", {"text": "hello"}, 1))
+    await renderer.on_event(
+        event("message.complete", {"text": "hello", "status": "ok"}, 2)
+    )
+
+    adapter.send.assert_awaited_once()
+    assert adapter.send.await_args.kwargs["chat_id"] == "channel-1"
+    assert adapter.send.await_args.kwargs["content"] == "hello"
+    runner._session_db.assert_not_called()
 
 
 @pytest.mark.asyncio

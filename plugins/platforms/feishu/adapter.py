@@ -2198,8 +2198,30 @@ class FeishuAdapter(BasePlatformAdapter):
             return SendResult(success=False, error=str(exc))
 
     @staticmethod
-    def _build_resolved_approval_card(*, choice: str, user_name: str) -> Dict[str, Any]:
+    def _build_resolved_approval_card(
+        *, choice: str, user_name: str, pending_confirmation: bool = False
+    ) -> Dict[str, Any]:
         """Build raw card JSON for a resolved approval action."""
+        if pending_confirmation:
+            return {
+                "config": {"wide_screen_mode": True},
+                "header": {
+                    "title": {
+                        "content": "⏳ Response submitted",
+                        "tag": "plain_text",
+                    },
+                    "template": "grey",
+                },
+                "elements": [
+                    {
+                        "tag": "markdown",
+                        "content": (
+                            f"⏳ Response submitted by {user_name}; "
+                            "awaiting active runtime confirmation"
+                        ),
+                    },
+                ],
+            }
         icon = "❌" if choice == "deny" else "✅"
         label = _APPROVAL_LABEL_MAP.get(choice, "Resolved")
         return {
@@ -2832,7 +2854,11 @@ class FeishuAdapter(BasePlatformAdapter):
         if CallBackCard is not None:
             card = CallBackCard()
             card.type = "raw"
-            card.data = self._build_resolved_approval_card(choice=choice, user_name=user_name)
+            card.data = self._build_resolved_approval_card(
+                choice=choice,
+                user_name=user_name,
+                pending_confirmation=":interaction:" in str(state.get("session_key", "")),
+            )
             response.card = card
         return response
 

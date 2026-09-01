@@ -97,6 +97,7 @@ def stable_gateway_client_id(
 @dataclass(frozen=True)
 class LiveRuntimeAttachmentRequest:
     routing_key: LiveRuntimeRoutingKey
+    source: SessionSource
     stable_client_id: str
     principal_id: str
     surface: str
@@ -261,6 +262,11 @@ class LiveRuntimeBridge:
                 "user_name": getattr(event, "user_name", None) or source.user_name,
             },
         )
+        registrar = getattr(attachment.client, "register_local_message_id", None)
+        if callable(registrar):
+            registration = registrar(frame["message_id"])
+            if inspect.isawaitable(registration):
+                await registration
         try:
             return await asyncio.wait_for(
                 attachment.client.request(frame),
@@ -324,6 +330,7 @@ class LiveRuntimeBridge:
             requested_capabilities = self._capabilities(mode)
             request = LiveRuntimeAttachmentRequest(
                 routing_key=routing_key,
+                source=source,
                 stable_client_id=stable_gateway_client_id(
                     routing_key, resolved_profile_home
                 ),
