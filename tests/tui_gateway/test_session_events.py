@@ -389,6 +389,16 @@ def test_queue_overflow_detaches_only_slow_subscriber(monkeypatch):
 
         hub.attach(slow, client_id="slow-again", mode=AttachmentMode.OBSERVE)
         assert hub.has_transport(slow)
+        assert hub.publish({"event": 4})
+        slow.wait_for_count(2)
+        healthy.wait_for_count(4)
+        assert slow.frames == [{"event": 1}, {"event": 4}]
+        assert healthy.frames == [
+            {"event": 1},
+            {"event": 2},
+            {"event": 3},
+            {"event": 4},
+        ]
     finally:
         slow.release.set()
         hub.close()

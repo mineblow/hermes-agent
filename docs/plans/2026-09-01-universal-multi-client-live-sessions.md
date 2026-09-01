@@ -19,7 +19,8 @@
 - [x] Phase 1, Task 3: scoped regression and security gates
 - [x] Phase 1, Task 4: cleanup commit and fork push (`72f11d25f`)
 - [x] Phase 2, Task 3: authenticated two-WebSocket acceptance
-- [ ] Phase 2, Task 4: complete live-event families and races (in progress)
+- [x] Phase 2, Task 4: complete live-event families and races
+- [ ] Phase 3, Task 5: transport-neutral runtime protocol (in progress)
 
 ---
 
@@ -145,6 +146,8 @@ accepted-ID ledger and reconstructs it from durable user-row metadata.
 
 ### Task 4: Cover complete live-event families and races
 
+Status: complete.
+
 **Objective:** Prove the common publisher covers assistant, thinking, tools, terminal, approval, clarification, subagent, error, cancellation, usage, and completion events.
 
 **Files:**
@@ -159,6 +162,17 @@ accepted-ID ledger and reconstructs it from durable user-row metadata.
 5. Change production only after each test fails for the intended missing behavior.
 
 **Gate:** Existing TUI Gateway final suites pass with no new failures.
+
+**Result:** Parameterized coverage now proves that assistant, reasoning,
+thinking, tool, terminal, approval, clarification, subagent, error, usage, and
+completion families traverse one sequenced multi-client publisher. Explicit
+barrier tests prove observers receive approval/clarification requests but
+cannot resolve them, while controllers release the barrier. The deterministic
+slow-subscriber test now also proves detach, healthy-peer continuity, and
+successful reattachment. Existing compute-host and authenticated runtime-proxy
+tests cover unavailable-IPC inline fallback and unsupported capability
+rejection. The canonical five-file gate passes 817/817 under
+`scripts/run_tests.sh`.
 
 ---
 

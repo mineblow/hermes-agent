@@ -47,10 +47,12 @@ class _LifecycleTransport:
         self.auth_identity = None
         self.frames: list[dict] = []
         self._lock = threading.Lock()
+        self._condition = threading.Condition(self._lock)
 
     def write(self, obj: dict) -> bool:
-        with self._lock:
+        with self._condition:
             self.frames.append(obj)
+            self._condition.notify_all()
         return True
 
     def close(self) -> None:
@@ -63,6 +65,182 @@ class _LifecycleTransport:
                 for frame in self.frames
                 if frame.get("method") == "event"
             ]
+
+    def wait_for_event(self, event_type: str) -> dict:
+        with self._condition:
+            assert self._condition.wait_for(
+                lambda: event_type in [
+                    frame.get("params", {}).get("type")
+                    for frame in self.frames
+                    if frame.get("method") == "event"
+                ],
+                timeout=5,
+            ), f"transport did not receive {event_type}"
+            return next(
+                frame
+                for frame in self.frames
+                if frame.get("method") == "event"
+                and frame.get("params", {}).get("type") == event_type
+            )
+
+
+@pytest.mark.parametrize(
+    "event_type",
+    [
+        "message.delta",
+        "message.interim",
+        "reasoning.delta",
+        "thinking.delta",
+        "tool.start",
+        "tool.complete",
+        "agent.terminal.output",
+        "terminal.close",
+        "approval.request",
+        "clarify.request",
+        "subagent.start",
+        "subagent.tool",
+        "subagent.complete",
+        "error",
+        "session.usage",
+        "message.complete",
+    ],
+)
+def test_live_event_families_use_one_ordered_multi_client_publisher(event_type):
+    sid = f"event-family-{event_type}"
+    session = _session()
+    left = _LifecycleTransport("event-family-left")
+    right = _LifecycleTransport("event-family-right")
+    hub = server._ensure_session_event_hub(sid, session)
+    hub.attach(left, client_id=left.client_id, mode=AttachmentMode.CONTROL)
+    hub.attach(right, client_id=right.client_id, mode=AttachmentMode.OBSERVE)
+    server._sessions[sid] = session
+    try:
+        server._emit(event_type, sid, {"family": event_type})
+        left_frame = left.wait_for_event(event_type)
+        right_frame = right.wait_for_event(event_type)
+
+        assert left_frame == right_frame
+        assert left_frame["params"]["payload"] == {"family": event_type}
+        assert left_frame["params"]["seq"] > 0
+    finally:
+        server._sessions.pop(sid, None)
+        hub.close()
+
+
+def test_clarification_barrier_fans_out_but_only_controller_can_release_it():
+    sid = "clarification-barrier"
+    session = _session()
+    controller = _LifecycleTransport("clarification-controller")
+    observer = _LifecycleTransport("clarification-observer")
+    hub = server._ensure_session_event_hub(sid, session)
+    hub.attach(controller, client_id=controller.client_id, mode=AttachmentMode.CONTROL)
+    hub.attach(observer, client_id=observer.client_id, mode=AttachmentMode.OBSERVE)
+    server._sessions[sid] = session
+    result: list[str] = []
+    worker = threading.Thread(
+        target=lambda: result.append(
+            server._block(
+                "clarify.request",
+                sid,
+                {"question": "Deploy?", "choices": ["yes", "no"]},
+                timeout=5,
+            )
+        ),
+        daemon=True,
+    )
+    try:
+        worker.start()
+        request = observer.wait_for_event("clarify.request")
+        request_id = request["params"]["payload"]["request_id"]
+        assert controller.wait_for_event("clarify.request") == request
+
+        denied = _dispatch_sync(
+            {
+                "id": "observer-answer",
+                "method": "clarify.respond",
+                "params": {"request_id": request_id, "answer": "yes"},
+            },
+            observer,
+        )
+        assert denied is not None and "error" in denied
+        assert worker.is_alive()
+
+        accepted = _dispatch_sync(
+            {
+                "id": "controller-answer",
+                "method": "clarify.respond",
+                "params": {"request_id": request_id, "answer": "yes"},
+            },
+            controller,
+        )
+        assert accepted is not None and accepted["result"]["status"] == "ok"
+        worker.join(timeout=5)
+        assert not worker.is_alive()
+        assert result == ["yes"]
+    finally:
+        server._sessions.pop(sid, None)
+        hub.close()
+
+
+def test_approval_request_fans_out_but_only_controller_can_resolve(
+    monkeypatch,
+):
+    from tools import approval
+
+    sid = "approval-barrier"
+    session = _session(session_key="durable-approval-session")
+    controller = _LifecycleTransport("approval-controller")
+    observer = _LifecycleTransport("approval-observer")
+    hub = server._ensure_session_event_hub(sid, session)
+    hub.attach(controller, client_id=controller.client_id, mode=AttachmentMode.CONTROL)
+    hub.attach(observer, client_id=observer.client_id, mode=AttachmentMode.OBSERVE)
+    server._sessions[sid] = session
+    resolutions: list[tuple[str, str, dict]] = []
+    monkeypatch.setattr(
+        approval,
+        "resolve_gateway_approval",
+        lambda key, choice, **kwargs: resolutions.append((key, choice, kwargs)) or 1,
+    )
+    try:
+        server._emit(
+            "approval.request",
+            sid,
+            {"request_id": "approval-request-1", "command": "deploy"},
+        )
+        request = observer.wait_for_event("approval.request")
+        assert controller.wait_for_event("approval.request") == request
+
+        params = {
+            "session_id": sid,
+            "request_id": "approval-request-1",
+            "choice": "once",
+        }
+        denied = _dispatch_sync(
+            {"id": "observer-approval", "method": "approval.respond", "params": params},
+            observer,
+        )
+        assert denied is not None and "error" in denied
+        assert resolutions == []
+
+        accepted = _dispatch_sync(
+            {
+                "id": "controller-approval",
+                "method": "approval.respond",
+                "params": params,
+            },
+            controller,
+        )
+        assert accepted is not None and accepted["result"]["status"] == "resolved"
+        assert resolutions == [
+            (
+                "durable-approval-session",
+                "once",
+                {"resolve_all": False, "request_id": "approval-request-1"},
+            )
+        ]
+    finally:
+        server._sessions.pop(sid, None)
+        hub.close()
 
 
 def _wait_for_event(transport: _LifecycleTransport, event_type: str) -> None:
