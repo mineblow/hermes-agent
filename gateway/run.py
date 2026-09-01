@@ -6947,6 +6947,26 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             return None
         return sessions.get(session_key)
 
+    def _live_runtime_attachment_bridge(self):
+        """Lazily expose platform-neutral attachment state.
+
+        Creating this registry never constructs an ``AIAgent``. Task 8 binds
+        its async clients to canonical owners when routing approved input.
+        """
+        bridge = self.__dict__.get("_live_runtime_bridge_instance")
+        if bridge is None:
+            from gateway.live_runtime_bridge import LiveRuntimeBridge
+
+            bridge = LiveRuntimeBridge(self._session_state)
+            self.__dict__["_live_runtime_bridge_instance"] = bridge
+        return bridge
+
+    async def _close_live_runtime_attachments(self) -> None:
+        """Close an existing bridge without creating one during shutdown."""
+        bridge = self.__dict__.get("_live_runtime_bridge_instance")
+        if bridge is not None:
+            await bridge.close_all()
+
     def _is_session_running(self, session_key: str) -> bool:
         """True when the session holds a running-turn slot (agent or sentinel)."""
         state = self._peek_session_state(session_key)
@@ -15225,7 +15245,6 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 "Shutdown phase: notify_active_sessions done at +%.2fs",
                 _phase_elapsed(),
             )
-
             timeout = self._restart_drain_timeout
 
             # Pre-mark sessions as resume_pending BEFORE the drain wait.
@@ -15451,6 +15470,8 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             )
             if cancel_completion_batches is not None:
                 await cancel_completion_batches()
+
+            await self._close_live_runtime_attachments()
 
             for platform, adapter in list(self.adapters.items()):
                 await self._bounded_adapter_teardown(adapter, platform)

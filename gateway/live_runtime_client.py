@@ -130,6 +130,22 @@ class AsyncLiveRuntimeClient:
             return None
         return self._replay_epoch, self._last_seq
 
+    @property
+    def owner_id(self) -> str | None:
+        return self._owner_id
+
+    @property
+    def owner_generation(self) -> int:
+        return self._owner_generation
+
+    @property
+    def runtime_id(self) -> str | None:
+        return self._runtime_id
+
+    @property
+    def durable_session_id(self) -> str | None:
+        return self._durable_session_id
+
     async def start(self) -> None:
         if self._runner is not None:
             await self._wait_first_connection()

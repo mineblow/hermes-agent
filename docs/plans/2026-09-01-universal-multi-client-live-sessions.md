@@ -22,7 +22,8 @@
 - [x] Phase 2, Task 4: complete live-event families and races
 - [x] Phase 3, Task 5: transport-neutral runtime protocol
 - [x] Phase 3, Task 6: async GatewayRunner frontend client
-- [ ] Phase 4, Task 7: platform-neutral attachment state (in progress)
+- [x] Phase 4, Task 7: platform-neutral attachment state
+- [ ] Phase 4, Task 8: shared-scheduler messaging input (in progress)
 
 ---
 
@@ -249,6 +250,8 @@ watermark. The canonical client/proxy gate passes 40/40.
 
 ### Task 7: Add platform-neutral attachment state
 
+Status: complete.
+
 **Objective:** Track one gateway frontend attachment per authorized routing key without creating another `AIAgent`.
 
 **Files:**
@@ -266,6 +269,16 @@ watermark. The canonical client/proxy gate passes 40/40.
 - platform `SessionSource` used only for delivery.
 
 **TDD:** Prove attachment reuse, profile isolation, controller/observer modes, disconnect cleanup, and no duplicate local agent creation.
+
+**Result:** `gateway/live_runtime_bridge.py` now owns one async frontend
+attachment per authenticated profile/platform/scope/chat/thread/principal key.
+Resolved profile home scopes both the byte-compatible canonical-owner key and
+the opaque stable gateway client ID. Attachment state has an independent
+`SessionState` lifecycle, preserves `SessionSource` only for delivery, narrows
+observer capabilities to `observe`, replaces clients on durable-root/mode
+changes, and uses compare-and-swap detach protection. `GatewayRunner` creates
+the bridge lazily without constructing an `AIAgent` and closes it after agent
+drain but before adapter teardown. The reviewed five-file gate passes 64/64.
 
 ### Task 8: Route messaging input through the shared scheduler
 

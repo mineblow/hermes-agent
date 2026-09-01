@@ -105,6 +105,10 @@ async def test_connect_sends_neutral_hello_and_intersects_capabilities():
     try:
         await client.start()
         assert client.accepted_capabilities == frozenset({"observe"})
+        assert client.owner_id == owner.owner_id
+        assert client.owner_generation == owner.generation
+        assert client.runtime_id == "runtime-1"
+        assert client.durable_session_id == "session-1"
         assert connection.sent[0]["kind"] == "frontend.hello"
         assert connection.sent[0]["client_id"] == "gateway-client-1"
         assert connection.sent[0]["durable_root"] == "durable-root"
