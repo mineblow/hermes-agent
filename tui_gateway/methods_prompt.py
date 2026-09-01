@@ -300,6 +300,32 @@ def _(rid, params: dict) -> dict:
     # client renders it as a bubble. Whitelisted to "hidden" — display_kind
     # is a DB-only sidecar and this RPC must not mint arbitrary kinds.
     display_kind = "hidden" if params.get("display_kind") == "hidden" else None
+    client_message_id = params.get("client_message_id")
+    if not isinstance(client_message_id, str) or not client_message_id.strip():
+        client_message_id = None
+    else:
+        client_message_id = client_message_id.strip()[:256]
+    raw_display_text = params.get("display_text")
+    display_text = (
+        sanitize_user_prompt_text(raw_display_text)
+        if isinstance(raw_display_text, str)
+        else None
+    )
+    submitted_at = params.get("submitted_at")
+    if not isinstance(submitted_at, (int, float)) or isinstance(submitted_at, bool):
+        submitted_at = None
+    elif not 0 < submitted_at <= 4_102_444_800:
+        # Reject NaN/infinity and implausible dates before JSON event encoding.
+        submitted_at = None
+    attachment_refs = params.get("attachment_refs")
+    if isinstance(attachment_refs, list):
+        attachment_refs = [
+            ref[:4096]
+            for ref in attachment_refs[:128]
+            if isinstance(ref, str) and ref
+        ]
+    else:
+        attachment_refs = None
     # Typed bare stop phrase while backend voice mode is active ends the
     # voice chat instead of sending "stop" to the agent — the typed twin of
     # the spoken stop phrase (PR #73106), applied at the ONE server-side
@@ -829,7 +855,15 @@ def _(rid, params: dict) -> dict:
 
     if turn_isolation:
         isolated_response = _submit_prompt_to_compute_host(
-            rid, sid, session, text, display_kind=display_kind
+            rid,
+            sid,
+            session,
+            text,
+            display_kind=display_kind,
+            client_message_id=client_message_id,
+            display_text=display_text,
+            submitted_at=submitted_at,
+            attachment_refs=attachment_refs,
         )
         if not isolated_response.get("error"):
             if survivor_user_row_ids is not None and requested_rebind_ids is None:
@@ -925,7 +959,17 @@ def _(rid, params: dict) -> dict:
                     },
                 )
                 return
-        _run_prompt_submit(rid, sid, session, text, display_kind=display_kind)
+        _run_prompt_submit(
+            rid,
+            sid,
+            session,
+            text,
+            display_kind=display_kind,
+            client_message_id=client_message_id,
+            display_text=display_text,
+            submitted_at=submitted_at,
+            attachment_refs=attachment_refs,
+        )
 
     run_thread = threading.Thread(target=run_after_agent_ready, daemon=True)
     # Keep a handle so session.interrupt can tell a live turn from a stuck

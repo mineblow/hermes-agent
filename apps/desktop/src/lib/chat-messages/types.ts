@@ -52,6 +52,10 @@ export type GatewayEventPayload = {
   rendered?: string
   status?: string
   message?: string
+  // message.user — durable user row fanout for live multi-client sessions.
+  message_id?: string
+  attachment_refs?: string[]
+  display_kind?: string
   id?: string
   name?: string
   tool_id?: string

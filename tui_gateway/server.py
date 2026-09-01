@@ -2930,6 +2930,10 @@ def _compute_host_turn_frame(
     image_paths: list[str] | None = None,
     queued_prompt_generation: int | None = None,
     display_kind: str | None = None,
+    client_message_id: str | None = None,
+    display_text: str | None = None,
+    submitted_at: float | None = None,
+    attachment_refs: list[str] | None = None,
 ) -> dict:
     with session["history_lock"]:
         history = list(session.get("history", []))
@@ -2946,6 +2950,18 @@ def _compute_host_turn_frame(
         "session_key": session.get("session_key") or sid,
         "text": text,
         **({"display_kind": display_kind} if display_kind else {}),
+        **(
+            {"client_message_id": client_message_id}
+            if client_message_id
+            else {}
+        ),
+        **({"display_text": display_text} if display_text is not None else {}),
+        **({"submitted_at": submitted_at} if submitted_at is not None else {}),
+        **(
+            {"attachment_refs": list(attachment_refs)}
+            if attachment_refs is not None
+            else {}
+        ),
         "history": history,
         "history_version": history_version,
         "cols": int(session.get("cols", 80) or 80),
@@ -3037,6 +3053,10 @@ def _submit_prompt_to_compute_host(
     image_paths: list[str] | None = None,
     queued_prompt_generation: int | None = None,
     display_kind: str | None = None,
+    client_message_id: str | None = None,
+    display_text: str | None = None,
+    submitted_at: float | None = None,
+    attachment_refs: list[str] | None = None,
 ) -> dict:
     cfg = _load_dashboard_process_isolation_config()
     frame = _compute_host_turn_frame(
@@ -3047,6 +3067,10 @@ def _submit_prompt_to_compute_host(
         image_paths=image_paths,
         queued_prompt_generation=queued_prompt_generation,
         display_kind=display_kind,
+        client_message_id=client_message_id,
+        display_text=display_text,
+        submitted_at=submitted_at,
+        attachment_refs=attachment_refs,
     )
 
     def _complete(done: dict) -> None:
@@ -13094,6 +13118,10 @@ def _run_prompt_submit(
     queued_prompt_generation: int | None = None,
     origin_client_id: str | None = None,
     request_id: str | None = None,
+    client_message_id: str | None = None,
+    display_text: str | None = None,
+    submitted_at: float | None = None,
+    attachment_refs: list[str] | None = None,
 ) -> bool:
     with session["history_lock"]:
         if session.get("_closing"):
@@ -13459,9 +13487,27 @@ def _run_prompt_submit(
             # durable. Fan the existing change signal through this session's
             # ordered event hub so peer clients refresh before assistant output;
             # the global state.db watcher remains the out-of-process fallback.
-            agent._on_user_message_persisted = lambda: _emit(
-                "sessions.changed", sid, {}
-            )
+            def _on_user_message_persisted() -> None:
+                # The DB watcher remains a coarse out-of-process fallback, but
+                # attached clients need the row itself on the ordered session
+                # stream. Otherwise assistant/tool frames outrun the async
+                # transcript reload by seconds. Only real client submissions
+                # carry a client_message_id; synthesized auto-continue/loop
+                # turns retain their existing typed timeline projections.
+                if client_message_id and display_kind != "hidden":
+                    payload = {
+                        "message_id": client_message_id,
+                        "text": display_text
+                        if display_text is not None
+                        else _content_display_text(text),
+                        "timestamp": submitted_at or time.time(),
+                    }
+                    if attachment_refs:
+                        payload["attachment_refs"] = list(attachment_refs)
+                    _emit("message.user", sid, payload)
+                _emit("sessions.changed", sid, {})
+
+            agent._on_user_message_persisted = _on_user_message_persisted
             _usage_stop, _usage_thread = _start_usage_ticker(sid, agent)
             try:
                 result = agent.run_conversation(run_message, **run_kwargs)

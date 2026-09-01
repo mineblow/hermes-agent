@@ -17100,13 +17100,82 @@ def test_prompt_submit_fans_out_user_row_before_assistant_events(monkeypatch):
     server.handle_request({
         "id": "1",
         "method": "prompt.submit",
-        "params": {"session_id": "sid", "text": "hello from pc 1"},
+        "params": {
+            "session_id": "sid",
+            "text": "expanded model-facing prompt",
+            "display_text": "hello from pc 1",
+            "client_message_id": "user-pc1-123",
+            "submitted_at": 1234.5,
+        },
     })
 
     event_names = [event for event, _payload in emitted]
+    assert "message.user" in event_names
     assert "sessions.changed" in event_names
+    assert event_names.index("message.user") < event_names.index("sessions.changed")
     assert event_names.index("sessions.changed") < event_names.index("message.delta")
+    assert emitted[event_names.index("message.user")][1] == {
+        "message_id": "user-pc1-123",
+        "text": "hello from pc 1",
+        "timestamp": 1234.5,
+    }
     assert server._sessions["sid"]["agent"]._on_user_message_persisted is None
+
+
+def test_prompt_submit_forwards_user_event_metadata_to_isolated_host(monkeypatch):
+    """The production turn-isolation path must not drop peer-fanout metadata."""
+    captured = {}
+    server._sessions["sid"] = _session(agent=None)
+    monkeypatch.setattr(server.threading, "Thread", _ImmediateThread)
+    monkeypatch.setattr(server, "_session_uses_compute_host", lambda *_args: True)
+    monkeypatch.setattr(
+        server,
+        "_submit_prompt_to_compute_host",
+        lambda rid, sid, session, text, **kwargs: (
+            captured.update(text=text, **kwargs)
+            or server._ok(rid, {"status": "streaming"})
+        ),
+    )
+
+    server.handle_request({
+        "id": "1",
+        "method": "prompt.submit",
+        "params": {
+            "session_id": "sid",
+            "text": "expanded model-facing prompt",
+            "display_text": "hello from pc 1",
+            "client_message_id": "user-pc1-123",
+            "submitted_at": 1234.5,
+            "attachment_refs": ["attachment://one"],
+        },
+    })
+
+    assert captured == {
+        "text": "expanded model-facing prompt",
+        "display_kind": None,
+        "client_message_id": "user-pc1-123",
+        "display_text": "hello from pc 1",
+        "submitted_at": 1234.5,
+        "attachment_refs": ["attachment://one"],
+    }
+
+
+def test_compute_host_turn_frame_carries_user_event_metadata():
+    frame = server._compute_host_turn_frame(
+        "r1",
+        "sid",
+        _session(),
+        "expanded model-facing prompt",
+        client_message_id="user-pc1-123",
+        display_text="hello from pc 1",
+        submitted_at=1234.5,
+        attachment_refs=["attachment://one"],
+    )
+
+    assert frame["client_message_id"] == "user-pc1-123"
+    assert frame["display_text"] == "hello from pc 1"
+    assert frame["submitted_at"] == 1234.5
+    assert frame["attachment_refs"] == ["attachment://one"]
 
 
 def test_prompt_submit_surfaces_backend_error_as_visible_text(monkeypatch):
