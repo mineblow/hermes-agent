@@ -13974,9 +13974,10 @@ def _run_prompt_submit(
             _clear_session_context(session_tokens)
             _current_runtime_session_record.reset(runtime_session_token)
             reset_transport(transport_token)
-            # Clear the per-turn interim callback so a stale closure from
-            # this turn can't fire during a later turn on the same agent.
+            # Clear per-turn callbacks so stale closures from this turn cannot
+            # fire during a later turn on the same cached agent.
             agent.interim_assistant_callback = None
+            agent._on_user_message_persisted = None
             with session["history_lock"]:
                 session["running"] = False
                 session["last_active"] = time.time()

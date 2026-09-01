@@ -17106,6 +17106,7 @@ def test_prompt_submit_fans_out_user_row_before_assistant_events(monkeypatch):
     event_names = [event for event, _payload in emitted]
     assert "sessions.changed" in event_names
     assert event_names.index("sessions.changed") < event_names.index("message.delta")
+    assert server._sessions["sid"]["agent"]._on_user_message_persisted is None
 
 
 def test_prompt_submit_surfaces_backend_error_as_visible_text(monkeypatch):

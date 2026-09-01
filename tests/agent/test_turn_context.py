@@ -304,9 +304,10 @@ def test_user_message_persisted_callback_runs_after_successful_persistence():
     agent = _FakeAgent()
     order: list[str] = []
 
-    def persist(*_args, **_kwargs):
+    def persist(messages, *_args, **_kwargs):
         order.append("persisted")
         agent._persist_calls += 1
+        messages[-1]["_db_persisted"] = True
 
     agent._persist_session = persist
     agent._on_user_message_persisted = lambda: order.append("notified")
@@ -325,6 +326,20 @@ def test_user_message_persisted_callback_skips_failed_persistence():
 
     _build(agent)
 
+    notified.assert_not_called()
+
+
+def test_user_message_persisted_callback_skips_swallowed_persistence_failure():
+    """A normal return without the durable marker must remain fail-closed."""
+    agent = _FakeAgent()
+    notified = MagicMock()
+    agent._on_user_message_persisted = notified
+    # The real persistence stack may swallow DB failures and return normally.
+    agent._persist_session = MagicMock(return_value=None)
+
+    ctx = _build(agent)
+
+    assert ctx.messages[-1].get("_db_persisted") is not True
     notified.assert_not_called()
 
 

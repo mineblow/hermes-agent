@@ -1516,14 +1516,18 @@ def build_turn_context(
         else:
             with persist_lock:
                 _ensure_and_persist()
-        # The row is durable now. Gateway-attached agents use this optional
-        # hook to refresh peer clients immediately instead of waiting for the
-        # coarse state.db watcher. Keep notification failure independent from
-        # persistence: a disconnected observer must never fail the turn.
-        _on_user_message_persisted = getattr(
-            agent, "_on_user_message_persisted", None
+        # A normal return is not sufficient proof of durability: the lower DB
+        # helpers deliberately swallow some creation/append failures so the
+        # turn can recover later. The intrinsic marker is stamped only after a
+        # successful row append (or when a loaded row is materialized), making
+        # it the authoritative commit signal for this exact user-message dict.
+        _turn_user_is_durable = (
+            0 <= current_turn_user_idx < len(messages)
+            and isinstance(messages[current_turn_user_idx], dict)
+            and messages[current_turn_user_idx].get("_db_persisted") is True
         )
-        if callable(_on_user_message_persisted):
+        _on_user_message_persisted = getattr(agent, "_on_user_message_persisted", None)
+        if _turn_user_is_durable and callable(_on_user_message_persisted):
             try:
                 _on_user_message_persisted()
             except Exception:
