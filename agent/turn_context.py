@@ -1516,6 +1516,22 @@ def build_turn_context(
         else:
             with persist_lock:
                 _ensure_and_persist()
+        # The row is durable now. Gateway-attached agents use this optional
+        # hook to refresh peer clients immediately instead of waiting for the
+        # coarse state.db watcher. Keep notification failure independent from
+        # persistence: a disconnected observer must never fail the turn.
+        _on_user_message_persisted = getattr(
+            agent, "_on_user_message_persisted", None
+        )
+        if callable(_on_user_message_persisted):
+            try:
+                _on_user_message_persisted()
+            except Exception:
+                logger.debug(
+                    "User-message persistence notification failed for session=%s",
+                    agent.session_id or "none",
+                    exc_info=True,
+                )
     except Exception:
         logger.warning(
             "Early turn-start session persistence failed for session=%s",

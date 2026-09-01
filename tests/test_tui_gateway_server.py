@@ -17060,6 +17060,54 @@ def test_prompt_submit_wires_live_title_rename_callback(monkeypatch):
     ) in emitted
 
 
+def test_prompt_submit_fans_out_user_row_before_assistant_events(monkeypatch):
+    """A second attached client sees the durable user row without the 2s watcher."""
+    emitted: list[tuple[str, dict]] = []
+
+    class _Agent:
+        model = "gpt-5.6-sol"
+        provider = "openai-codex"
+        base_url = "https://chatgpt.example.test/backend-api/codex"
+        api_key = object()
+        api_mode = "codex_responses"
+
+        def run_conversation(
+            self, prompt, conversation_history=None, stream_callback=None, **_kwargs
+        ):
+            callback = getattr(self, "_on_user_message_persisted", None)
+            assert callable(callback), "gateway did not install a durable-user-row hook"
+            callback()
+            stream_callback("reply")
+            return {
+                "final_response": "reply",
+                "messages": [
+                    {"role": "user", "content": prompt},
+                    {"role": "assistant", "content": "reply"},
+                ],
+            }
+
+    server._sessions["sid"] = _session(agent=_Agent())
+    monkeypatch.setattr(server.threading, "Thread", _ImmediateThread)
+    monkeypatch.setattr(
+        server,
+        "_emit",
+        lambda kind, sid, payload=None, **kw: emitted.append((kind, payload or {})),
+    )
+    monkeypatch.setattr(server, "make_stream_renderer", lambda cols: None)
+    monkeypatch.setattr(server, "render_message", lambda raw, cols: None)
+    monkeypatch.setattr(server, "_get_db", lambda: None)
+
+    server.handle_request({
+        "id": "1",
+        "method": "prompt.submit",
+        "params": {"session_id": "sid", "text": "hello from pc 1"},
+    })
+
+    event_names = [event for event, _payload in emitted]
+    assert "sessions.changed" in event_names
+    assert event_names.index("sessions.changed") < event_names.index("message.delta")
+
+
 def test_prompt_submit_surfaces_backend_error_as_visible_text(monkeypatch):
     """When the backend fails with no visible response (e.g. invalid model slug
     → provider 4xx), the TUI must surface result['error'] as visible text

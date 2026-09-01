@@ -299,6 +299,35 @@ def test_applies_agent_side_effects():
     assert agent._current_turn_id
 
 
+def test_user_message_persisted_callback_runs_after_successful_persistence():
+    """Attached clients may refresh only after the inbound row is durable."""
+    agent = _FakeAgent()
+    order: list[str] = []
+
+    def persist(*_args, **_kwargs):
+        order.append("persisted")
+        agent._persist_calls += 1
+
+    agent._persist_session = persist
+    agent._on_user_message_persisted = lambda: order.append("notified")
+
+    _build(agent)
+
+    assert order == ["persisted", "notified"]
+
+
+def test_user_message_persisted_callback_skips_failed_persistence():
+    """A refresh event must never race ahead of a row that failed to commit."""
+    agent = _FakeAgent()
+    notified = MagicMock()
+    agent._on_user_message_persisted = notified
+    agent._persist_session = MagicMock(side_effect=RuntimeError("disk unavailable"))
+
+    _build(agent)
+
+    notified.assert_not_called()
+
+
 
 
 

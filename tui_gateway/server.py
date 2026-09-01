@@ -13455,6 +13455,13 @@ def _run_prompt_submit(
             agent._on_session_title = lambda t, _src, _k=_title_key: _emit(
                 "session.title", sid, {"session_id": _k, "title": t}
             )
+            # The turn prologue calls this only after its inbound user row is
+            # durable. Fan the existing change signal through this session's
+            # ordered event hub so peer clients refresh before assistant output;
+            # the global state.db watcher remains the out-of-process fallback.
+            agent._on_user_message_persisted = lambda: _emit(
+                "sessions.changed", sid, {}
+            )
             _usage_stop, _usage_thread = _start_usage_ticker(sid, agent)
             try:
                 result = agent.run_conversation(run_message, **run_kwargs)
