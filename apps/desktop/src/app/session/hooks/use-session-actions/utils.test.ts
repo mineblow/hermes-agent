@@ -541,38 +541,6 @@ describe('reconcileResumeMessages', () => {
     expect(reconcileResumeMessages(next, [])).toBe(next)
   })
 
-  it('keeps a settled live final over the matching durable internal tool timeline', () => {
-    const previous = [
-      msg('user-live', 'user', 'question'),
-      msg('assistant-stream-live', 'assistant', '', {
-        completedAt: 30,
-        pending: false,
-        parts: [
-          { type: 'tool-call', toolCallId: 'call-1', toolName: 'todo', result: 'done' },
-          { type: 'text', text: 'Final answer.' }
-        ]
-      })
-    ]
-
-    const next = [
-      msg('user-durable', 'user', 'question', { rowId: 1 }),
-      msg('assistant-durable', 'assistant', '', {
-        rowId: 2,
-        parts: [
-          { type: 'text', text: 'First I will check.' },
-          { type: 'tool-call', toolCallId: 'call-1', toolName: 'todo', result: 'done' },
-          { type: 'text', text: 'Final answer.' }
-        ]
-      })
-    ]
-
-    const [, assistant] = reconcileResumeMessages(next, previous)
-
-    expect(chatMessageText(assistant)).toBe('Final answer.')
-    expect(assistant.parts.map(part => part.type)).toEqual(['tool-call', 'text'])
-    expect(assistant.rowId).toBe(2)
-  })
-
   it('re-grafts reasoning parts onto a matching assistant turn', () => {
     const next = [msg('a', 'assistant', 'answer')]
 

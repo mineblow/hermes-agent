@@ -28,19 +28,13 @@ def server():
     # e.g. hermes_cli.active_sessions would bind the mocked get_hermes_home
     # (a fixed shared path) forever, leaking active-session registry entries
     # across every later test in the process. Scope the patch to the import.
-    with patch.dict(
-        "sys.modules",
-        {
-            "hermes_constants": MagicMock(
-                get_hermes_home=MagicMock(return_value="/tmp/hermes_test")
-            ),
-            "hermes_cli.env_loader": MagicMock(),
-            "hermes_cli.banner": MagicMock(),
-            "hermes_state": MagicMock(),
-        },
-    ):
+    with patch.dict("sys.modules", {
+        "hermes_constants": MagicMock(get_hermes_home=MagicMock(return_value="/tmp/hermes_test")),
+        "hermes_cli.env_loader": MagicMock(),
+        "hermes_cli.banner": MagicMock(),
+        "hermes_state": MagicMock(),
+    }):
         import importlib
-
         mod = importlib.import_module("tui_gateway.server")
 
     # Snapshot the RPC registry: several tests below stub handlers
@@ -115,17 +109,13 @@ def test_unknown_method(server):
 
 def test_ok_envelope(server):
     assert server._ok("r1", {"x": 1}) == {
-        "jsonrpc": "2.0",
-        "id": "r1",
-        "result": {"x": 1},
+        "jsonrpc": "2.0", "id": "r1", "result": {"x": 1},
     }
 
 
 def test_err_envelope(server):
     assert server._err("r2", 4001, "nope") == {
-        "jsonrpc": "2.0",
-        "id": "r2",
-        "error": {"code": 4001, "message": "nope"},
+        "jsonrpc": "2.0", "id": "r2", "error": {"code": 4001, "message": "nope"},
     }
 
 
@@ -209,9 +199,7 @@ def test_live_session_payload_replays_pending_approval(server, monkeypatch):
         approval._ApprovalEntry(first),
         approval._ApprovalEntry(second),
     ]
-    monkeypatch.setattr(
-        server, "_approval_request_payload", lambda data: dict(data or {})
-    )
+    monkeypatch.setattr(server, "_approval_request_payload", lambda data: dict(data or {}))
 
     try:
         payload = server._live_session_payload("runtime-session", session)
@@ -307,9 +295,7 @@ def test_block_and_respond(capture):
     result = [None]
 
     threading.Thread(
-        target=lambda: result.__setitem__(
-            0, server._block("test.prompt", "s1", {"q": "?"}, timeout=5)
-        ),
+        target=lambda: result.__setitem__(0, server._block("test.prompt", "s1", {"q": "?"}, timeout=5)),
     ).start()
 
     for _ in range(100):
@@ -357,11 +343,13 @@ def test_late_prompt_response_is_idempotent(server, method, value_key):
     """All four blocking bridges tolerate a late reply after their request has
     expired — the `*.respond` returns a graceful `{"status": "expired"}` instead
     of the raw 4009 protocol error a client would otherwise surface verbatim."""
-    response = server.handle_request({
-        "id": "late-response",
-        "method": method,
-        "params": {"request_id": "expired-request", value_key: ""},
-    })
+    response = server.handle_request(
+        {
+            "id": "late-response",
+            "method": method,
+            "params": {"request_id": "expired-request", value_key: ""},
+        }
+    )
 
     assert response["result"] == {"status": "expired"}
 
@@ -402,8 +390,7 @@ def test_clarify_batch_resolves_when_all_questions_locked(capture):
     thread, box, rid = _drain_batch_block(server, ["q0", "q1"])
 
     first = server.handle_request({
-        "id": "a1",
-        "method": "clarify.respond",
+        "id": "a1", "method": "clarify.respond",
         "params": {"request_id": rid, "question_id": "q1", "answer": "beta"},
     })
     assert first["result"]["status"] == "ok"
@@ -411,8 +398,7 @@ def test_clarify_batch_resolves_when_all_questions_locked(capture):
     assert thread.is_alive()  # one question left — still blocking
 
     second = server.handle_request({
-        "id": "a2",
-        "method": "clarify.respond",
+        "id": "a2", "method": "clarify.respond",
         "params": {"request_id": rid, "question_id": "q0", "answer": "alpha"},
     })
     assert second["result"]["status"] == "ok"
@@ -437,8 +423,7 @@ def test_clarify_batch_first_locked_answer_wins(server):
         "params": {"request_id": rid, "question_id": "q0", "answer": "changed"},
     })
     server.handle_request({
-        "id": "a3",
-        "method": "clarify.respond",
+        "id": "a3", "method": "clarify.respond",
         "params": {"request_id": rid, "question_id": "q1", "answer": "done"},
     })
 
@@ -560,13 +545,11 @@ def test_clarify_batch_empty_answer_is_a_locked_skip(server):
     thread, box, rid = _drain_batch_block(server, ["q0", "q1"])
 
     server.handle_request({
-        "id": "a1",
-        "method": "clarify.respond",
+        "id": "a1", "method": "clarify.respond",
         "params": {"request_id": rid, "question_id": "q0", "answer": ""},
     })
     server.handle_request({
-        "id": "a2",
-        "method": "clarify.respond",
+        "id": "a2", "method": "clarify.respond",
         "params": {"request_id": rid, "question_id": "q1", "answer": "kept"},
     })
 
@@ -578,15 +561,13 @@ def test_clarify_batch_unknown_question_id_rejected(server):
     thread, box, rid = _drain_batch_block(server, ["q0"])
 
     response = server.handle_request({
-        "id": "bad",
-        "method": "clarify.respond",
+        "id": "bad", "method": "clarify.respond",
         "params": {"request_id": rid, "question_id": "q9", "answer": "x"},
     })
     assert response["error"]["code"] == 4002
 
     server.handle_request({
-        "id": "ok",
-        "method": "clarify.respond",
+        "id": "ok", "method": "clarify.respond",
         "params": {"request_id": rid, "question_id": "q0", "answer": "fine"},
     })
     thread.join(timeout=5)
@@ -599,8 +580,7 @@ def test_clarify_batch_timeout_keeps_locked_answers(capture):
     thread, box, rid = _drain_batch_block(server, ["q0", "q1"], timeout=1)
 
     server.handle_request({
-        "id": "a1",
-        "method": "clarify.respond",
+        "id": "a1", "method": "clarify.respond",
         "params": {"request_id": rid, "question_id": "q0", "answer": "kept"},
     })
 
@@ -618,8 +598,7 @@ def test_clarify_batch_cancel_all_returns_empty(server):
     thread, box, rid = _drain_batch_block(server, ["q0", "q1"])
 
     server.handle_request({
-        "id": "cancel",
-        "method": "clarify.respond",
+        "id": "cancel", "method": "clarify.respond",
         "params": {"request_id": rid, "answer": ""},
     })
 
@@ -629,8 +608,7 @@ def test_clarify_batch_cancel_all_returns_empty(server):
 
 def test_clarify_batch_late_question_respond_is_idempotent(server):
     response = server.handle_request({
-        "id": "late",
-        "method": "clarify.respond",
+        "id": "late", "method": "clarify.respond",
         "params": {"request_id": "gone", "question_id": "q0", "answer": "x"},
     })
     assert response["result"] == {"status": "expired"}
@@ -639,8 +617,7 @@ def test_clarify_batch_late_question_respond_is_idempotent(server):
 def test_clarify_batch_state_cleared_after_resolution(server):
     thread, box, rid = _drain_batch_block(server, ["q0"])
     server.handle_request({
-        "id": "a",
-        "method": "clarify.respond",
+        "id": "a", "method": "clarify.respond",
         "params": {"request_id": rid, "question_id": "q0", "answer": "x"},
     })
     thread.join(timeout=5)
@@ -656,11 +633,8 @@ def test_clarify_block_helper_builds_batch_payload(capture):
     server, buf = capture
     normalized = [
         {
-            "qid": "q0",
-            "id": "approach",
-            "question": "Which?",
-            "choices": ["a (Recommended)", "b"],
-            "choices_offered": ["a", "b"],
+            "qid": "q0", "id": "approach", "question": "Which?",
+            "choices": ["a (Recommended)", "b"], "choices_offered": ["a", "b"],
             "multi_select": False,
         },
     ]
@@ -681,8 +655,7 @@ def test_clarify_block_helper_builds_batch_payload(capture):
     assert rid
 
     server.handle_request({
-        "id": "a",
-        "method": "clarify.respond",
+        "id": "a", "method": "clarify.respond",
         "params": {"request_id": rid, "question_id": "q0", "answer": "a"},
     })
     thread.join(timeout=5)
@@ -700,17 +673,11 @@ def test_approval_pending_replays_unresolved_requests(server, monkeypatch):
 
     server._sessions["ui-1"] = {"session_key": "agent-1", "history": []}
     pending = [{"request_id": "req-1", "command": "danger"}]
-    monkeypatch.setattr(
-        approval,
-        "list_gateway_approvals",
-        lambda key: pending if key == "agent-1" else [],
-    )
+    monkeypatch.setattr(approval, "list_gateway_approvals", lambda key: pending if key == "agent-1" else [])
 
-    response = server.handle_request({
-        "id": "r1",
-        "method": "approval.pending",
-        "params": {"session_id": "ui-1"},
-    })
+    response = server.handle_request(
+        {"id": "r1", "method": "approval.pending", "params": {"session_id": "ui-1"}}
+    )
 
     assert response["result"] == {"approvals": pending}
 
@@ -726,11 +693,13 @@ def test_approval_received_acknowledges_exact_request(server, monkeypatch):
         lambda key, request_id: calls.append((key, request_id)) or True,
     )
 
-    response = server.handle_request({
-        "id": "r2",
-        "method": "approval.received",
-        "params": {"session_id": "ui-1", "request_id": "req-1"},
-    })
+    response = server.handle_request(
+        {
+            "id": "r2",
+            "method": "approval.received",
+            "params": {"session_id": "ui-1", "request_id": "req-1"},
+        }
+    )
 
     assert response["result"] == {"acknowledged": True}
     assert calls == [("agent-1", "req-1")]
@@ -747,11 +716,13 @@ def test_approval_response_correlates_request_id(server, monkeypatch):
         lambda key, choice, **kwargs: calls.append((key, choice, kwargs)) or 1,
     )
 
-    response = server.handle_request({
-        "id": "r3",
-        "method": "approval.respond",
-        "params": {"session_id": "ui-1", "request_id": "req-1", "choice": "once"},
-    })
+    response = server.handle_request(
+        {
+            "id": "r3",
+            "method": "approval.respond",
+            "params": {"session_id": "ui-1", "request_id": "req-1", "choice": "once"},
+        }
+    )
 
     assert response["result"] == {
         "resolved": 1,
@@ -781,15 +752,17 @@ def test_approval_respond_falls_back_to_request_id_lookup(server, monkeypatch):
         lambda key, choice, **kwargs: calls.append((key, choice, kwargs)) or 1,
     )
 
-    response = server.handle_request({
-        "id": "r-fallback",
-        "method": "approval.respond",
-        "params": {
-            "session_id": "gone-sid",
-            "request_id": "req-91684",
-            "choice": "once",
-        },
-    })
+    response = server.handle_request(
+        {
+            "id": "r-fallback",
+            "method": "approval.respond",
+            "params": {
+                "session_id": "gone-sid",
+                "request_id": "req-91684",
+                "choice": "once",
+            },
+        }
+    )
 
     assert response["result"] == {
         "resolved": 1,
@@ -816,11 +789,13 @@ def test_approval_respond_falls_back_to_stored_session_id(server, monkeypatch):
         lambda key, choice, **kwargs: calls.append((key, choice, kwargs)) or 1,
     )
 
-    response = server.handle_request({
-        "id": "r-stored",
-        "method": "approval.respond",
-        "params": {"session_id": "stored-91684", "choice": "deny"},
-    })
+    response = server.handle_request(
+        {
+            "id": "r-stored",
+            "method": "approval.respond",
+            "params": {"session_id": "stored-91684", "choice": "deny"},
+        }
+    )
 
     assert response["result"] == {
         "resolved": 1,
@@ -837,11 +812,13 @@ def test_approval_respond_4001_when_nothing_resolves(server, monkeypatch):
     from tools import approval
 
     monkeypatch.setattr(approval, "list_gateway_approvals", lambda key: [])
-    response = server.handle_request({
-        "id": "r-nope",
-        "method": "approval.respond",
-        "params": {"session_id": "nope", "request_id": "req-x", "choice": "once"},
-    })
+    response = server.handle_request(
+        {
+            "id": "r-nope",
+            "method": "approval.respond",
+            "params": {"session_id": "nope", "request_id": "req-x", "choice": "once"},
+        }
+    )
 
     assert response["error"]["code"] == 4001
 
@@ -887,9 +864,7 @@ def test_session_resume_returns_hydrated_messages(server, monkeypatch):
         def get_ancestor_display_prefix(self, _sid):
             return []
 
-        def get_messages_as_conversation(
-            self, _sid, include_ancestors=False, repair_alternation=False
-        ):
+        def get_messages_as_conversation(self, _sid, include_ancestors=False, repair_alternation=False):
             return [
                 {"role": "user", "content": "hello"},
                 {"role": "assistant", "content": "yo", "reasoning": "thoughts"},
@@ -900,31 +875,19 @@ def test_session_resume_returns_hydrated_messages(server, monkeypatch):
             ]
 
     monkeypatch.setattr(server, "_get_db", lambda: _DB())
-    monkeypatch.setattr(
-        server,
-        "_make_agent",
-        lambda sid, key, session_id=None, session_db=None, **_kwargs: object(),
-    )
-    monkeypatch.setattr(
-        server,
-        "_init_session",
-        lambda sid, key, agent, history, cols=80, **_kwargs: None,
-    )
-    monkeypatch.setattr(
-        server, "_session_info", lambda _agent, _session=None: {"model": "test/model"}
-    )
+    monkeypatch.setattr(server, "_make_agent", lambda sid, key, session_id=None, session_db=None, **_kwargs: object())
+    monkeypatch.setattr(server, "_init_session", lambda sid, key, agent, history, cols=80, **_kwargs: None)
+    monkeypatch.setattr(server, "_session_info", lambda _agent, _session=None: {"model": "test/model"})
 
-    resp = server.handle_request({
-        "id": "r1",
-        "method": "session.resume",
-        # eager_build: exercise the synchronous build path (this test
-        # monkeypatches _make_agent/_init_session/_session_info).
-        "params": {
-            "session_id": "20260409_010101_abc123",
-            "cols": 100,
-            "eager_build": True,
-        },
-    })
+    resp = server.handle_request(
+        {
+            "id": "r1",
+            "method": "session.resume",
+            # eager_build: exercise the synchronous build path (this test
+            # monkeypatches _make_agent/_init_session/_session_info).
+            "params": {"session_id": "20260409_010101_abc123", "cols": 100, "eager_build": True},
+        }
+    )
 
     assert "error" not in resp
     assert resp["result"]["message_count"] == 3
@@ -953,14 +916,16 @@ def test_session_resume_rejects_runaway_transcript_before_history_load(
 
     monkeypatch.setattr(server, "_get_db", lambda: _DB())
 
-    response = server.handle_request({
-        "id": "r1",
-        "method": "session.resume",
-        "params": {
-            "session_id": "runaway-session",
-            "omit_messages": True,
-        },
-    })
+    response = server.handle_request(
+        {
+            "id": "r1",
+            "method": "session.resume",
+            "params": {
+                "session_id": "runaway-session",
+                "omit_messages": True,
+            },
+        }
+    )
 
     assert response["error"]["code"] == 4130
     assert "safe resume limit is 20000" in response["error"]["message"]
@@ -989,14 +954,16 @@ def test_session_resume_guard_failure_fails_open(server, monkeypatch):
 
     monkeypatch.setattr(server, "_get_db", lambda: _DB())
 
-    response = server.handle_request({
-        "id": "r-open",
-        "method": "session.resume",
-        "params": {
-            "session_id": "transient-guard-session",
-            "omit_messages": True,
-        },
-    })
+    response = server.handle_request(
+        {
+            "id": "r-open",
+            "method": "session.resume",
+            "params": {
+                "session_id": "transient-guard-session",
+                "omit_messages": True,
+            },
+        }
+    )
 
     # The guard must not block: no 4130, and any downstream failure must not
     # be the guard's own "resume safety check failed" error. Reopen being
@@ -1007,14 +974,12 @@ def test_session_resume_guard_failure_fails_open(server, monkeypatch):
     assert reopened == ["transient-guard-session"]
 
 
-def test_session_resume_active_turn_payload_matches_desktop_fixture(
-    server, monkeypatch
-):
+def test_session_resume_active_turn_payload_matches_desktop_fixture(server, monkeypatch):
     """A live resume serializes the exact timer payload consumed by Desktop."""
     fixture = json.loads(
-        (
-            Path(__file__).parents[1] / "fixtures" / "session-resume-active-turn.json"
-        ).read_text(encoding="utf-8")
+        (Path(__file__).parents[1] / "fixtures" / "session-resume-active-turn.json").read_text(
+            encoding="utf-8"
+        )
     )
 
     class _DB:
@@ -1049,11 +1014,13 @@ def test_session_resume_active_turn_payload_matches_desktop_fixture(
     # faithful to what the gateway actually serializes, not a copied shape.
     response = json.loads(
         json.dumps(
-            server.handle_request({
-                "id": "resume-running",
-                "method": "session.resume",
-                "params": {"session_id": fixture["session_key"]},
-            })
+            server.handle_request(
+                {
+                    "id": "resume-running",
+                    "method": "session.resume",
+                    "params": {"session_id": fixture["session_key"]},
+                }
+            )
         )
     )
     result = response["result"]
@@ -1084,29 +1051,19 @@ def test_enforce_session_cap_evicts_oldest_detached_only(server, monkeypatch):
     live = object()  # no _closed attr -> live transport, never evictable
 
     server._sessions.clear()
-    server._sessions.update({
-        "old_detached": {
-            "transport": detached,
-            "last_active": 100.0,
-            "agent_ready": _ready(),
-        },
-        "new_detached": {
-            "transport": detached,
-            "last_active": 300.0,
-            "agent_ready": _ready(),
-        },
-        "running_detached": {
-            "transport": detached,
-            "last_active": 50.0,
-            "running": True,
-            "agent_ready": _ready(),
-        },
-        "focused_live": {
-            "transport": live,
-            "last_active": 200.0,
-            "agent_ready": _ready(),
-        },
-    })
+    server._sessions.update(
+        {
+            "old_detached": {"transport": detached, "last_active": 100.0, "agent_ready": _ready()},
+            "new_detached": {"transport": detached, "last_active": 300.0, "agent_ready": _ready()},
+            "running_detached": {
+                "transport": detached,
+                "last_active": 50.0,
+                "running": True,
+                "agent_ready": _ready(),
+            },
+            "focused_live": {"transport": live, "last_active": 200.0, "agent_ready": _ready()},
+        }
+    )
 
     server._enforce_session_cap()
 
@@ -1180,12 +1137,8 @@ def test_make_agent_accepts_list_system_prompt(server, monkeypatch):
             }
         ),
     )
-    monkeypatch.setattr(
-        server, "_load_cfg", lambda: {"agent": {"system_prompt": ["one", "two"]}}
-    )
-    monkeypatch.setattr(
-        server, "_resolve_startup_runtime", lambda: ("test/model", "test")
-    )
+    monkeypatch.setattr(server, "_load_cfg", lambda: {"agent": {"system_prompt": ["one", "two"]}})
+    monkeypatch.setattr(server, "_resolve_startup_runtime", lambda: ("test/model", "test"))
     monkeypatch.setattr(server, "_get_db", lambda: None)
 
     server._make_agent("sid", "session-key", session_id="session-key")
@@ -1205,16 +1158,13 @@ def test_config_roundtrip(server, tmp_path):
 # ── _cli_exec_blocked ────────────────────────────────────────────────
 
 
-@pytest.mark.parametrize(
-    "argv",
-    [
-        [],
-        ["setup"],
-        ["gateway"],
-        ["sessions", "browse"],
-        ["config", "edit"],
-    ],
-)
+@pytest.mark.parametrize("argv", [
+    [],
+    ["setup"],
+    ["gateway"],
+    ["sessions", "browse"],
+    ["config", "edit"],
+])
 def test_cli_exec_blocked(server, argv):
     assert server._cli_exec_blocked(argv) is not None
 
@@ -1229,9 +1179,7 @@ def test_slash_exec_rejects_skill_commands(server):
     server._sessions[sid] = {"session_key": sid, "agent": None}
 
     # Mock scan_skill_commands to return a known skill
-    fake_skills = {
-        "/hermes-agent-dev": {"name": "hermes-agent-dev", "description": "Dev workflow"}
-    }
+    fake_skills = {"/hermes-agent-dev": {"name": "hermes-agent-dev", "description": "Dev workflow"}}
 
     with patch("agent.skill_commands.get_skill_commands", return_value=fake_skills):
         resp = server.handle_request({
@@ -1307,11 +1255,7 @@ def test_command_dispatch_queue_sends_message(server):
     resp = server.handle_request({
         "id": "r1",
         "method": "command.dispatch",
-        "params": {
-            "name": "queue",
-            "arg": "tell me about quantum computing",
-            "session_id": sid,
-        },
+        "params": {"name": "queue", "arg": "tell me about quantum computing", "session_id": sid},
     })
 
     assert "error" not in resp
@@ -1321,14 +1265,10 @@ def test_command_dispatch_queue_sends_message(server):
 
 
 def test_skills_manage_search_uses_tools_hub_sources(server):
-    result = type(
-        "Result",
-        (),
-        {
-            "description": "Build better terminal demos",
-            "name": "showroom",
-        },
-    )()
+    result = type("Result", (), {
+        "description": "Build better terminal demos",
+        "name": "showroom",
+    })()
     auth = MagicMock(return_value="auth")
     router = MagicMock(return_value=["source"])
     search = MagicMock(return_value=[result])
@@ -1351,9 +1291,7 @@ def test_skills_manage_search_uses_tools_hub_sources(server):
     }
     auth.assert_called_once_with()
     router.assert_called_once_with("auth")
-    search.assert_called_once_with(
-        "showroom", ["source"], source_filter="all", limit=20
-    )
+    search.assert_called_once_with("showroom", ["source"], source_filter="all", limit=20)
 
 
 # ── dispatch(): pool routing for long handlers (#12546) ──────────────
@@ -1416,22 +1354,16 @@ def test_skin_live_switch_end_to_end(server, tmp_path, monkeypatch):
     server._cfg_cache = server._cfg_mtime = server._cfg_path = None
 
     emitted = []
-    monkeypatch.setattr(
-        server, "_emit", lambda ev, sid, payload=None: emitted.append((ev, payload))
-    )
+    monkeypatch.setattr(server, "_emit", lambda ev, sid, payload=None: emitted.append((ev, payload)))
 
     # Baseline (default) — seeds the signature.
-    (tmp_path / "config.yaml").write_text(
-        "display:\n  skin: default\n", encoding="utf-8"
-    )
+    (tmp_path / "config.yaml").write_text("display:\n  skin: default\n", encoding="utf-8")
     server._broadcast_skin_if_changed()
     emitted.clear()
 
     # Activate midnight, as `hermes config set display.skin midnight` would.
     time.sleep(0.01)  # ensure the config mtime moves
-    (tmp_path / "config.yaml").write_text(
-        "display:\n  skin: midnight\n", encoding="utf-8"
-    )
+    (tmp_path / "config.yaml").write_text("display:\n  skin: midnight\n", encoding="utf-8")
     server._broadcast_skin_if_changed()
 
     assert [ev for ev, _ in emitted] == ["skin.changed"]
@@ -1446,9 +1378,7 @@ def test_broadcast_skin_if_changed_on_any_signature_move(server, monkeypatch):
     emitted = []
     # switch, no-op, switch, then a color edit (same name, bumped mtime).
     sigs = iter([("neon", 1.0), ("neon", 1.0), ("forest", 1.0), ("forest", 2.0)])
-    monkeypatch.setattr(
-        server, "_emit", lambda ev, sid, payload=None: emitted.append((ev, payload))
-    )
+    monkeypatch.setattr(server, "_emit", lambda ev, sid, payload=None: emitted.append((ev, payload)))
     monkeypatch.setattr(server, "_last_skin_sig", None, raising=False)
     monkeypatch.setattr(server, "_skin_sig", lambda: next(sigs))
     monkeypatch.setattr(server, "resolve_skin", lambda: {"name": "x", "colors": {}})

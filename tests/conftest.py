@@ -548,7 +548,6 @@ def _hermetic_environment(tmp_path, monkeypatch):
     #    singleton might still be cached from a previous test).
     try:
         import hermes_cli.plugins as _plugins_mod
-
         monkeypatch.setattr(_plugins_mod, "_plugin_manager", None)
         # Also clear the keyed per-home manager cache (and any plugin
         # submodules it left in sys.modules) so a manager built for a
@@ -677,7 +676,6 @@ def _capture_real_kanban_root() -> Path:
         # honor it via the normal resolver (it may be a profile dir whose
         # root matters).
         from hermes_constants import get_default_hermes_root
-
         return get_default_hermes_root().resolve()
     # No pre-existing HERMES_HOME: the real root is the platform default,
     # NOT the sandbox tempdir now sitting in the env.
@@ -722,7 +720,9 @@ def _kanban_write_guard(_hermetic_environment, monkeypatch):
             resolved = Path(db_path).expanduser().resolve()
         else:
             resolved = (
-                _kdb.kanban_db_path(board=kwargs.get("board")).expanduser().resolve()
+                _kdb.kanban_db_path(board=kwargs.get("board"))
+                .expanduser()
+                .resolve()
             )
         try:
             resolved.relative_to(_REAL_KANBAN_ROOT)
@@ -769,8 +769,12 @@ def _state_db_write_guard(request, monkeypatch):
     if _PRE_SANDBOX_HERMES_HOME and not _hermes_home_points_at_production(
         _PRE_SANDBOX_HERMES_HOME
     ):
-        extra_roots.append(Path(_PRE_SANDBOX_HERMES_HOME).expanduser().resolve())
-    monkeypatch.setattr(_hs, "_STATE_DB_GUARD_EXTRA_DENY_ROOTS", tuple(extra_roots))
+        extra_roots.append(
+            Path(_PRE_SANDBOX_HERMES_HOME).expanduser().resolve()
+        )
+    monkeypatch.setattr(
+        _hs, "_STATE_DB_GUARD_EXTRA_DENY_ROOTS", tuple(extra_roots)
+    )
     yield
 
 
@@ -888,29 +892,6 @@ def _reset_tui_gateway_server_state():
             set_hermes_home_override(None)
     except Exception:
         pass
-
-
-# ── auxiliary runtime context isolation ─────────────────────────────────────
-#
-# The canonical parallel runner gives every test file a fresh interpreter, but
-# a direct ``pytest`` invocation shares ContextVars across files. A test that
-# exercises a live AIAgent turn can otherwise leave its main provider bound for
-# an unrelated provider-resolution test collected later.
-
-
-@pytest.fixture(autouse=True)
-def _reset_auxiliary_runtime_context():
-    mod = sys.modules.get("agent.auxiliary_client")
-    clear = getattr(mod, "clear_runtime_main", None) if mod is not None else None
-    if callable(clear):
-        clear()
-
-    yield
-
-    mod = sys.modules.get("agent.auxiliary_client")
-    clear = getattr(mod, "clear_runtime_main", None) if mod is not None else None
-    if callable(clear):
-        clear()
 
 
 @pytest.fixture()
@@ -1211,10 +1192,7 @@ def pytest_configure(config):  # noqa: D401 — pytest hook
     # raises AttributeError at timer setup and the whole run aborts before any
     # test executes. Fall back to the thread-based timer on Windows so the
     # suite runs natively there (POSIX keeps the more reliable signal method).
-    if (
-        sys.platform == "win32"
-        and getattr(config.option, "timeout_method", None) == "signal"
-    ):
+    if sys.platform == "win32" and getattr(config.option, "timeout_method", None) == "signal":
         config.option.timeout_method = "thread"
 
 
@@ -1344,7 +1322,6 @@ def _live_system_guard(request, monkeypatch):
     # the live psutil walk below. Static set keeps the fast path cheap.
     try:
         import psutil as _psutil
-
         _initial_children = {
             c.pid for c in _psutil.Process(test_pid).children(recursive=True)
         }
@@ -1436,38 +1413,16 @@ def _live_system_guard(request, monkeypatch):
         "hermes gateway",
     )
     _MUTATING_VERBS = (
-        "restart",
-        "start",
-        "stop",
-        "kill",
-        "reload",
-        "reset-failed",
-        "enable",
-        "disable",
-        "mask",
-        "unmask",
-        "daemon-reload",
-        "try-restart",
-        "reload-or-restart",
+        "restart", "start", "stop", "kill", "reload",
+        "reset-failed", "enable", "disable", "mask", "unmask",
+        "daemon-reload", "try-restart", "reload-or-restart",
     )
     _PROCESS_KILLERS = ("pkill", "killall", "taskkill", "skill", "fuser")
     # Shell/launcher executables whose arguments are themselves commands —
     # argv[0]-only scanning must not exempt what they wrap.
     _WRAPPER_COMMANDS = (
-        "sh",
-        "bash",
-        "zsh",
-        "dash",
-        "env",
-        "nohup",
-        "setsid",
-        "timeout",
-        "sudo",
-        "xargs",
-        "nice",
-        "ionice",
-        "stdbuf",
-        "flock",
+        "sh", "bash", "zsh", "dash", "env", "nohup", "setsid",
+        "timeout", "sudo", "xargs", "nice", "ionice", "stdbuf", "flock",
     )
 
     def _cmd_to_string(cmd) -> str:
@@ -1593,7 +1548,6 @@ def _live_system_guard(request, monkeypatch):
         def _guarded(cmd, *args, **kwargs):
             _check_subprocess_cmd(name, cmd)
             return real(cmd, *args, **kwargs)
-
         _guarded.__name__ = f"_guarded_{name}"
         # Make the wrapper subscriptable like the wrapped callable when
         # the wrapped object is. ``subprocess.Popen[bytes]`` is used as
@@ -1663,7 +1617,6 @@ def _live_system_guard(request, monkeypatch):
     # pty.spawn — POSIX-only.
     try:
         import pty as _pty
-
         if hasattr(_pty, "spawn"):
             real_pty_spawn = _pty.spawn
 
@@ -1678,12 +1631,13 @@ def _live_system_guard(request, monkeypatch):
     # asyncio.create_subprocess_* — bypasses subprocess module entirely.
     try:
         import asyncio as _asyncio
-
         real_async_exec = _asyncio.create_subprocess_exec
         real_async_shell = _asyncio.create_subprocess_shell
 
         async def _guarded_async_exec(program, *args, **kwargs):
-            _check_subprocess_cmd("asyncio.create_subprocess_exec", [program, *args])
+            _check_subprocess_cmd(
+                "asyncio.create_subprocess_exec", [program, *args]
+            )
             return await real_async_exec(program, *args, **kwargs)
 
         async def _guarded_async_shell(cmd, *args, **kwargs):
@@ -1691,7 +1645,9 @@ def _live_system_guard(request, monkeypatch):
             return await real_async_shell(cmd, *args, **kwargs)
 
         monkeypatch.setattr(_asyncio, "create_subprocess_exec", _guarded_async_exec)
-        monkeypatch.setattr(_asyncio, "create_subprocess_shell", _guarded_async_shell)
+        monkeypatch.setattr(
+            _asyncio, "create_subprocess_shell", _guarded_async_shell
+        )
     except Exception:
         pass
 

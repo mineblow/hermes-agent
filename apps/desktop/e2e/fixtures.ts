@@ -74,10 +74,7 @@ function stripCredentials(env: Record<string, string | undefined>): Record<strin
   const clean: Record<string, string> = {}
 
   for (const [key, value] of Object.entries(env)) {
-    // Empty values can be semantically required. In particular, Git's
-    // GIT_CONFIG_COUNT/KEY_n/VALUE_n triplets permit an empty VALUE_n; dropping
-    // only that member leaves every Git command with malformed process config.
-    if (value === undefined) {
+    if (!value) {
       continue
     }
 

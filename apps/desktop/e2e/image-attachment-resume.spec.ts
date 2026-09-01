@@ -27,6 +27,8 @@ import { type MockServer, startMockServer } from './mock-server'
 import { RealSessionBuilder } from './real-session-builder'
 import { type ElectronApplication, expect, type Page, test } from './test'
 
+// A seeded session has no generated title, so every label falls back to the
+// session preview — the first 60 characters of the first user message.
 const SESSION_TITLE = 'E2E attached image session'
 const CAPTION = 'E2E attached image must survive a relaunch'
 const IMAGE_DIR = 'Application Support/e2e shots'
@@ -88,7 +90,7 @@ async function setupSeededDesktop(): Promise<SeededFixture> {
 }
 
 function sessionRow(page: Page) {
-  return page.locator('[data-slot="sidebar"] button').filter({ hasText: SESSION_TITLE }).first()
+  return page.locator('[data-slot="sidebar"] button').filter({ hasText: CAPTION }).first()
 }
 
 // Inactive tabs stay mounted under a data-pane-hidden ancestor. Match the
@@ -123,15 +125,7 @@ async function openSeededSession(page: Page): Promise<void> {
  * surface is empty rather than waiting for the old caption to leave the page.
  */
 async function openNewSession(page: Page): Promise<void> {
-  const obstructingTooltip = page.getByRole('tooltip', { name: SESSION_TITLE })
-  const composer = page.getByRole('textbox', { name: 'Message' }).first()
-
-  await composer.hover()
-  await expect(obstructingTooltip).toHaveCount(0)
-
-  const newSession = page.locator('[data-slot="sidebar"] button[aria-label="New session"]').first()
-  await newSession.focus()
-  await page.keyboard.press('Enter')
+  await page.locator('[data-slot="sidebar"] button[aria-label="New session"]').first().click()
   await page.waitForFunction(
     ([expected, surfaceSelector]: [string, string]) => {
       const surfaces = document.querySelectorAll(surfaceSelector)
@@ -178,11 +172,13 @@ test.describe('attached image resume', () => {
     fixture = await setupSeededDesktop()
     await waitForAppReady(fixture, 120_000)
 
+    // The sidebar labels a session by its preview, so the caption has to lead
+    // the persisted turn — a leading directive reads as a truncated file path.
     const row = sessionRow(fixture.page)
     await row.waitFor({ state: 'visible', timeout: 60_000 })
 
     const label = (await row.textContent())?.trim() ?? ''
-    expect(label.startsWith(SESSION_TITLE), `sidebar label should open with the durable title: ${label}`).toBe(true)
+    expect(label.startsWith(CAPTION), `sidebar label should open with the caption: ${label}`).toBe(true)
 
     await openSeededSession(fixture.page)
     await assertRendersThumbnail(fixture.page, 'first open')

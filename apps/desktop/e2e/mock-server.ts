@@ -483,22 +483,15 @@ export function startMockServer(options: MockServerOptions = {}): Promise<MockSe
           if (userText) {
             _receivedUserTexts.push(userText)
           }
-          const isInterimTrigger = stream && userText.includes('E2E_INTERIM_TRIGGER')
-          const isSidebarTrigger = stream && userText.includes('E2E_SIDEBAR_TRIGGER')
-          const isSidebarCrossTrigger = stream && userText.includes('E2E_SIDEBAR_CROSS')
+          const isInterimTrigger = userText.includes('E2E_INTERIM_TRIGGER')
+          const isSidebarTrigger = userText.includes('E2E_SIDEBAR_TRIGGER')
+          const isSidebarCrossTrigger = userText.includes('E2E_SIDEBAR_CROSS')
           const isQueueStopTrigger = userText.includes('E2E_QUEUE_STOP_TRIGGER')
           const isTaskPanelResumeTrigger = userText.includes(TASK_PANEL_RESUME_TRIGGER)
-          const verificationScript = verificationStopScript(
-            options.verificationWritePath ?? 'e2e-verification-target.py',
-          )
-          const isVerificationStopTrigger = stream
-            && _verificationStopIndex < verificationScript.length
-            && messages.some(
+          const isVerificationStopTrigger = messages.some(
             message => typeof message?.content === 'string' && message.content.includes(VERIFICATION_STOP_TRIGGER),
           )
-          const isCorrectionSwitchTrigger = stream
-            && _correctionSwitchIndex < CORRECTION_SWITCH_SCRIPT.length
-            && messages.some(
+          const isCorrectionSwitchTrigger = messages.some(
             message => typeof message?.content === 'string' && message.content.includes(CORRECTION_SWITCH_TRIGGER),
           )
 
@@ -564,7 +557,8 @@ export function startMockServer(options: MockServerOptions = {}): Promise<MockSe
           }
 
           if (isVerificationStopTrigger) {
-            const turn = verificationScript[_verificationStopIndex]
+            const script = verificationStopScript(options.verificationWritePath ?? 'e2e-verification-target.py')
+            const turn = script[_verificationStopIndex] ?? script[script.length - 1]
             _verificationStopIndex++
             if (stream) {
               streamScriptedTurn(res, model, turn)
@@ -575,7 +569,7 @@ export function startMockServer(options: MockServerOptions = {}): Promise<MockSe
           }
 
           if (isCorrectionSwitchTrigger) {
-            const turn = CORRECTION_SWITCH_SCRIPT[_correctionSwitchIndex]
+            const turn = CORRECTION_SWITCH_SCRIPT[_correctionSwitchIndex] ?? CORRECTION_SWITCH_SCRIPT[CORRECTION_SWITCH_SCRIPT.length - 1]
             _correctionSwitchIndex++
             if (stream) {
               streamScriptedTurn(res, model, turn)

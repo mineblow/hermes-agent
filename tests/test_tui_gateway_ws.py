@@ -10,6 +10,8 @@ from tui_gateway import server
 from tui_gateway import ws as ws_mod
 
 
+
+
 def _run_disconnect(monkeypatch, seed):
     """Drive handle_ws to its disconnect `finally`, seeding sessions against the
     live WSTransport the moment it exists. Returns nothing; inspect _sessions."""
@@ -34,11 +36,8 @@ def _run_disconnect(monkeypatch, seed):
     created = []
     real_transport = ws_mod.WSTransport
     monkeypatch.setattr(
-        ws_mod,
-        "WSTransport",
-        lambda ws, loop, **kw: (
-            created.append(real_transport(ws, loop, **kw)) or created[-1]
-        ),
+        ws_mod, "WSTransport",
+        lambda ws, loop, **kw: created.append(real_transport(ws, loop, **kw)) or created[-1],
     )
 
     class FakeWS:
@@ -84,9 +83,9 @@ def test_ws_disconnect_reaps_flagged_session_and_closes_worker(monkeypatch):
         server._sessions.clear()
 
 
-def test_ws_connection_registers_then_disconnect_unregisters_live_transport(
-    monkeypatch,
-):
+
+
+def test_ws_connection_registers_then_disconnect_unregisters_live_transport(monkeypatch):
     """A connected client must be tracked in the live-transport registry so a
     session-less global broadcast (skin.changed from the background watcher)
     reaches it, and dropped on disconnect so no stale write targets a dead peer.
@@ -122,6 +121,8 @@ def test_ws_disconnect_releases_wake_word_owner(monkeypatch):
     assert released == created
 
 
+
+
 def test_ws_starts_mcp_discovery_before_ready(monkeypatch):
     import tui_gateway.entry as entry
 
@@ -129,9 +130,7 @@ def test_ws_starts_mcp_discovery_before_ready(monkeypatch):
     events = []
 
     monkeypatch.setattr(server, "_WS_ORPHAN_REAP_GRACE_S", 0)
-    monkeypatch.setattr(
-        entry, "ensure_mcp_discovery_started", lambda: calls.append("mcp")
-    )
+    monkeypatch.setattr(entry, "ensure_mcp_discovery_started", lambda: calls.append("mcp"))
 
     class FakeWS:
         async def accept(self):
@@ -157,14 +156,18 @@ def test_ws_starts_mcp_discovery_before_ready(monkeypatch):
 
 def test_ws_ready_advertises_heartbeat_and_ping_is_inline(monkeypatch):
     sent = []
-    inbound = iter([
-        json.dumps({
-            "jsonrpc": "2.0",
-            "id": "heartbeat-1",
-            "method": "gateway.ping",
-            "params": {},
-        })
-    ])
+    inbound = iter(
+        [
+            json.dumps(
+                {
+                    "jsonrpc": "2.0",
+                    "id": "heartbeat-1",
+                    "method": "gateway.ping",
+                    "params": {},
+                }
+            )
+        ]
+    )
     monkeypatch.setattr(server, "_WS_ORPHAN_REAP_GRACE_S", 0)
 
     class FakeWS:

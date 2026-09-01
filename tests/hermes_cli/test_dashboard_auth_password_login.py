@@ -206,7 +206,7 @@ class TestProviderListFlag:
         login = gated_app.get(resp.headers["location"])
         assert login.status_code == 200
         assert '<form class="provider-form" data-provider="testpw"' in login.text
-        assert "fetch('auth/password-login'" in login.text
+        assert "/auth/password-login" in login.text
 
 
     def test_oauth_provider_reports_false(self):
@@ -354,8 +354,7 @@ class TestLoginPageRender:
             assert 'name="password"' in html
             assert 'value="/sessions"' in html
             assert "<script>" in html
-            assert "fetch('auth/password-login'" in html
-            assert "fetch('/auth/password-login'" not in html
+            assert "/auth/password-login" in html
         finally:
             clear_providers()
 

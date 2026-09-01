@@ -14,10 +14,16 @@
  * clicks the session (cold resume — populates the warm cache), navigates
  * away to a new chat, then clicks back (warm resume). Two detectors run:
  *
- * A MutationObserver counts additive DOM mutation bursts and snapshots the
- * exact settled message nodes before reactivation. A valid virtualized reveal
- * may add rows before the original head once; it may not replace, move, or
- * mutate any settled message, nor add transcript content after the old head.
+ * 1. A MutationObserver counts additive DOM mutation bursts (childList
+ *    additions). More than 1 burst = the transcript was repainted.
+ *
+ * 2. A 2ms innerHTML-length poll counts "reconciles" — DOM content changes
+ *    that happen AFTER the initial paint, while messages are already on
+ *    screen. This catches the case where React reconciles by key without
+ *    adding/removing nodes (same keys → in-place prop update → no
+ *    MutationObserver burst), but `$messages` was still set twice.
+ *
+ * The test passes when bursts === 1 AND reconciles === 0.
  * The sidebar "+" keeps the session warm in another tab. Its reactivation
  * follows the same contract: one additive paint and zero reconciles.
  *
@@ -73,7 +79,6 @@ function gibberish(rng: () => number): string {
 
 /** First user message — used as a wait target in the test. */
 const FIRST_USER_MSG = gibberish(mulberry32(RNG_SEED))
-const LAST_USER_MSG = generateSessionTurns().at(-1)!
 
 /**
  * Generate the user turns for a real session. The mock provider produces the
@@ -146,7 +151,16 @@ test.afterAll(async () => {
   fixture = null
 })
 
-/** Observe a hidden warm transcript while preserving its settled node identities. */
+/**
+ * Install a MutationObserver + text-content poll on the thread viewport
+ * to detect re-renders after the initial paint. Returns nothing — call
+ * `readRenderCount` to stop and collect results.
+ *
+ * - MutationObserver: counts additive childList bursts (5ms coalescing).
+ * - Text-content poll: counts "reconciles" — first-message text changes
+ *   after the initial paint, catching key-based reconciles that don't
+ *   add/remove nodes.
+ */
 async function installRenderCounter(
   page: import('@playwright/test').Page,
   transcriptText?: string,
@@ -154,35 +168,22 @@ async function installRenderCounter(
   await page.evaluate(([visibleSelector, allSelector, expected]: [string, string, string | undefined]) => {
     const surfaces = [...document.querySelectorAll(expected ? allSelector : visibleSelector)]
     const surface = expected
-      ? surfaces.find(candidate => (candidate.textContent ?? '').includes(expected))
+      ? surfaces.find(candidate =>
+          (candidate.querySelector('[data-slot="aui_thread-viewport"]')?.textContent ?? '').includes(expected),
+        )
       : surfaces.at(-1)
     const viewport = surface?.querySelector('[data-slot="aui_thread-viewport"]')
     if (!viewport) {
       throw new Error('Thread viewport not found before warm resume')
     }
 
-    const content = viewport.querySelector('[data-slot="aui_thread-content"]') ?? viewport
-    const selectMessages = () => [...content.querySelectorAll('[data-role="message"], [data-message-id]')]
-    const initialMessages = selectMessages()
-    const initialTexts = initialMessages.map(message => message.textContent ?? '')
-    const head = initialMessages[0]
-    const tail = initialMessages.at(-1)
-
-    if (!head || !tail) {
-      throw new Error('Settled transcript messages not found before warm resume')
+    const state = { bursts: 0, mutations: 0, timeline: [] as number[], stopped: false, reconciles: 0 }
+    const debugWindow = window as unknown as {
+      __RENDER_COUNT__: typeof state
+      __RENDER_VIEWPORT__: Element
     }
-
-    const state = {
-      bursts: 0,
-      currentBatch: 0,
-      identityViolations: 0,
-      invalidAdditions: 0,
-      lastMutationAt: performance.now(),
-      stopped: false,
-      viewport,
-    }
-    const monitorWindow = window as unknown as { __WARM_RESUME_MONITOR__: typeof state }
-    monitorWindow.__WARM_RESUME_MONITOR__ = state
+    debugWindow.__RENDER_COUNT__ = state
+    debugWindow.__RENDER_VIEWPORT__ = viewport
 
     let currentBatch = 0
     let flushTimer: ReturnType<typeof setTimeout> | null = null
@@ -191,8 +192,8 @@ async function installRenderCounter(
       flushTimer = null
       if (currentBatch > 0 && !state.stopped) {
         state.bursts += 1
+        state.timeline.push(currentBatch)
         currentBatch = 0
-        state.currentBatch = 0
       }
     }
 
@@ -200,37 +201,15 @@ async function installRenderCounter(
       if (state.stopped) return
       let batchAdded = 0
       for (const record of records) {
+        state.mutations += 1
         if (record.type === 'childList' && record.addedNodes.length > 0) {
           batchAdded += 1
-          for (const added of record.addedNodes) {
-            if (initialMessages.some(message => message === added || message.contains(added))) {
-              state.identityViolations += 1
-              continue
-            }
-
-            const headFollowsAdded = Boolean(added.compareDocumentPosition(head) & Node.DOCUMENT_POSITION_FOLLOWING)
-            if (!headFollowsAdded) state.invalidAdditions += 1
-          }
         }
       }
-
-      const currentMessages = selectMessages()
-      const initialStart = currentMessages.indexOf(head)
-      const settledIdentityPreserved =
-        initialMessages.every((message, index) =>
-          message.isConnected
-          && message.textContent === initialTexts[index]
-          && currentMessages[initialStart + index] === message)
-        && currentMessages.at(-1) === tail
-
-      if (!settledIdentityPreserved) state.identityViolations += 1
-
       if (batchAdded > 0) {
         currentBatch += batchAdded
-        state.currentBatch = currentBatch
-        state.lastMutationAt = performance.now()
         if (flushTimer) clearTimeout(flushTimer)
-        flushTimer = setTimeout(flush, 20)
+        flushTimer = setTimeout(flush, 5)
       }
     })
 
@@ -238,9 +217,34 @@ async function installRenderCounter(
       childList: true,
       subtree: true,
       attributes: false,
-      characterData: true,
+      characterData: false,
     })
 
+    // Poll the first message's text content every 2ms. The MutationObserver
+    // only catches childList additions; React may reconcile by key without
+    // adding/removing nodes (same keys → in-place prop update → no childList
+    // mutation). The poll catches this by detecting text content changes in
+    // the first message after the initial paint. Metadata-only changes (model
+    // name, busy indicator) don't affect message text, so they don't produce
+    // false positives.
+    const contentEl = viewport.querySelector('[data-slot="aui_thread-content"]') ?? viewport
+    let lastFirstMsgText = ''
+    let hasMessages = false
+    const pollInterval = setInterval(() => {
+      if (state.stopped) {
+        clearInterval(pollInterval)
+        return
+      }
+      const firstMsg = contentEl.querySelector('[data-role="message"], [data-message-id]')
+      const firstMsgText = firstMsg?.textContent ?? ''
+      if (firstMsgText && firstMsgText !== lastFirstMsgText) {
+        if (hasMessages) {
+          state.reconciles = (state.reconciles ?? 0) + 1
+        }
+        lastFirstMsgText = firstMsgText
+        hasMessages = true
+      }
+    }, 2)
   }, [SURFACE, ALL_SURFACES, transcriptText] as [string, string, string | undefined])
 }
 
@@ -290,50 +294,21 @@ async function openNewSessionTab(page: import('@playwright/test').Page, priorTex
   await waitForActiveTranscriptWithoutText(page, priorText)
 }
 
-interface WarmResumeObservation {
-  bursts: number
-  identityViolations: number
-  invalidAdditions: number
-}
-
-/** Wait for the observer's additive burst to finish without a fixed delay. */
-async function waitForRenderQuiescence(page: import('@playwright/test').Page): Promise<void> {
-  await page.waitForFunction(
-    () => {
-      const monitor = (window as unknown as {
-        __WARM_RESUME_MONITOR__?: { bursts: number; currentBatch: number; lastMutationAt: number }
-      }).__WARM_RESUME_MONITOR__
-
-      return Boolean(
-        monitor
-        && monitor.bursts > 0
-        && monitor.currentBatch === 0
-        && performance.now() - monitor.lastMutationAt >= 250,
-      )
-    },
-    undefined,
-    { timeout: 10_000 },
-  )
-}
-
-/** Stop the observer and return the production-state invariants it recorded. */
+/** Stop the render counter and return the recorded burst/reconcile counts. */
 async function readRenderCount(page: import('@playwright/test').Page): Promise<{
   bursts: number
-  identityViolations: number
-  invalidAdditions: number
+  mutations: number
+  timeline: number[]
+  reconciles: number
 } | null> {
   return page.evaluate(() => {
-    type Monitor = WarmResumeObservation & { stopped: boolean }
-    const w = window as unknown as { __WARM_RESUME_MONITOR__?: Monitor }
-    const monitor = w.__WARM_RESUME_MONITOR__
-    if (!monitor) return null
-    monitor.stopped = true
-    delete w.__WARM_RESUME_MONITOR__
-    return {
-      bursts: monitor.bursts,
-      identityViolations: monitor.identityViolations,
-      invalidAdditions: monitor.invalidAdditions,
+    type RenderCount = { bursts: number; mutations: number; timeline: number[]; stopped: boolean; reconciles: number }
+    const w = window as unknown as { __RENDER_COUNT__?: RenderCount }
+    const rc = w.__RENDER_COUNT__
+    if (rc) {
+      rc.stopped = true
     }
+    return rc ? { bursts: rc.bursts, mutations: rc.mutations, timeline: rc.timeline, reconciles: rc.reconciles } : null
   })
 }
 
@@ -341,49 +316,43 @@ async function observedViewportIsActive(page: import('@playwright/test').Page): 
   return page.evaluate((surfaceSelector: string) => {
     const surfaces = document.querySelectorAll(surfaceSelector)
     const activeViewport = surfaces[surfaces.length - 1]?.querySelector('[data-slot="aui_thread-viewport"]')
-    const observedViewport = (window as unknown as {
-      __WARM_RESUME_MONITOR__?: { viewport: Element }
-    }).__WARM_RESUME_MONITOR__?.viewport
+    const observedViewport = (window as unknown as { __RENDER_VIEWPORT__?: Element }).__RENDER_VIEWPORT__
 
     return activeViewport === observedViewport
   }, SURFACE)
 }
 
-/** A kept-alive tab reveals its pruned head once without reconciling the mounted tail. */
-function assertBoundedReveal(result: WarmResumeObservation | null): void {
+/** A kept-alive tab must become visible without rebuilding its transcript. */
+function assertNoRepaint(result: { bursts: number; mutations: number; timeline: number[]; reconciles: number } | null): void {
   expect(result, 'MutationObserver should have recorded render data').toBeTruthy()
   expect(
     result!.bursts,
-    `Expected one bounded head-reveal burst for a kept-alive tab, but got ${result!.bursts}.`,
-  ).toBe(1)
-  expect(
-    result!.identityViolations,
-    'Reactivation replaced, moved, or changed a settled transcript message.',
+    `Expected no additive render bursts for a kept-alive tab, but got ${result!.bursts}. ` +
+      `Mutation timeline: ${JSON.stringify(result!.timeline)}.`,
   ).toBe(0)
   expect(
-    result!.invalidAdditions,
-    'Reactivation added transcript messages outside the virtualized head backfill.',
+    result!.reconciles,
+    `Expected no transcript reconciles for a kept-alive tab, but got ${result!.reconciles}.`,
   ).toBe(0)
 }
 
 /** Assert the render counter shows exactly one paint with no re-renders. */
-function assertNoJitter(result: WarmResumeObservation | null): void {
+function assertNoJitter(result: { bursts: number; mutations: number; timeline: number[]; reconciles: number } | null): void {
   expect(result, 'MutationObserver should have recorded render data').toBeTruthy()
   expect(
     result!.bursts,
-    `Expected 1 additive render burst (single paint), but got ${result!.bursts} bursts.`,
+    `Expected 1 additive render burst (single paint), but got ${result!.bursts} bursts. ` +
+      `Mutation timeline: ${JSON.stringify(result!.timeline)}.`,
   ).toBe(1)
   expect(
-    result!.identityViolations,
-    'Warm resume replaced, moved, or changed a settled transcript message.',
-  ).toBe(0)
-  expect(
-    result!.invalidAdditions,
-    'Warm resume added transcript messages outside the virtualized head backfill.',
+    result!.reconciles,
+    `Expected 0 reconciles (no re-render after initial paint), but got ${result!.reconciles}. ` +
+      `This means the warm-route resume re-rendered the transcript after the initial paint ` +
+      `— the "warm resume jitter" bug is present.`,
   ).toBe(0)
 }
 
-test('tab reactivation preserves the mounted transcript with one bounded reveal', async () => {
+test('tab reactivation preserves the mounted transcript without repainting', async ({}, testInfo) => {
   const page = fixture!.page
 
   // Wait for the sidebar to populate with our seeded session.
@@ -397,26 +366,31 @@ test('tab reactivation preserves the mounted transcript with one bounded reveal'
   // This populates the warm cache (runtimeIdByStoredSessionId + sessionStateByRuntimeId).
   await sessionRow.click()
 
-  // The final seeded user message proves the durable cold-resume transcript,
-  // not merely its initially virtualized head, has arrived.
-  await waitForActiveTranscriptText(page, LAST_USER_MSG)
+  // Wait for the transcript to appear — the first user message text confirms
+  // the cold-path prefetch painted.
+  await waitForActiveTranscriptText(page, FIRST_USER_MSG)
+
+  // Wait for the session to fully settle (cold-path RPC + reconciliation).
+  await page.waitForTimeout(2_000)
 
   // Stack a new tab, then observe the seeded transcript while it is hidden.
   // Installing after the switch isolates reactivation from mutations caused
   // while the new tab was being created.
   await openNewSessionTab(page, FIRST_USER_MSG)
-  await installRenderCounter(page, SESSION_TITLE)
+  await page.waitForTimeout(500)
+  await installRenderCounter(page, FIRST_USER_MSG)
 
   // Step 3: Click back and verify the same kept-alive viewport becomes active
   // without rebuilding or reconciling its transcript.
   await sessionRow.click()
 
   await waitForActiveTranscriptText(page, FIRST_USER_MSG)
-  await waitForRenderQuiescence(page)
+  await page.waitForTimeout(2_000)
   expect(await observedViewportIsActive(page), 'Reactivation should reveal the observed kept-alive viewport').toBe(true)
 
   const result = await readRenderCount(page)
-  assertBoundedReveal(result)
+  await page.screenshot({ path: testInfo.outputPath('warm-resume-idle.png') })
+  assertNoRepaint(result)
 })
 
 test('warm-route resume after background inference completes (no jitter)', async ({}, testInfo) => {

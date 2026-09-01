@@ -36,11 +36,9 @@ const BG_DOT_LABEL = 'Background task running'
 /** Foreground turn-running dot aria-label. */
 const SESSION_RUNNING_DOT_LABEL = 'Session running'
 
-function sessionRowWithIndicator(page: import('@playwright/test').Page, ariaLabel: string) {
-  return page
-    .locator('[data-slot="sidebar"] button')
-    .filter({ has: page.locator(`[aria-label="${ariaLabel}"]`) })
-    .first()
+/** Locate a session's sidebar row by its preview text. */
+function sessionRow(page: import('@playwright/test').Page, text: string) {
+  return page.locator('[data-slot="sidebar"] button').filter({ hasText: text }).first()
 }
 
 /** Common setup: start a turn with a held bg process + subagent, wait for
@@ -123,7 +121,6 @@ test.describe('sidebar states — tab (hidden) unread is correct', () => {
   test.beforeAll(async () => {
     restartMockServer()
     fixture = await setupMockBackend({
-      extraConfig: 'approvals:\n  mode: off',
       mockServer: { backgroundReleasePath: bgRelease.path },
     })
     await waitForAppReady(fixture, 120_000)
@@ -145,7 +142,7 @@ test.describe('sidebar states — tab (hidden) unread is correct', () => {
 
     // ⌃-click opens the session as a TAB (center dock = stacked, not visible
     // unless it's the active tab). The session is NOT on screen.
-    const row = sessionRowWithIndicator(page, BG_DOT_LABEL)
+    const row = sessionRow(page, SIDEBAR_CROSS_TEXTS.finalText)
     await row.click({ modifiers: ['Control'] })
     await page.waitForTimeout(2000)
 
@@ -185,7 +182,6 @@ test.describe.skip('sidebar states — split (visible) unread bug (RED)', () => 
   test.beforeAll(async () => {
     restartMockServer()
     fixture = await setupMockBackend({
-      extraConfig: 'approvals:\n  mode: off',
       mockServer: { backgroundReleasePath: bgRelease.path },
     })
     await waitForAppReady(fixture, 120_000)
@@ -208,7 +204,7 @@ test.describe.skip('sidebar states — split (visible) unread bug (RED)', () => 
     // Drag the session row from the sidebar to the right edge of the workspace
     // zone to create a SPLIT (side-by-side) tile. This triggers the real
     // startSessionDrag → onCommit → openSessionTile(id, 'right', anchor) path.
-    const row = sessionRowWithIndicator(page, BG_DOT_LABEL)
+    const row = sessionRow(page, SIDEBAR_CROSS_TEXTS.finalText)
     const rowBox = await row.boundingBox()
     expect(rowBox, 'session row must be visible').not.toBeNull()
 

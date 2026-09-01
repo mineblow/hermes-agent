@@ -18,7 +18,9 @@ def _history_user_indices(history: list) -> list:
     from agent.context_compressor import user_originated_turn_view
 
     return [
-        i for i, m in enumerate(history) if user_originated_turn_view(m) is not None
+        i
+        for i, m in enumerate(history)
+        if user_originated_turn_view(m) is not None
     ]
 
 
@@ -59,14 +61,15 @@ def _mem_db_pair_agrees(mem, db_msg) -> bool:
         if (mem_view is None) != (db_view is None):
             return False
         if mem_view is None:
-            return bool(mem.get("display_kind")) == bool(db_msg.get("display_kind"))
+            return bool(mem.get("display_kind")) == bool(
+                db_msg.get("display_kind")
+            )
         mem_content = mem_view.get("content")
         db_content = db_view.get("content")
         if isinstance(mem_content, str) and isinstance(db_content, str):
-            if (
-                sanitize_context(mem_content).strip()
-                != sanitize_context(db_content).strip()
-            ):
+            if sanitize_context(mem_content).strip() != sanitize_context(
+                db_content
+            ).strip():
                 return False
         return True
     if bool(mem.get("display_kind")) != bool(db_msg.get("display_kind")):
@@ -138,7 +141,8 @@ def _resolve_truncate_row_id(session: dict, history: list, target_row_id: int):
     # durable row. Stamp only when EVERY pair agrees (all-or-nothing): roles
     # must match on every pair, and addressable user turns must match content.
     if len(db_history) == len(history) and all(
-        _mem_db_pair_agrees(mem, db_msg) for mem, db_msg in zip(history, db_history)
+        _mem_db_pair_agrees(mem, db_msg)
+        for mem, db_msg in zip(history, db_history)
     ):
         for mem, db_msg in zip(history, db_history):
             db_rid = _message_row_id(db_msg) if isinstance(db_msg, dict) else None
@@ -182,12 +186,7 @@ def _coerce_truncate_int(rid, value, param_name="truncate_before_user_ordinal"):
 
 
 def _reconcile_client_ordinal(
-    rid,
-    sid,
-    client_ordinal,
-    msg_ordinal,
-    param_name,
-    target_repr,
+    rid, sid, client_ordinal, msg_ordinal, param_name, target_repr,
     prefix_user_count=0,
 ):
     """Cross-check a client ordinal against a resolved durable target.
@@ -251,9 +250,7 @@ def _pending_reaction_notes(session: dict) -> str:
     # model hears nothing, even about reactions set while it was on.
     try:
         display = _load_cfg().get("display")
-        if not (
-            isinstance(display, dict) and bool(display.get("message_reactions", False))
-        ):
+        if not (isinstance(display, dict) and bool(display.get("message_reactions", False))):
             return ""
     except Exception:
         return ""
@@ -293,9 +290,7 @@ def _(rid, params: dict) -> dict:
 
     sid = params.get("session_id", "")
     raw_text = params.get("text", "")
-    text = (
-        sanitize_user_prompt_text(raw_text) if isinstance(raw_text, str) else raw_text
-    )
+    text = sanitize_user_prompt_text(raw_text) if isinstance(raw_text, str) else raw_text
     # Off-screen sends (widget intents): type the persisted user row so no
     # client renders it as a bubble. Whitelisted to "hidden" — display_kind
     # is a DB-only sidecar and this RPC must not mint arbitrary kinds.
@@ -405,11 +400,7 @@ def _(rid, params: dict) -> dict:
             else:
                 break
         busy_response = _handle_busy_submit(
-            rid,
-            sid,
-            session,
-            text,
-            busy_transport,
+            rid, sid, session, text, busy_transport,
             queued=bool(params.get("queued")),
             origin_client_id=_legacy_client_id_for_transport(busy_transport),
             display_kind=display_kind,
@@ -445,9 +436,7 @@ def _(rid, params: dict) -> dict:
         # racing the in-flight child on the same stored session (interleaved
         # transcript, stale fork). After the run completes, submitting is fine:
         # the upgrade resumes the child's transcript as a normal conversation.
-        if session.get("lazy") and _child_run_active(
-            str(session.get("session_key") or "")
-        ):
+        if session.get("lazy") and _child_run_active(str(session.get("session_key") or "")):
             return _err(rid, 4009, "subagent still running — wait for it to finish")
         truncate_message_id = params.get("truncate_before_message_id")
         truncate_row_id = params.get("truncate_before_row_id")
@@ -467,7 +456,9 @@ def _(rid, params: dict) -> dict:
             or truncate_message_id is not None
             or truncate_row_id is not None
         ):
-            history = _history_without_ephemeral_scaffolding(session.get("history", []))
+            history = _history_without_ephemeral_scaffolding(
+                session.get("history", [])
+            )
 
             # Malformed params refuse first (4004), regardless of consent —
             # the historical ordinal-path precedence.
@@ -525,7 +516,9 @@ def _(rid, params: dict) -> dict:
             # of loading ancestors into the tip (which would duplicate
             # compressed history on later resumes).
             prefix_user_count = len(
-                _history_user_indices(session.get("display_history_prefix") or [])
+                _history_user_indices(
+                    session.get("display_history_prefix") or []
+                )
             )
 
             user_indices = _history_user_indices(history)
@@ -554,7 +547,9 @@ def _(rid, params: dict) -> dict:
                 # client ordinal cut (#82959 / #82766 review). Unknown id refuses
                 # without touching data; stale ordinal with a *resolved* row_id
                 # is a separate 4030 mismatch below.
-                found_match = _resolve_truncate_row_id(session, history, target_row_id)
+                found_match = _resolve_truncate_row_id(
+                    session, history, target_row_id
+                )
 
                 if found_match is None:
                     logger.warning(
@@ -572,12 +567,8 @@ def _(rid, params: dict) -> dict:
 
                 msg_ordinal, _ = found_match
                 ordinal, err = _reconcile_client_ordinal(
-                    rid,
-                    sid,
-                    client_ordinal,
-                    msg_ordinal,
-                    "truncate_before_row_id",
-                    target_row_id,
+                    rid, sid, client_ordinal, msg_ordinal,
+                    "truncate_before_row_id", target_row_id,
                     prefix_user_count=prefix_user_count,
                 )
                 if err is not None:
@@ -587,10 +578,7 @@ def _(rid, params: dict) -> dict:
                 found_match = None
                 for u_ord, h_idx in enumerate(user_indices):
                     msg = history[h_idx]
-                    if (
-                        msg.get("id") == msg_id_str
-                        or msg.get("message_id") == msg_id_str
-                    ):
+                    if msg.get("id") == msg_id_str or msg.get("message_id") == msg_id_str:
                         found_match = (u_ord, h_idx)
                         break
 
@@ -613,12 +601,8 @@ def _(rid, params: dict) -> dict:
 
                 msg_ordinal, _ = found_match
                 ordinal, err = _reconcile_client_ordinal(
-                    rid,
-                    sid,
-                    client_ordinal,
-                    msg_ordinal,
-                    "truncate_before_message_id",
-                    msg_id_str,
+                    rid, sid, client_ordinal, msg_ordinal,
+                    "truncate_before_message_id", msg_id_str,
                     prefix_user_count=prefix_user_count,
                 )
                 if err is not None:
@@ -764,7 +748,9 @@ def _(rid, params: dict) -> dict:
                         old_active_row_ids = {
                             row_id
                             for message in history
-                            if isinstance((row_id := _message_row_id(message)), int)
+                            if isinstance(
+                                (row_id := _message_row_id(message)), int
+                            )
                         }
                         if requested_rebind_ids is not None:
                             # Row-id fallback can resolve a durable target even
@@ -774,10 +760,12 @@ def _(rid, params: dict) -> dict:
                             # authoritative un-repaired pre-write active-id set so
                             # a rewritten row is never mistaken for an untouched
                             # archived/ancestor row by the bounded client map.
-                            durable_rebind_history = _load_durable_truncation_history(
-                                session,
-                                truncation_key,
-                                repair_alternation=False,
+                            durable_rebind_history = (
+                                _load_durable_truncation_history(
+                                    session,
+                                    truncation_key,
+                                    repair_alternation=False,
+                                )
                             )
                             if durable_rebind_history is None:
                                 raise RuntimeError(
@@ -786,7 +774,9 @@ def _(rid, params: dict) -> dict:
                             old_active_row_ids.update(
                                 row_id
                                 for message in durable_rebind_history
-                                if isinstance((row_id := _message_row_id(message)), int)
+                                if isinstance(
+                                    (row_id := _message_row_id(message)), int
+                                )
                             )
                         old_survivor_row_ids = [
                             _message_row_id(message) for message in truncated
@@ -834,7 +824,10 @@ def _(rid, params: dict) -> dict:
                             str(old_row_id): new_row_id
                             for old_row_id, new_row_id in zip(
                                 old_survivor_row_ids,
-                                (_message_row_id(message) for message in truncated),
+                                (
+                                    _message_row_id(message)
+                                    for message in truncated
+                                ),
                             )
                             if isinstance(old_row_id, int)
                             and isinstance(new_row_id, int)
@@ -843,7 +836,9 @@ def _(rid, params: dict) -> dict:
                         for dropped_row_id in requested_rebind_ids.intersection(
                             old_active_row_ids
                         ):
-                            survivor_row_id_map.setdefault(str(dropped_row_id), None)
+                            survivor_row_id_map.setdefault(
+                                str(dropped_row_id), None
+                            )
             session["history"] = truncated
             session["history_version"] = int(session.get("history_version", 0)) + 1
         session["running"] = True
@@ -875,9 +870,9 @@ def _(rid, params: dict) -> dict:
                 # The truncation already happened inline above (memory + DB),
                 # before compute-host dispatch — the rebind payload applies to
                 # this path exactly as it does to the inline one.
-                isolated_response["result"]["survivor_user_row_ids"] = (
-                    survivor_user_row_ids
-                )
+                isolated_response["result"][
+                    "survivor_user_row_ids"
+                ] = survivor_user_row_ids
             if survivor_row_id_map is not None:
                 isolated_response["result"]["survivor_row_id_map"] = survivor_row_id_map
             return isolated_response
@@ -933,11 +928,7 @@ def _(rid, params: dict) -> dict:
                 (err.get("error") or {}).get("message", "agent initialization failed"),
                 # Agent construction never reached the provider: this is a
                 # local-runtime failure (env/config/venv), not an API error.
-                error_surface={
-                    "layer": "runtime",
-                    "code": "agent_init_failed",
-                    "retryable": True,
-                },
+                error_surface={"layer": "runtime", "code": "agent_init_failed", "retryable": True},
             )
             with session["history_lock"]:
                 session["running"] = False
@@ -987,7 +978,8 @@ def _(rid, params: dict) -> dict:
             "status": "streaming",
             **(
                 {"survivor_user_row_ids": survivor_user_row_ids}
-                if survivor_user_row_ids is not None and requested_rebind_ids is None
+                if survivor_user_row_ids is not None
+                and requested_rebind_ids is None
                 else {}
             ),
             **(
@@ -1114,9 +1106,7 @@ def _(rid, params: dict) -> dict:
         return _err(rid, 4017, "image is empty")
     if len(img_bytes) > _ATTACH_BYTES_MAX_BYTES:
         mb = _ATTACH_BYTES_MAX_BYTES // (1024 * 1024)
-        return _err(
-            rid, 4018, f"image too large ({len(img_bytes)} bytes; cap is {mb} MB)"
-        )
+        return _err(rid, 4018, f"image too large ({len(img_bytes)} bytes; cap is {mb} MB)")
 
     filename = str(params.get("filename", "") or "")
     ext_hint = str(params.get("ext", "") or "").strip().lower()
@@ -1166,9 +1156,7 @@ def _(rid, params: dict) -> dict:
         return err
 
     if shutil.which("pdftoppm") is None:
-        return _err(
-            rid, 5028, "pdftoppm not installed (poppler-utils package required)"
-        )
+        return _err(rid, 5028, "pdftoppm not installed (poppler-utils package required)")
 
     raw_path = str(params.get("path", "") or "").strip()
     raw_b64 = str(params.get("content_base64") or params.get("data") or "").strip()
@@ -1185,13 +1173,9 @@ def _(rid, params: dict) -> dict:
                 return _err(rid, 4017, "decoded PDF is empty")
             if len(pdf_bytes) > _PDF_ATTACH_MAX_BYTES:
                 mb = _PDF_ATTACH_MAX_BYTES // (1024 * 1024)
-                return _err(
-                    rid, 4018, f"PDF too large ({len(pdf_bytes)} bytes; cap is {mb} MB)"
-                )
+                return _err(rid, 4018, f"PDF too large ({len(pdf_bytes)} bytes; cap is {mb} MB)")
             if pdf_bytes[:5] != b"%PDF-":
-                return _err(
-                    rid, 4017, "payload is not a PDF (missing %PDF- magic bytes)"
-                )
+                return _err(rid, 4017, "payload is not a PDF (missing %PDF- magic bytes)")
             pdf_path = td_path / "input.pdf"
             pdf_path.write_bytes(pdf_bytes)
             display_name = str(params.get("filename", "") or "uploaded.pdf")
@@ -1226,38 +1210,22 @@ def _(rid, params: dict) -> dict:
         if last_page < first_page:
             return _err(rid, 4015, "last_page must be >= first_page")
         if last_page - first_page + 1 > _PDF_ATTACH_MAX_PAGES:
-            return _err(
-                rid,
-                4019,
-                f"page range exceeds cap of {_PDF_ATTACH_MAX_PAGES} pages per attach call",
-            )
+            return _err(rid, 4019, f"page range exceeds cap of {_PDF_ATTACH_MAX_PAGES} pages per attach call")
 
         out_prefix = td_path / "page"
         argv = [
-            "pdftoppm",
-            "-png",
-            "-r",
-            "150",
-            "-f",
-            str(first_page),
-            "-l",
-            str(last_page),
-            str(pdf_path),
-            str(out_prefix),
+            "pdftoppm", "-png", "-r", "150",
+            "-f", str(first_page), "-l", str(last_page),
+            str(pdf_path), str(out_prefix),
         ]
         from hermes_cli._subprocess_compat import windows_hide_flags
 
         try:
             res = subprocess.run(
-                argv,
-                capture_output=True,
-                text=True,
-                timeout=120,
-                stdin=subprocess.DEVNULL,
+                argv, capture_output=True, text=True, timeout=120, stdin=subprocess.DEVNULL,
                 # Force UTF-8 + lossy decode so non-UTF-8 child output can't
                 # crash the gateway thread on locale-mismatched Windows (#53137).
-                encoding="utf-8",
-                errors="replace",
+                encoding="utf-8", errors="replace",
                 creationflags=windows_hide_flags(),
             )
         except subprocess.TimeoutExpired:
@@ -1277,14 +1245,8 @@ def _(rid, params: dict) -> dict:
                 page_int = int(page_num)
             except ValueError:
                 page_int = first_page + len(attached_pages)
-            dst = _queue_attached_image(
-                session, src.read_bytes(), ".png", prefix=f"pdf_p{page_num}"
-            )
-            attached_pages.append({
-                "path": str(dst),
-                "page": page_int,
-                **_image_meta(dst),
-            })
+            dst = _queue_attached_image(session, src.read_bytes(), ".png", prefix=f"pdf_p{page_num}")
+            attached_pages.append({"path": str(dst), "page": page_int, **_image_meta(dst)})
 
         return _ok(
             rid,
@@ -1537,9 +1499,7 @@ def _(rid, params: dict) -> dict:
     def run():
         # Pin the validated preview cwd, else the parent workspace — never an
         # invalid client path, which would silently fall back to the launch dir.
-        session_tokens = _set_session_context(
-            task_id, cwd=(preview_cwd or _session_cwd(session))
-        )
+        session_tokens = _set_session_context(task_id, cwd=(preview_cwd or _session_cwd(session)))
         try:
             from run_agent import AIAgent
             from tools.terminal_tool import register_task_env_overrides
@@ -1555,10 +1515,7 @@ def _(rid, params: dict) -> dict:
             _emit(
                 "preview.restart.progress",
                 parent,
-                {
-                    "task_id": task_id,
-                    "text": f"Starting hidden restart agent{history_note}",
-                },
+                {"task_id": task_id, "text": f"Starting hidden restart agent{history_note}"},
             )
             # Bug #50233: ephemeral preview-restart agent threads don't inherit
             # the session's HERMES_HOME override (the ContextVar set on the
@@ -1592,9 +1549,7 @@ def _(rid, params: dict) -> dict:
                 if isinstance(result, dict)
                 else str(result)
             )
-            _emit(
-                "preview.restart.complete", parent, {"task_id": task_id, "text": text}
-            )
+            _emit("preview.restart.complete", parent, {"task_id": task_id, "text": text})
         except Exception as e:
             _emit(
                 "preview.restart.complete",
@@ -1748,7 +1703,9 @@ def _approval_respond_session_fallback(params: dict):
                     if str(pending.get("request_id") or "") == request_id:
                         return session
         except Exception:
-            logger.debug("approval.respond request_id fallback failed", exc_info=True)
+            logger.debug(
+                "approval.respond request_id fallback failed", exc_info=True
+            )
     target = str(params.get("session_id") or "")
     if target:
         try:
@@ -1756,7 +1713,9 @@ def _approval_respond_session_fallback(params: dict):
             if live is not None:
                 return live[1]
         except Exception:
-            logger.debug("approval.respond stored-id fallback failed", exc_info=True)
+            logger.debug(
+                "approval.respond stored-id fallback failed", exc_info=True
+            )
     return None
 
 

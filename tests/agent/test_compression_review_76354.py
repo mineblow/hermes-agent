@@ -228,7 +228,8 @@ class TestF2HostUnwindRevokesAdmission:
         fence = fence_box["fence"]
         assert not release.is_set()
         assert fence.is_cancelled, (
-            "host unwind must revoke commit admission while the worker is still running"
+            "host unwind must revoke commit admission while the worker "
+            "is still running"
         )
         # Now release the worker and prove its commit was refused.
         release.set()
@@ -236,7 +237,8 @@ class TestF2HostUnwindRevokesAdmission:
         while time.time() < deadline and "value" not in commit_admitted:
             time.sleep(0.01)
         assert commit_admitted.get("value") is False, (
-            "a worker surviving a host unwind must be denied the commit boundary"
+            "a worker surviving a host unwind must be denied the commit "
+            "boundary"
         )
         _drain_admission_slots()
 
@@ -316,7 +318,6 @@ class TestF6ExecutorSaturation:
                 return ([], "5th")
 
             fifth_msgs = [{"role": "user", "content": "fifth"}]
-
             # Round-2 #6: the fail-fast refusal must emit the standard
             # compression-attempt telemetry with failure_class=pool_saturated.
             class _TelemetryAgent:
@@ -339,7 +340,9 @@ class TestF6ExecutorSaturation:
                 def emit(self, record):
                     msg = record.getMessage()
                     if "compression attempt telemetry" in msg:
-                        self.payloads.append(_json.loads(msg.split(": ", 1)[1]))
+                        self.payloads.append(
+                            _json.loads(msg.split(": ", 1)[1])
+                        )
 
             capture = _CaptureHandler()
             _prev_level = cc.logger.level
@@ -368,8 +371,7 @@ class TestF6ExecutorSaturation:
             assert prompt == "fifth-fallback"
             assert not fifth_ran.is_set()
             saturated = [
-                p
-                for p in capture.payloads
+                p for p in capture.payloads
                 if p.get("failure_class") == "pool_saturated"
             ]
             assert saturated, (
@@ -458,17 +460,16 @@ class TestS3IdleChargedFromLastProgress:
     def test_silence_cannot_approach_double_idle_timeout(self):
         """Progress early in an interval must not extend silence to ~2x idle."""
         _drain_admission_slots()
-        idle = 1.0
+        idle = 0.4
         release = threading.Event()
-        progress_at: list[float] = []
 
         def worker(fence: CompressionCommitFence):
             time.sleep(0.05)
             fence.touch_progress()  # early progress, then total silence
-            progress_at.append(time.monotonic())
             assert release.wait(timeout=10)
             return ([], "late")
 
+        t0 = time.monotonic()
         try:
             msgs, prompt = run_compress_context_with_progress_timeout(
                 worker=worker,
@@ -478,12 +479,12 @@ class TestS3IdleChargedFromLastProgress:
                 total_ceiling_seconds=5.0,
             )
         finally:
-            elapsed = time.monotonic() - progress_at[0]
+            elapsed = time.monotonic() - t0
             release.set()
         assert prompt == "fb"
         # Old behavior waited a full interval from the CHECK (~2x idle ≈
-        # 2.05s+). New behavior times out ~idle after the last progress
-        # (~1.05s). Allow generous scheduler slack while still excluding ~2x.
+        # 0.85s+). New behavior times out ~idle after the last progress
+        # (~0.45s). Allow generous slack while still excluding ~2x.
         assert elapsed < idle * 1.8, (
             f"silence exceeded ~2x idle budget shape: {elapsed:.2f}s"
         )
@@ -506,10 +507,14 @@ class TestRound2MidCommitLeaseRelease:
         session_id = "R2_MID_COMMIT_LEASE"
         db.create_session(session_id, source="cli")
         holder = "pid:worker:original"
-        assert db.try_acquire_compression_lock(session_id, holder, ttl_seconds=60)
+        assert db.try_acquire_compression_lock(
+            session_id, holder, ttl_seconds=60
+        )
         return db, session_id, holder
 
-    def test_revoke_during_in_flight_commit_defers_lease_release(self, tmp_path):
+    def test_revoke_during_in_flight_commit_defers_lease_release(
+        self, tmp_path
+    ):
         """Event-gated fake commit; assertions run WHILE it is blocked."""
         db, session_id, holder = self._db_with_lease(tmp_path)
         fence = CompressionCommitFence()
@@ -546,7 +551,10 @@ class TestRound2MidCommitLeaseRelease:
         )
         assert not db.try_acquire_compression_lock(
             session_id, "pid:second:contender", ttl_seconds=60
-        ), "a second compressor acquired the durable lock DURING an admitted commit"
+        ), (
+            "a second compressor acquired the durable lock DURING an "
+            "admitted commit"
+        )
 
         # ── Release the commit; deferred release must fire promptly ──────
         release_commit.set()

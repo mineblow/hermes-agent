@@ -29,9 +29,13 @@
  * Prerequisite: `npm run build` must have been run so dist/ exists.
  */
 
-import { expect, type Page, test } from '@playwright/test'
+import { expect, test, type Page } from '@playwright/test'
 
-import { type MockBackendFixture, setupMockBackend, waitForAppReady } from './fixtures'
+import {
+  type MockBackendFixture,
+  setupMockBackend,
+  waitForAppReady,
+} from './fixtures'
 import { INTERIM_TEXTS, restartMockServer } from './mock-server'
 
 // ─── Helpers ──────────────────────────────────────────────────────────
@@ -39,81 +43,37 @@ import { INTERIM_TEXTS, restartMockServer } from './mock-server'
 /** Unique trigger keyword the mock server detects to switch to the script. */
 const TRIGGER = 'E2E_INTERIM_TRIGGER'
 
-async function observeGatewayCompletion(page: Page): Promise<{ dispose: () => void; done: Promise<void> }> {
-  const cdp = await page.context().newCDPSession(page)
-  await cdp.send('Network.enable')
-
-  let disposed = false
-  let timeout: ReturnType<typeof setTimeout>
-
-  const dispose = () => {
-    if (disposed) {
-      return
-    }
-
-    disposed = true
-    clearTimeout(timeout)
-    void cdp.detach().catch(() => undefined)
-  }
-
-  const done = new Promise<void>((resolve, reject) => {
-    let completionSeen = false
-
-    timeout = setTimeout(() => {
-      dispose()
-      reject(new Error('Timed out waiting for gateway message.complete and running:false frames'))
-    }, 90_000)
-
-    cdp.on('Network.webSocketFrameReceived', ({ response }) => {
-      const frame = response.payloadData
-
-      if (frame.includes('message.complete') && frame.includes(INTERIM_TEXTS.finalText)) {
-        completionSeen = true
-
-        return
-      }
-
-      if (!completionSeen || !frame.includes('session.info') || !/"running"\s*:\s*false/.test(frame)) {
-        return
-      }
-
-      dispose()
-      resolve()
-    })
-  })
-
-  return { dispose, done }
-}
-
 /**
- * Send the scripted message and wait for its actual gateway
- * `message.complete` frame. Final text can appear earlier via message.delta.
+ * Send a message and wait for BOTH the user's message and the agent's
+ * final response to appear in the transcript. Returns when the final text
+ * is visible, which means message.complete has fired and the transcript
+ * has settled.
  */
 async function sendInterimMessage(page: Page): Promise<void> {
-  const completion = await observeGatewayCompletion(page)
   const composer = page.locator('[contenteditable="true"]').first()
+  await composer.waitFor({ state: 'visible', timeout: 10_000 })
+  await composer.click()
+  await composer.type(TRIGGER, { delay: 20 })
+  await page.keyboard.press('Enter')
 
-  try {
-    await composer.waitFor({ state: 'visible', timeout: 10_000 })
-    await composer.click()
-    await composer.type(TRIGGER, { delay: 20 })
-    await page.keyboard.press('Enter')
+  // Wait for the user's trigger message to appear.
+  await page.waitForFunction(
+    () => (document.body.textContent ?? '').includes('E2E_INTERIM_TRIGGER'),
+    undefined,
+    { timeout: 15_000 },
+  )
 
-    // Wait for the user's trigger message to appear.
-    await page.waitForFunction(() => (document.body.textContent ?? '').includes('E2E_INTERIM_TRIGGER'), undefined, {
-      timeout: 15_000
-    })
+  // Wait for the agent's FINAL response (last turn). This means
+  // message.complete has fired and the transcript is settled.
+  await page.waitForFunction(
+    (finalText) => (document.body.textContent ?? '').includes(finalText),
+    INTERIM_TEXTS.finalText,
+    { timeout: 90_000 },
+  )
 
-    await completion.done
-    await page.evaluate(
-      () =>
-        new Promise<void>(resolve => {
-          requestAnimationFrame(() => requestAnimationFrame(() => resolve()))
-        })
-    )
-  } finally {
-    completion.dispose()
-  }
+  // Give the renderer a moment to settle any final state updates
+  // (hydration, session refresh) before asserting.
+  await page.waitForTimeout(2000)
 }
 
 /**
@@ -127,41 +87,42 @@ async function sendInterimMessage(page: Page): Promise<void> {
  * scoping the DOM walk to the viewport cleanly excludes them.
  */
 async function countTranscriptMessagesContaining(page: Page, text: string): Promise<number> {
-  return page.evaluate(search => {
-    const viewport = document.querySelector('[data-slot="aui_thread-viewport"]')
-
-    if (!viewport) {
-      return 0
-    }
-
-    let count = 0
-
-    const walker = document.createTreeWalker(viewport, NodeFilter.SHOW_ELEMENT, {
-      acceptNode: node => {
-        const el = node as HTMLElement
-        const directText = el.textContent ?? ''
-
-        if (!directText.includes(search)) {
-          return NodeFilter.FILTER_SKIP
-        }
-
-        // Only count leaf-ish elements to avoid double-counting.
-        const hasChildWithText = Array.from(el.children).some(child => (child.textContent ?? '').includes(search))
-
-        if (hasChildWithText) {
-          return NodeFilter.FILTER_SKIP
-        }
-
-        return NodeFilter.FILTER_ACCEPT
+  return page.evaluate(
+    (search) => {
+      const viewport = document.querySelector('[data-slot="aui_thread-viewport"]')
+      if (!viewport) {
+        return 0
       }
-    })
 
-    while (walker.nextNode()) {
-      count++
-    }
-
-    return count
-  }, text)
+      let count = 0
+      const walker = document.createTreeWalker(
+        viewport,
+        NodeFilter.SHOW_ELEMENT,
+        {
+          acceptNode: (node) => {
+            const el = node as HTMLElement
+            const directText = el.textContent ?? ''
+            if (!directText.includes(search)) {
+              return NodeFilter.FILTER_SKIP
+            }
+            // Only count leaf-ish elements to avoid double-counting.
+            const hasChildWithText = Array.from(el.children).some(
+              (child) => (child.textContent ?? '').includes(search),
+            )
+            if (hasChildWithText) {
+              return NodeFilter.FILTER_SKIP
+            }
+            return NodeFilter.FILTER_ACCEPT
+          },
+        },
+      )
+      while (walker.nextNode()) {
+        count++
+      }
+      return count
+    },
+    text,
+  )
 }
 
 // ─── Flag ON: interim_assistant_messages = true (default) ─────────────
@@ -190,19 +151,19 @@ test.describe('interim assistant messages — flag ON (default)', () => {
     // message.complete.
     for (const interimText of INTERIM_TEXTS.interims) {
       await expect
-        .poll(() => countTranscriptMessagesContaining(page, interimText), {
-          timeout: 15_000,
-          message: `interim text "${interimText}" should be visible`
-        })
+        .poll(
+          () => countTranscriptMessagesContaining(page, interimText),
+          { timeout: 15_000, message: `interim text "${interimText}" should be visible` },
+        )
         .toBeGreaterThanOrEqual(1)
     }
 
     // The final text must also be visible.
     await expect
-      .poll(() => countTranscriptMessagesContaining(page, INTERIM_TEXTS.finalText), {
-        timeout: 15_000,
-        message: 'final text should be visible'
-      })
+      .poll(
+        () => countTranscriptMessagesContaining(page, INTERIM_TEXTS.finalText),
+        { timeout: 15_000, message: 'final text should be visible' },
+      )
       .toBeGreaterThanOrEqual(1)
   })
 })
@@ -217,7 +178,7 @@ test.describe('interim assistant messages — flag OFF', () => {
   test.beforeAll(async () => {
     restartMockServer()
     fixture = await setupMockBackend({
-      extraDisplayConfig: '  interim_assistant_messages: false'
+      extraDisplayConfig: '  interim_assistant_messages: false',
     })
     await waitForAppReady(fixture, 120_000)
   })
@@ -232,10 +193,10 @@ test.describe('interim assistant messages — flag OFF', () => {
 
     // The final text must be visible.
     await expect
-      .poll(() => countTranscriptMessagesContaining(page, INTERIM_TEXTS.finalText), {
-        timeout: 15_000,
-        message: 'final text should be visible'
-      })
+      .poll(
+        () => countTranscriptMessagesContaining(page, INTERIM_TEXTS.finalText),
+        { timeout: 15_000, message: 'final text should be visible' },
+      )
       .toBeGreaterThanOrEqual(1)
 
     // NONE of the interim texts should be visible — with the flag off,

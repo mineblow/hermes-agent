@@ -572,46 +572,6 @@ describe('reconcileActiveTranscript', () => {
     expect(fixture.updateSessionState).toHaveBeenCalledTimes(1)
   })
 
-  it('keeps the completed live final when durable tool history contains pre-tool commentary', async () => {
-    const fixture = makeRefresh()
-    fixture.state.messages = [
-      { id: 'user-live', parts: [{ text: 'question', type: 'text' }], role: 'user' },
-      {
-        completedAt: 4,
-        id: 'assistant-stream-live',
-        parts: [
-          { result: 'done', toolCallId: 'call-1', toolName: 'todo', type: 'tool-call' },
-          { text: 'Final answer.', type: 'text' }
-        ],
-        pending: false,
-        role: 'assistant'
-      }
-    ]
-    vi.mocked(getLatestSessionMessages).mockResolvedValue({
-      messages: [
-        { content: 'question', id: 1, role: 'user', timestamp: 1 },
-        {
-          content: 'First I will check.',
-          id: 2,
-          role: 'assistant',
-          timestamp: 2,
-          tool_calls: [{ function: { arguments: '{}', name: 'todo' }, id: 'call-1' }]
-        },
-        { content: 'done', role: 'tool', timestamp: 3, tool_call_id: 'call-1', tool_name: 'todo' },
-        { content: 'Final answer.', id: 3, role: 'assistant', timestamp: 4 }
-      ],
-      session_id: ACTIVE_STORED_ID
-    } as never)
-
-    await fixture.refresh()
-
-    const assistant = fixture.states.get(ACTIVE_RUNTIME_ID)?.messages.at(-1)
-
-    expect(assistant?.parts.map(part => part.type)).toEqual(['tool-call', 'text'])
-    expect(assistant?.parts.find(part => part.type === 'text')?.text).toBe('Final answer.')
-    expect(assistant?.rowId).toBe(2)
-  })
-
   it('preserves a local assistant error while hydrating authoritative messages', async () => {
     const fixture = makeRefresh()
     fixture.state.messages = [

@@ -133,8 +133,7 @@ describe('parseMarkdownIntoBlocksCached', () => {
   // 12 seeds × 500 growing prefixes is ~6000 full+cached lexes; it first trips
   // the pre-fix boundary at seed 11 / step 257, so the workload can't shrink
   // without gutting the guard. The work is bounded but exceeds one test's 5s
-  // default budget and takes ~31s on a loaded two-core CI worker, so raise the
-  // timeout rather than weaken the coverage.
+  // default budget, so raise the timeout rather than weaken the coverage.
   it('matches a full lex at every char-level streaming cut over noisy markdown (property fuzz)', () => {
     // Character-level append fuzz over the markdown control alphabet — the
     // harness that surfaced the setext-underline merge above. Growing a single
@@ -161,5 +160,5 @@ describe('parseMarkdownIntoBlocksCached', () => {
         expect(parseMarkdownIntoBlocksCached(text)).toEqual(parseMarkdownIntoBlocks(text))
       }
     }
-  }, 60_000)
+  }, 30_000)
 })
