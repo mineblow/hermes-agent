@@ -2918,6 +2918,7 @@ def _compute_host_turn_frame(
     image_paths: list[str] | None = None,
     queued_prompt_generation: int | None = None,
     display_kind: str | None = None,
+    display_metadata: dict | None = None,
     client_message_id: str | None = None,
     display_text: str | None = None,
     submitted_at: float | None = None,
@@ -2938,6 +2939,11 @@ def _compute_host_turn_frame(
         "session_key": session.get("session_key") or sid,
         "text": text,
         **({"display_kind": display_kind} if display_kind else {}),
+        **(
+            {"display_metadata": dict(display_metadata)}
+            if display_metadata is not None
+            else {}
+        ),
         **(
             {"client_message_id": client_message_id}
             if client_message_id
@@ -3039,6 +3045,7 @@ def _submit_prompt_to_compute_host(
     image_paths: list[str] | None = None,
     queued_prompt_generation: int | None = None,
     display_kind: str | None = None,
+    display_metadata: dict | None = None,
     client_message_id: str | None = None,
     display_text: str | None = None,
     submitted_at: float | None = None,
@@ -3053,6 +3060,7 @@ def _submit_prompt_to_compute_host(
         image_paths=image_paths,
         queued_prompt_generation=queued_prompt_generation,
         display_kind=display_kind,
+        display_metadata=display_metadata,
         client_message_id=client_message_id,
         display_text=display_text,
         submitted_at=submitted_at,
@@ -10236,6 +10244,7 @@ def _enqueue_prompt(
     origin_client_id: str | None = None,
     request_id: str | None = None,
     display_kind: str | None = None,
+    display_metadata: dict | None = None,
     client_message_id: str | None = None,
     display_text: str | None = None,
     submitted_at: float | None = None,
@@ -10282,6 +10291,9 @@ def _enqueue_prompt(
             key: value
             for key, value in {
                 "display_kind": display_kind,
+                "display_metadata": (
+                    dict(display_metadata) if display_metadata is not None else None
+                ),
                 "client_message_id": client_message_id,
                 "display_text": display_text,
                 "submitted_at": submitted_at,
@@ -10455,10 +10467,12 @@ def _handle_busy_submit(
     *,
     origin_client_id: str | None = None,
     display_kind: str | None = None,
+    display_metadata: dict | None = None,
     client_message_id: str | None = None,
     display_text: str | None = None,
     submitted_at: float | None = None,
     attachment_refs: list[str] | None = None,
+    image_paths: list[str] | None = None,
 ) -> dict | None:
     """Apply the ``display.busy_input_mode`` policy to a prompt that lands while
     a turn is in flight, instead of rejecting it with ``session busy``.
@@ -10489,11 +10503,14 @@ def _handle_busy_submit(
     with session["history_lock"]:
         if not session.get("running"):
             return None
-        image_paths = list(session.get("attached_images", []))
-        if image_paths:
-            # Claim at submission time. A later paste must not be consumed by
-            # this prompt after the active turn finally yields.
-            session["attached_images"] = []
+        if image_paths is None:
+            image_paths = list(session.get("attached_images", []))
+            if image_paths:
+                # Claim at submission time. A later paste must not be consumed by
+                # this prompt after the active turn finally yields.
+                session["attached_images"] = []
+        else:
+            image_paths = list(image_paths)
     text_only = not image_paths and _is_text_only_busy_payload(text)
     plain_text = _coerce_message_text(text).strip() if text_only else ""
     if mode == "steer" and text_only and plain_text and agent is not None and hasattr(agent, "steer"):
@@ -10544,6 +10561,7 @@ def _handle_busy_submit(
             origin_client_id=origin_client_id,
             request_id=str(rid) if origin_client_id is not None else None,
             display_kind=display_kind,
+            display_metadata=display_metadata,
             client_message_id=client_message_id,
             display_text=display_text,
             submitted_at=submitted_at,
@@ -10617,6 +10635,7 @@ def _drain_queued_prompt(rid, sid: str, session: dict) -> bool:
     dispatch_failed = False
     submit_metadata = {
         "display_kind": queued.get("display_kind"),
+        "display_metadata": queued.get("display_metadata"),
         "client_message_id": queued.get("client_message_id"),
         "display_text": queued.get("display_text"),
         "submitted_at": queued.get("submitted_at"),

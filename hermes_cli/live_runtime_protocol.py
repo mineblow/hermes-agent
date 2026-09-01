@@ -153,6 +153,7 @@ def runtime_input(
     display_text: str | None = None,
     submitted_at: float | None = None,
     attachment_refs: Iterable[str] | None = None,
+    image_refs: Iterable[str] | None = None,
     display_metadata: Mapping[str, Any] | None = None,
     busy_policy: str = "queue",
 ) -> dict[str, Any]:
@@ -169,6 +170,8 @@ def runtime_input(
         frame["submitted_at"] = submitted_at
     if attachment_refs is not None:
         frame["attachment_refs"] = list(attachment_refs)
+    if image_refs is not None:
+        frame["image_refs"] = list(image_refs)
     if display_metadata is not None:
         frame["display_metadata"] = dict(display_metadata)
     return validate_runtime_input(frame)
@@ -203,6 +206,14 @@ def validate_runtime_input(frame: Any) -> dict[str, Any]:
         or len(set(refs)) != len(refs)
     ):
         raise LiveRuntimeProtocolError("invalid attachment refs")
+    image_refs = frame.get("image_refs", [])
+    if (
+        not isinstance(image_refs, list)
+        or any(not isinstance(ref, str) or not ref.strip() for ref in image_refs)
+        or len(set(image_refs)) != len(image_refs)
+        or any(ref not in refs for ref in image_refs)
+    ):
+        raise LiveRuntimeProtocolError("invalid image refs")
     if "display_metadata" in frame and not isinstance(frame["display_metadata"], dict):
         raise LiveRuntimeProtocolError("invalid display metadata")
     return _plain_json(frame, "runtime input")

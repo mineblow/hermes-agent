@@ -6,6 +6,8 @@ import asyncio
 import hashlib
 import inspect
 import json
+import logging
+import uuid
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
 from enum import Enum
@@ -14,7 +16,12 @@ from typing import Any, Protocol
 
 from gateway.session import SessionSource
 from gateway.session_state import SessionState
-from hermes_cli.live_runtime_protocol import SUPPORTED_CAPABILITIES
+from hermes_cli.live_runtime_protocol import SUPPORTED_CAPABILITIES, runtime_input
+
+logger = logging.getLogger(__name__)
+
+SUBMISSION_TIMEOUT_SECONDS = 30.0
+CLOSE_TIMEOUT_SECONDS = 2.0
 
 
 class AttachmentMode(str, Enum):
@@ -111,6 +118,8 @@ class AttachmentClient(Protocol):
 
     async def start(self) -> None: ...
 
+    async def request(self, payload: dict[str, Any]) -> Any: ...
+
     async def close(self) -> None: ...
 
 
@@ -163,6 +172,13 @@ class LiveRuntimeBridge:
         self._state_for = state_for
         self._locks: dict[tuple[str, str], asyncio.Lock] = {}
 
+    def attachment_for(
+        self, session_key: str, routing_key: LiveRuntimeRoutingKey
+    ) -> LiveRuntimeAttachment | None:
+        """Return the current attachment for an authenticated route, if any."""
+        state = self._state_for(session_key)
+        return state.live_runtime_attachments.get(routing_key.token)
+
     @staticmethod
     def _capabilities(mode: AttachmentMode) -> frozenset[str]:
         if mode is AttachmentMode.OBSERVE:
@@ -170,6 +186,100 @@ class LiveRuntimeBridge:
         if mode is AttachmentMode.CONTROL:
             return SUPPORTED_CAPABILITIES
         raise ValueError("unsupported attachment mode")
+
+    @staticmethod
+    def _client_message_id(
+        attachment: LiveRuntimeAttachment, event: Any
+    ) -> str:
+        native_id = getattr(event, "message_id", None)
+        native_namespace = "message"
+        if not isinstance(native_id, str) or not native_id.strip():
+            platform_update_id = getattr(event, "platform_update_id", None)
+            if isinstance(platform_update_id, (str, int)) and not isinstance(
+                platform_update_id, bool
+            ):
+                native_id = str(platform_update_id)
+                native_namespace = "platform-update"
+        if isinstance(native_id, str) and native_id.strip():
+            material = (
+                f"{attachment.routing_key.token}\0{native_namespace}\0{native_id}"
+            ).encode("utf-8")
+            return f"gateway-message-v1:{hashlib.sha256(material).hexdigest()}"
+        metadata = getattr(event, "metadata", None)
+        if not isinstance(metadata, dict):
+            metadata = {}
+            event.metadata = metadata
+        generated = metadata.get("live_runtime_client_message_id")
+        if not isinstance(generated, str) or not generated.strip():
+            generated = f"gateway-message-v1:{uuid.uuid4().hex}"
+            metadata["live_runtime_client_message_id"] = generated
+        return generated
+
+    @staticmethod
+    async def submit_message(
+        attachment: LiveRuntimeAttachment, event: Any
+    ) -> Any:
+        """Submit one authorized platform event to the canonical scheduler."""
+        if (
+            attachment.mode is not AttachmentMode.CONTROL
+            or "prompt.submit" not in attachment.accepted_capabilities
+        ):
+            raise PermissionError("live runtime attachment cannot submit prompts")
+        source = attachment.source
+        platform = getattr(source.platform, "value", source.platform)
+        metadata = getattr(event, "metadata", None)
+        display_text = (
+            metadata.get("live_runtime_display_text")
+            if isinstance(metadata, dict)
+            else None
+        )
+        refs = list(dict.fromkeys(getattr(event, "media_urls", None) or ()))
+        raw_image_refs = (
+            metadata.get("live_runtime_image_refs", ())
+            if isinstance(metadata, dict)
+            else ()
+        )
+        image_refs = [
+            ref
+            for ref in dict.fromkeys(raw_image_refs)
+            if isinstance(ref, str) and ref in refs
+        ]
+        timestamp = getattr(event, "timestamp", None)
+        submitted_at = timestamp.timestamp() if timestamp is not None else None
+        frame = runtime_input(
+            message_id=LiveRuntimeBridge._client_message_id(attachment, event),
+            text=getattr(event, "text", ""),
+            display_text=display_text,
+            submitted_at=submitted_at,
+            attachment_refs=refs,
+            image_refs=image_refs,
+            display_metadata={
+                "platform": platform,
+                "profile": source.profile or "default",
+                "principal_id": attachment.principal_id,
+                "user_id": getattr(event, "user_id", None) or source.user_id,
+                "user_name": getattr(event, "user_name", None) or source.user_name,
+            },
+        )
+        try:
+            return await asyncio.wait_for(
+                attachment.client.request(frame),
+                timeout=SUBMISSION_TIMEOUT_SECONDS,
+            )
+        except TimeoutError as exc:
+            try:
+                await asyncio.wait_for(
+                    attachment.client.close(),
+                    timeout=CLOSE_TIMEOUT_SECONDS,
+                )
+            except Exception:
+                logger.warning(
+                    "Canonical runtime client close did not finish after submission timeout",
+                    exc_info=True,
+                )
+            raise TimeoutError(
+                "canonical scheduler acknowledgement timed out; execution outcome is unknown"
+            ) from exc
 
     async def attach(
         self,

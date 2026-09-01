@@ -79,7 +79,8 @@ def test_runtime_input_preserves_stable_identity_display_metadata_and_attachment
         text="deploy staging",
         display_text="Deploy staging",
         submitted_at=1_725_000_000.5,
-        attachment_refs=["attachment://manifest"],
+        attachment_refs=["attachment://manifest", "attachment://photo"],
+        image_refs=["attachment://photo"],
         display_metadata={"source_message_id": "discord-99"},
         busy_policy="queue",
     )
@@ -87,7 +88,11 @@ def test_runtime_input_preserves_stable_identity_display_metadata_and_attachment
     assert protocol.validate_runtime_input(frame) == frame
     assert frame["message_id"] == "message-1"
     assert frame["display_metadata"] == {"source_message_id": "discord-99"}
-    assert frame["attachment_refs"] == ["attachment://manifest"]
+    assert frame["attachment_refs"] == [
+        "attachment://manifest",
+        "attachment://photo",
+    ]
+    assert frame["image_refs"] == ["attachment://photo"]
 
 
 def test_runtime_input_rejects_unknown_busy_policy_and_duplicate_attachment_refs():

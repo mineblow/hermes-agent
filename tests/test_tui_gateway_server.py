@@ -783,6 +783,7 @@ def test_busy_queue_preserves_durable_user_metadata_and_message_identity(monkeyp
     }
     metadata = {
         "display_kind": "hidden",
+        "display_metadata": {"platform": "discord", "user_id": "user-1"},
         "display_text": "Repeat me",
         "submitted_at": 1_725_000_000.5,
         "attachment_refs": ["attachment://one"],
@@ -792,6 +793,7 @@ def test_busy_queue_preserves_durable_user_metadata_and_message_identity(monkeyp
         session,
         "repeat me",
         None,
+        ["/tmp/image-one.png"],
         origin_client_id="client-a",
         request_id="request-a",
         client_message_id="message-a",
@@ -801,6 +803,7 @@ def test_busy_queue_preserves_durable_user_metadata_and_message_identity(monkeyp
         session,
         "repeat me",
         None,
+        ["/tmp/image-one.png"],
         origin_client_id="client-a",
         request_id="request-b",
         client_message_id="message-b",
@@ -811,6 +814,7 @@ def test_busy_queue_preserves_durable_user_metadata_and_message_identity(monkeyp
         session,
         "repeat me",
         None,
+        ["/tmp/image-one.png"],
         origin_client_id="client-a",
         request_id="request-b-retry",
         client_message_id="message-b",
@@ -834,9 +838,14 @@ def test_busy_queue_preserves_durable_user_metadata_and_message_identity(monkeyp
     kwargs = captured[0][1]
     assert kwargs["client_message_id"] == "message-a"
     assert kwargs["display_kind"] == "hidden"
+    assert kwargs["display_metadata"] == {
+        "platform": "discord",
+        "user_id": "user-1",
+    }
     assert kwargs["display_text"] == "Repeat me"
     assert kwargs["submitted_at"] == 1_725_000_000.5
     assert kwargs["attachment_refs"] == ["attachment://one"]
+    assert kwargs["image_paths"] == ["/tmp/image-one.png"]
 
 
 def test_accepted_client_message_identity_hydrates_from_durable_history():
@@ -16867,8 +16876,14 @@ def test_prompt_submit_fans_out_user_row_before_assistant_events(monkeypatch):
         api_mode = "codex_responses"
 
         def run_conversation(
-            self, prompt, conversation_history=None, stream_callback=None, **_kwargs
+            self,
+            prompt,
+            conversation_history=None,
+            stream_callback=None,
+            persist_user_display_metadata=None,
+            **_kwargs,
         ):
+            self.persist_user_display_metadata = persist_user_display_metadata
             callback = getattr(self, "_on_user_message_persisted", None)
             assert callable(callback), "gateway did not install a durable-user-row hook"
             callback()
@@ -16901,6 +16916,7 @@ def test_prompt_submit_fans_out_user_row_before_assistant_events(monkeypatch):
             "display_text": "hello from pc 1",
             "client_message_id": "user-pc1-123",
             "submitted_at": 1234.5,
+            "display_metadata": {"platform": "discord", "user_id": "user-1"},
         },
     })
 
@@ -16915,6 +16931,11 @@ def test_prompt_submit_fans_out_user_row_before_assistant_events(monkeypatch):
         "timestamp": 1234.5,
     }
     assert server._sessions["sid"]["agent"]._on_user_message_persisted is None
+    assert server._sessions["sid"]["agent"].persist_user_display_metadata == {
+        "platform": "discord",
+        "user_id": "user-1",
+        "client_message_id": "user-pc1-123",
+    }
 
 
 def test_prompt_submit_forwards_user_event_metadata_to_isolated_host(monkeypatch):
@@ -16942,16 +16963,20 @@ def test_prompt_submit_forwards_user_event_metadata_to_isolated_host(monkeypatch
             "client_message_id": "user-pc1-123",
             "submitted_at": 1234.5,
             "attachment_refs": ["attachment://one"],
+            "image_paths": ["/tmp/image-one.png"],
+            "display_metadata": {"platform": "discord", "user_id": "user-1"},
         },
     })
 
     assert captured == {
         "text": "expanded model-facing prompt",
         "display_kind": None,
+        "display_metadata": {"platform": "discord", "user_id": "user-1"},
         "client_message_id": "user-pc1-123",
         "display_text": "hello from pc 1",
         "submitted_at": 1234.5,
         "attachment_refs": ["attachment://one"],
+        "image_paths": ["/tmp/image-one.png"],
     }
 
 
@@ -16961,16 +16986,23 @@ def test_compute_host_turn_frame_carries_user_event_metadata():
         "sid",
         _session(),
         "expanded model-facing prompt",
+        image_paths=["/tmp/image-one.png"],
         client_message_id="user-pc1-123",
         display_text="hello from pc 1",
         submitted_at=1234.5,
         attachment_refs=["attachment://one"],
+        display_metadata={"platform": "discord", "user_id": "user-1"},
     )
 
     assert frame["client_message_id"] == "user-pc1-123"
     assert frame["display_text"] == "hello from pc 1"
     assert frame["submitted_at"] == 1234.5
     assert frame["attachment_refs"] == ["attachment://one"]
+    assert frame["attached_images"] == ["/tmp/image-one.png"]
+    assert frame["display_metadata"] == {
+        "platform": "discord",
+        "user_id": "user-1",
+    }
 
 
 def test_prompt_submit_surfaces_backend_error_as_visible_text(monkeypatch):

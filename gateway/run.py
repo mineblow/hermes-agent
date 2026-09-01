@@ -6967,6 +6967,223 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         if bridge is not None:
             await bridge.close_all()
 
+    async def _lookup_live_runtime_owner(self, conversation_key: str):
+        from hermes_cli.live_runtime_owners import lookup_runtime_owner
+
+        registry_home = getattr(
+            self, "_live_runtime_registry_home", str(Path(_hermes_home).resolve())
+        )
+        return await asyncio.to_thread(
+            lookup_runtime_owner,
+            conversation_key=conversation_key,
+            registry_home=registry_home,
+        )
+
+    def _make_live_runtime_client(self, request):
+        from gateway.live_runtime_client import AsyncLiveRuntimeClient
+        from gateway.runtime_proxy_connection import RuntimeProxyAsyncConnection
+
+        registry_home = getattr(
+            self, "_live_runtime_registry_home", str(Path(_hermes_home).resolve())
+        )
+
+        async def owner_lookup(conversation_key):
+            from hermes_cli.live_runtime_owners import lookup_runtime_owner
+
+            return await asyncio.to_thread(
+                lookup_runtime_owner,
+                conversation_key=conversation_key,
+                registry_home=registry_home,
+            )
+
+        return AsyncLiveRuntimeClient(
+            conversation_key=request.conversation_key,
+            durable_root=request.durable_root,
+            client_id=request.stable_client_id,
+            principal={
+                "provider": request.surface,
+                "subject": request.principal_id,
+                "authenticated": True,
+            },
+            surface=request.surface,
+            requested_capabilities=request.requested_capabilities,
+            owner_lookup=owner_lookup,
+            connector=lambda owner: RuntimeProxyAsyncConnection(
+                owner=owner,
+                durable_session_id=request.durable_session_id,
+                profile=(
+                    request.routing_key.profile
+                    if request.routing_key.profile != "default"
+                    else None
+                ),
+                client_id=request.stable_client_id,
+                requested_capabilities=request.requested_capabilities,
+            ),
+        )
+
+    async def _live_runtime_attachment_for_input(
+        self,
+        *,
+        source,
+        session_key: str,
+        durable_session_id: str,
+    ):
+        """Return a canonical control attachment when safely available."""
+        principal_id = str(source.user_id or "").strip()
+        if not principal_id or self._session_db is None:
+            return None
+        from gateway.live_runtime_bridge import (
+            AttachmentMode,
+            LiveRuntimeRoutingKey,
+            profile_scoped_runtime_key,
+        )
+
+        profile_home = self._resolve_profile_home_for_source(source)
+        durable_root = await asyncio.to_thread(
+            self._session_db.session_runtime_key, durable_session_id
+        )
+        conversation_key = profile_scoped_runtime_key(durable_root, profile_home)
+        bridge = self._live_runtime_attachment_bridge()
+        routing_key = LiveRuntimeRoutingKey.from_source(source, principal_id)
+        existing = bridge.attachment_for(session_key, routing_key)
+        if (
+            existing is not None
+            and existing.durable_root == durable_root
+            and existing.durable_session_id == durable_session_id
+            and existing.mode is AttachmentMode.CONTROL
+        ):
+            return existing
+        try:
+            owner = await self._lookup_live_runtime_owner(conversation_key)
+        except Exception:
+            logger.debug("Canonical runtime owner lookup failed", exc_info=True)
+            return None
+        if owner is None or str(owner.endpoint).startswith("process-local:"):
+            return None
+        if Path(owner.profile_home).expanduser().resolve() != Path(
+            profile_home
+        ).expanduser().resolve():
+            logger.warning("Ignoring canonical runtime owner from another profile")
+            return None
+
+        try:
+            return await asyncio.wait_for(
+                bridge.attach(
+                    session_key=session_key,
+                    source=source,
+                    principal_id=principal_id,
+                    durable_root=durable_root,
+                    durable_session_id=durable_session_id,
+                    profile_home=profile_home,
+                    mode=AttachmentMode.CONTROL,
+                    client_factory=self._make_live_runtime_client,
+                ),
+                timeout=3.0,
+            )
+        except Exception:
+            # Safe local fallback is permitted only before scheduler submission.
+            logger.info(
+                "Canonical runtime attachment unavailable; using local gateway runtime",
+                exc_info=True,
+            )
+            return None
+
+    async def _try_route_live_runtime_input(
+        self,
+        *,
+        event,
+        source,
+        session_key: str,
+        durable_session_id: str,
+    ) -> bool:
+        """Route one already-prepared input to the canonical scheduler."""
+        if getattr(event, "internal", False):
+            return False
+        attachment = await self._live_runtime_attachment_for_input(
+            source=source,
+            session_key=session_key,
+            durable_session_id=durable_session_id,
+        )
+        if attachment is None:
+            return False
+        bridge = self._live_runtime_attachment_bridge()
+        # Once request() begins, failures may represent an unknown execution
+        # outcome. Never replay the same logical message into a local agent.
+        await bridge.submit_message(attachment, event)
+        attachment.refresh_runtime_state()
+        return True
+
+    async def _try_route_preprocessed_live_runtime_input(
+        self,
+        *,
+        event,
+        source,
+        session_key: str,
+        durable_session_id: str,
+        history: list,
+    ) -> bool:
+        """Select a canonical owner, preserve gateway preprocessing, and submit."""
+        if getattr(event, "internal", False):
+            return False
+        attachment = await self._live_runtime_attachment_for_input(
+            source=source,
+            session_key=session_key,
+            durable_session_id=durable_session_id,
+        )
+        if attachment is None:
+            return False
+
+        display_text = event.text
+        message_text = await self._prepare_profile_scoped_inbound_message_text(
+            event=event,
+            source=source,
+            history=history,
+            session_key=session_key,
+        )
+        if message_text is None:
+            return True
+        try:
+            from hermes_time import get_timezone as _get_live_evt_tz
+            from gateway.message_timestamps import (
+                coerce_message_timestamp as _coerce_live_ts,
+                render_user_content_with_timestamp as _render_live_ts,
+                strip_leading_message_timestamps as _strip_live_ts,
+            )
+
+            live_tz = _get_live_evt_tz()
+            clean_text, embedded_timestamp = _strip_live_ts(
+                message_text, tz=live_tz
+            )
+            event_timestamp = _coerce_live_ts(
+                getattr(event, "timestamp", None), tz=live_tz
+            )
+            timestamp = (
+                event_timestamp if event_timestamp is not None else embedded_timestamp
+            )
+            message_text = (
+                _render_live_ts(clean_text, timestamp, tz=live_tz)
+                if _message_timestamps_enabled(_load_gateway_config())
+                else clean_text
+            )
+        except Exception as exc:
+            logger.debug(
+                "Canonical message timestamp injection failed (non-fatal): %s",
+                exc,
+            )
+        if not isinstance(event.metadata, dict):
+            event.metadata = {}
+        event.metadata["live_runtime_display_text"] = display_text
+        event.metadata["live_runtime_image_refs"] = (
+            self._consume_pending_native_image_paths(session_key)
+        )
+        event.text = message_text
+        bridge = self._live_runtime_attachment_bridge()
+        # Once request() begins, failures may represent an unknown execution
+        # outcome. Never replay locally after this boundary.
+        await bridge.submit_message(attachment, event)
+        attachment.refresh_runtime_state()
+        return True
+
     def _is_session_running(self, session_key: str) -> bool:
         """True when the session holds a running-turn slot (agent or sentinel)."""
         state = self._peek_session_state(session_key)
@@ -7124,6 +7341,9 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         # self._session_state(key) (get-or-create) or
         # self._peek_session_state(key) (read-only).
         self._sessions: Dict[str, SessionState] = {}
+        # Pin the owner registry to the launch profile. Multiplex profile
+        # context is task-local and must never redirect cross-process lookup.
+        self._live_runtime_registry_home = str(Path(_hermes_home).resolve())
         # Per-SESSION_ID turn lease (#64934): serializes the
         # [load history → run → flush] region when two ROUTING KEYS resolve
         # to one session_id (switch_session's many-to-one mapping). The
@@ -19676,6 +19896,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         # onto subsequent messages in the same session (issue #6508).
         if getattr(session_entry, "is_fresh_reset", False):
             session_entry.is_fresh_reset = False
+
         if _is_new_session:
             await self.hooks.emit("session:start", {
                 "platform": source.platform.value if source.platform else "",
@@ -19893,7 +20114,25 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
 
         # Load conversation history from transcript
         history = await self.async_session_store.load_transcript(session_entry.session_id)
-        
+
+        # Canonical-owner routing happens after transcript resolution but before
+        # session hygiene or any process-local AIAgent construction. The helper
+        # applies the same preprocessing used by the local path and preserves the
+        # original renderer-facing text separately.
+        if await self._try_route_preprocessed_live_runtime_input(
+            event=event,
+            source=source,
+            session_key=session_key,
+            durable_session_id=session_entry.session_id,
+            history=history,
+        ):
+            logger.info(
+                "Inbound message accepted by canonical runtime: platform=%s session=%s",
+                _platform_name,
+                session_entry.session_id,
+            )
+            return None
+
         # -----------------------------------------------------------------
         # Session hygiene: auto-compress pathologically large transcripts
         #

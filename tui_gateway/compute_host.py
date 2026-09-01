@@ -490,6 +490,7 @@ class ComputeHost:
                 session,
                 text,
                 display_kind=frame.get("display_kind") or None,
+                display_metadata=frame.get("display_metadata"),
                 client_message_id=frame.get("client_message_id") or None,
                 display_text=(
                     frame.get("display_text") if "display_text" in frame else None

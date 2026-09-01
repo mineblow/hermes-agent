@@ -23,7 +23,7 @@
 - [x] Phase 3, Task 5: transport-neutral runtime protocol
 - [x] Phase 3, Task 6: async GatewayRunner frontend client
 - [x] Phase 4, Task 7: platform-neutral attachment state
-- [ ] Phase 4, Task 8: shared-scheduler messaging input (in progress)
+- [x] Phase 4, Task 8: shared-scheduler messaging input
 
 ---
 
@@ -282,6 +282,8 @@ drain but before adapter teardown. The reviewed five-file gate passes 64/64.
 
 ### Task 8: Route messaging input through the shared scheduler
 
+Status: complete.
+
 **Objective:** Make an authorized `MessageEvent` submit into the canonical runtime rather than call a separate `GatewayRunner` agent.
 
 **Files:**
@@ -297,6 +299,19 @@ drain but before adapter teardown. The reviewed five-file gate passes 64/64.
 - attachments and display text survive the bridge;
 - observer input is rejected before scheduler mutation;
 - fallback remains process-local when authenticated IPC is unsupported.
+
+**Result:** Authorized generic-gateway input now selects the authenticated,
+profile-scoped canonical owner after transcript resolution and before local
+agent construction. It preserves gateway preprocessing, renderer-facing text,
+event-level author identity, durable attachment references, image-only native
+model attachments, timestamps, and stable native/update identities. Owner
+absence may use the legacy process-local path only before canonical submission;
+submission timeout is bounded, closes with a separate deadline, reports an
+unknown outcome, and never replays locally. Direct, busy-queue, and isolated
+compute-host paths preserve canonical metadata and images. The focused protocol,
+bridge, client, runner, proxy, and TUI gate passes 78/78, and a real authenticated
+Unix-socket acceptance test proves `MessageEvent -> bridge -> async client ->
+runtime proxy -> prompt.submit` exactly once.
 
 ### Task 9: Translate runtime output into `GatewayStreamConsumer`
 

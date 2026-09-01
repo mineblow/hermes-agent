@@ -295,6 +295,10 @@ def _(rid, params: dict) -> dict:
     # client renders it as a bubble. Whitelisted to "hidden" — display_kind
     # is a DB-only sidecar and this RPC must not mint arbitrary kinds.
     display_kind = "hidden" if params.get("display_kind") == "hidden" else None
+    raw_display_metadata = params.get("display_metadata")
+    display_metadata = (
+        dict(raw_display_metadata) if isinstance(raw_display_metadata, dict) else None
+    )
     client_message_id = params.get("client_message_id")
     if not isinstance(client_message_id, str) or not client_message_id.strip():
         client_message_id = None
@@ -321,6 +325,21 @@ def _(rid, params: dict) -> dict:
         ]
     else:
         attachment_refs = None
+    raw_image_paths = params.get("image_paths")
+    if raw_image_paths is None:
+        explicit_image_paths = None
+    elif (
+        isinstance(raw_image_paths, list)
+        and len(raw_image_paths) <= 32
+        and all(isinstance(path, str) and path.strip() for path in raw_image_paths)
+    ):
+        explicit_image_paths = list(raw_image_paths)
+    else:
+        return _err(
+            rid,
+            -32602,
+            "invalid params: image_paths must be a bounded string list",
+        )
     # Typed bare stop phrase while backend voice mode is active ends the
     # voice chat instead of sending "stop" to the agent — the typed twin of
     # the spoken stop phrase (PR #73106), applied at the ONE server-side
@@ -414,10 +433,12 @@ def _(rid, params: dict) -> dict:
             queued=bool(params.get("queued")),
             origin_client_id=_legacy_client_id_for_transport(busy_transport),
             display_kind=display_kind,
+            display_metadata=display_metadata,
             client_message_id=client_message_id,
             display_text=display_text,
             submitted_at=submitted_at,
             attachment_refs=attachment_refs,
+            image_paths=explicit_image_paths,
         )
         if busy_response is not None:
             return busy_response
@@ -879,7 +900,9 @@ def _(rid, params: dict) -> dict:
             sid,
             session,
             text,
+            image_paths=explicit_image_paths,
             display_kind=display_kind,
+            display_metadata=display_metadata,
             client_message_id=client_message_id,
             display_text=display_text,
             submitted_at=submitted_at,
@@ -981,7 +1004,9 @@ def _(rid, params: dict) -> dict:
             sid,
             session,
             text,
+            image_paths=explicit_image_paths,
             display_kind=display_kind,
+            display_metadata=display_metadata,
             client_message_id=client_message_id,
             display_text=display_text,
             submitted_at=submitted_at,
