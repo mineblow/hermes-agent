@@ -17,6 +17,9 @@ const MAX_BUFFERED_EVENTS = 2000
 const MAX_LOG_PREVIEW = 240
 const STARTUP_TIMEOUT_MS = Math.max(5000, parseInt(process.env.HERMES_TUI_STARTUP_TIMEOUT_MS ?? '15000', 10) || 15000)
 const REQUEST_TIMEOUT_MS = Math.max(30000, parseInt(process.env.HERMES_TUI_RPC_TIMEOUT_MS ?? '120000', 10) || 120000)
+export const INTERACTION_REQUEST_TIMEOUT_MS = 30_000
+export const requestTimeoutMs = (method: string) =>
+  method === 'approval.respond' || method === 'clarify.respond' ? INTERACTION_REQUEST_TIMEOUT_MS : REQUEST_TIMEOUT_MS
 const WS_CONNECTING = 0
 const WS_OPEN = 1
 const WS_CLOSING = 2
@@ -1135,7 +1138,7 @@ export class GatewayClient extends EventEmitter {
       ws =>
         new Promise<T>((resolve, reject) => {
           const id = `r${++this.reqId}`
-          const timeout = setTimeout(this.onTimeout, REQUEST_TIMEOUT_MS, id)
+          const timeout = setTimeout(this.onTimeout, requestTimeoutMs(method), id)
 
           timeout.unref?.()
           this.pending.set(id, {
@@ -1195,7 +1198,7 @@ export class GatewayClient extends EventEmitter {
     const id = `r${++this.reqId}`
 
     return new Promise<T>((resolve, reject) => {
-      const timeout = setTimeout(this.onTimeout, REQUEST_TIMEOUT_MS, id)
+      const timeout = setTimeout(this.onTimeout, requestTimeoutMs(method), id)
 
       timeout.unref?.()
 

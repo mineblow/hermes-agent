@@ -99,11 +99,19 @@ vi.mock('undici', () => ({ WebSocket: FakeWebSocket }))
 
 import {
   GatewayClient,
+  INTERACTION_REQUEST_TIMEOUT_MS,
   RECONNECT_BASE_MS,
   RECONNECT_MAX_MS,
+  requestTimeoutMs,
   WS_HEARTBEAT_DEAD_MS,
   WS_HEARTBEAT_INTERVAL_MS
 } from '../gatewayClient.js'
+
+it('uses a strict timeout only for interaction responses', () => {
+  expect(requestTimeoutMs('approval.respond')).toBe(INTERACTION_REQUEST_TIMEOUT_MS)
+  expect(requestTimeoutMs('clarify.respond')).toBe(INTERACTION_REQUEST_TIMEOUT_MS)
+  expect(requestTimeoutMs('prompt.submit')).toBeGreaterThan(INTERACTION_REQUEST_TIMEOUT_MS)
+})
 
 describe('GatewayClient websocket attach mode', () => {
   const originalWebSocket = globalThis.WebSocket

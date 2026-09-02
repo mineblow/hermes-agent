@@ -725,6 +725,7 @@ export type GatewayEvent =
         choices?: string[]
         command: string
         description: string
+        request_id?: string
         smart_denied?: boolean
       }
       session_id?: string
