@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import threading
 from unittest.mock import AsyncMock
 
 import pytest
@@ -7,6 +8,8 @@ import pytest
 from hermes_cli.classic_live_runtime import (
     ClassicLiveRuntimeController,
     ClassicLiveRuntimeFrontend,
+    ClassicLiveRuntimeSession,
+    InProcessGatewayClient,
     build_classic_live_runtime_frontend,
 )
 from hermes_cli.live_runtime_owners import RuntimeOwner
@@ -135,6 +138,30 @@ async def test_classic_frontend_restores_and_answers_interactions():
     assert result == {"accepted": True}
 
 
+def test_builder_uses_compression_root_for_owner_lookup(tmp_path):
+    captured = {}
+
+    class FakeClient:
+        def __init__(self, **kwargs):
+            captured.update(kwargs)
+
+    build_classic_live_runtime_frontend(
+        durable_session_id="session-1",
+        conversation_key="compression-root-1",
+        profile="worker",
+        profile_home=tmp_path,
+        client_factory=FakeClient,
+        connection_factory=lambda **kwargs: kwargs,
+        owner_lookup=lambda *_args, **_kwargs: None,
+    )
+
+    from tui_gateway.runtime_proxy import _profile_scoped_conversation_key
+
+    assert captured["conversation_key"] == _profile_scoped_conversation_key(
+        "compression-root-1", tmp_path
+    )
+
+
 def test_builder_wires_classic_identity_owner_lookup_and_runtime_proxy(tmp_path):
     captured = {}
     rows = []
@@ -162,6 +189,7 @@ def test_builder_wires_classic_identity_owner_lookup_and_runtime_proxy(tmp_path)
 
     frontend = build_classic_live_runtime_frontend(
         durable_session_id="session-1",
+        conversation_key="compression-root-1",
         profile="worker",
         profile_home=tmp_path,
         client_id="classic-cli:test",
@@ -251,3 +279,166 @@ def test_sync_controller_runs_async_frontend_and_closes_its_thread():
         "close",
     ]
     assert controller.is_alive is False
+
+
+def test_session_creates_gateway_owner_before_starting_classic_frontend(tmp_path):
+    calls = []
+
+    class FakeGateway:
+        def request(self, method, params):
+            calls.append(("rpc", method, params))
+            return {
+                "session_id": "live-1",
+                "stored_session_id": "durable-1",
+            }
+
+        def close(self):
+            calls.append("gateway.close")
+
+    class FakeController:
+        def start(self):
+            calls.append("controller.start")
+
+        def submit(self, text, **kwargs):
+            calls.append(("submit", text, kwargs))
+            return {"status": "streaming"}
+
+        def close(self):
+            calls.append("controller.close")
+
+    def build_frontend(**kwargs):
+        calls.append(("build", kwargs))
+        return object()
+
+    session = ClassicLiveRuntimeSession(
+        gateway=FakeGateway(),
+        profile="worker",
+        profile_home=tmp_path,
+        frontend_factory=build_frontend,
+        controller_factory=lambda _frontend: FakeController(),
+    )
+
+    identity = session.start_new(cols=100, cwd="/workspace")
+    result = session.submit("hello", submitted_at=1.0, message_id="message-1")
+    session.close()
+
+    assert identity == {
+        "conversation_key": "durable-1",
+        "durable_session_id": "durable-1",
+        "live_session_id": "live-1",
+    }
+    assert calls[0] == (
+        "rpc",
+        "session.create",
+        {
+            "attachment_mode": "control",
+            "cols": 100,
+            "cwd": "/workspace",
+            "profile": "worker",
+            "source": "classic-cli",
+        },
+    )
+    assert calls[1][0] == "build"
+    assert calls[1][1]["conversation_key"] == "durable-1"
+    assert calls[1][1]["durable_session_id"] == "durable-1"
+    assert calls[2] == "controller.start"
+    assert result == {"status": "streaming"}
+    assert calls[-2:] == ["controller.close", "gateway.close"]
+
+
+def test_session_resume_attaches_to_compression_root(tmp_path):
+    calls = []
+
+    class FakeGateway:
+        def request(self, method, params):
+            calls.append(("rpc", method, params))
+            return {
+                "session_id": "live-tip",
+                "stored_session_id": "durable-tip",
+            }
+
+        def close(self):
+            pass
+
+    class FakeController:
+        def start(self):
+            calls.append("controller.start")
+
+        def close(self):
+            pass
+
+    def build_frontend(**kwargs):
+        calls.append(("build", kwargs))
+        return object()
+
+    session = ClassicLiveRuntimeSession(
+        gateway=FakeGateway(),
+        profile=None,
+        profile_home=tmp_path,
+        conversation_key_resolver=lambda durable_id: (
+            calls.append(("resolve", durable_id)) or "compression-root"
+        ),
+        frontend_factory=build_frontend,
+        controller_factory=lambda _frontend: FakeController(),
+    )
+
+    identity = session.start_resume("requested-parent", cols=80)
+
+    assert calls[0] == (
+        "rpc",
+        "session.resume",
+        {
+            "attachment_mode": "control",
+            "cols": 80,
+            "omit_messages": True,
+            "profile": None,
+            "session_id": "requested-parent",
+            "source": "classic-cli",
+        },
+    )
+    assert calls[1] == ("resolve", "durable-tip")
+    assert calls[2][1]["conversation_key"] == "compression-root"
+    assert identity == {
+        "conversation_key": "compression-root",
+        "durable_session_id": "durable-tip",
+        "live_session_id": "live-tip",
+    }
+
+
+def test_in_process_gateway_correlates_async_response_and_detaches():
+    detached = []
+
+    def dispatch(request, transport):
+        transport.write(
+            {
+                "jsonrpc": "2.0",
+                "method": "event",
+                "params": {"type": "session.info", "payload": {}},
+            }
+        )
+        threading.Timer(
+            0.01,
+            lambda: transport.write(
+                {
+                    "jsonrpc": "2.0",
+                    "id": request["id"],
+                    "result": {"session_id": "live-1"},
+                }
+            ),
+        ).start()
+        return None
+
+    client = InProcessGatewayClient(
+        dispatch=dispatch,
+        detach=lambda transport: detached.append(transport.connection_id),
+        timeout=1,
+    )
+
+    assert client.request("session.resume", {"session_id": "stored-1"}) == {
+        "session_id": "live-1"
+    }
+    connection_id = client.transport.connection_id
+    client.close()
+
+    assert detached == [connection_id]
+    assert client.transport.closed is True

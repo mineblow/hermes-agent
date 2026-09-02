@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import inspect
+import queue
 import threading
 import uuid
 from collections.abc import Callable, Mapping
@@ -21,6 +22,7 @@ _REQUIRED_CAPABILITIES = frozenset(
 def build_classic_live_runtime_frontend(
     *,
     durable_session_id: str,
+    conversation_key: str,
     profile: str | None,
     profile_home: str | Path,
     on_row: Callable[[dict[str, Any]], Any] | None = None,
@@ -39,7 +41,7 @@ def build_classic_live_runtime_frontend(
     resolved_client_factory = client_factory or AsyncLiveRuntimeClient
     resolved_connection_factory = connection_factory or RuntimeProxyAsyncConnection
     resolved_owner_lookup = owner_lookup or lookup_runtime_owner
-    scoped_key = _profile_scoped_conversation_key(durable_session_id, profile_home)
+    scoped_key = _profile_scoped_conversation_key(conversation_key, profile_home)
     holder: dict[str, ClassicLiveRuntimeFrontend] = {}
 
     def find_owner(key: str):
@@ -82,6 +84,195 @@ def build_classic_live_runtime_frontend(
     )
     holder["frontend"] = frontend
     return frontend
+
+
+class _InProcessGatewayTransport:
+    def __init__(self) -> None:
+        self.connection_id = f"classic-cli-bootstrap:{uuid.uuid4()}"
+        self.client_id = self.connection_id
+        self.auth_identity = {
+            "authenticated": True,
+            "provider": "classic-cli",
+            "subject": self.client_id,
+        }
+        self.closed = False
+        self.responses: queue.Queue[dict[str, Any]] = queue.Queue(maxsize=8)
+
+    def write(self, frame: dict[str, Any]) -> bool:
+        if self.closed:
+            return False
+        if "id" not in frame:
+            return True
+        try:
+            self.responses.put_nowait(dict(frame))
+        except queue.Full:
+            self.closed = True
+            return False
+        return True
+
+    def close(self) -> None:
+        self.closed = True
+
+
+class InProcessGatewayClient:
+    """Synchronous RPC bootstrap against the canonical in-process gateway."""
+
+    def __init__(
+        self,
+        *,
+        dispatch: Callable[[dict[str, Any], Any], dict[str, Any] | None],
+        detach: Callable[[Any], Any],
+        timeout: float = 30 * 60,
+    ) -> None:
+        self.dispatch = dispatch
+        self.detach = detach
+        self.timeout = timeout
+        self.transport = _InProcessGatewayTransport()
+        self._request_lock = threading.Lock()
+        self._closed = False
+
+    def request(self, method: str, params: Mapping[str, Any]) -> Any:
+        if self._closed:
+            raise RuntimeError("in-process gateway client is closed")
+        request_id = uuid.uuid4().hex
+        request = {
+            "jsonrpc": "2.0",
+            "id": request_id,
+            "method": method,
+            "params": dict(params),
+        }
+        with self._request_lock:
+            response = self.dispatch(request, self.transport)
+            if response is None:
+                try:
+                    response = self.transport.responses.get(timeout=self.timeout)
+                except queue.Empty as exc:
+                    raise TimeoutError(
+                        f"gateway request timed out: {method}"
+                    ) from exc
+            if response.get("id") != request_id:
+                raise RuntimeError("gateway response identity mismatch")
+            error = response.get("error")
+            if error is not None:
+                message = error.get("message") if isinstance(error, dict) else error
+                raise RuntimeError(f"gateway request failed: {message}")
+            if "result" not in response:
+                raise RuntimeError("gateway response has no result")
+            return response["result"]
+
+    def close(self) -> None:
+        if self._closed:
+            return
+        self._closed = True
+        try:
+            self.detach(self.transport)
+        finally:
+            self.transport.close()
+
+
+class ClassicLiveRuntimeSession:
+    """Own the classic frontend's create/resume and proxy attachment lifecycle."""
+
+    def __init__(
+        self,
+        *,
+        gateway: Any,
+        profile: str | None,
+        profile_home: str | Path,
+        on_row: Callable[[dict[str, Any]], Any] | None = None,
+        conversation_key_resolver: Callable[[str], str] | None = None,
+        frontend_factory: Callable[..., Any] = build_classic_live_runtime_frontend,
+        controller_factory: Callable[[Any], Any] | None = None,
+    ) -> None:
+        self.gateway = gateway
+        self.profile = profile
+        self.profile_home = profile_home
+        self.on_row = on_row
+        self.conversation_key_resolver = conversation_key_resolver
+        self.frontend_factory = frontend_factory
+        self.controller_factory = controller_factory
+        self.controller: Any | None = None
+
+    @staticmethod
+    def _identity(result: Mapping[str, Any]) -> dict[str, str]:
+        live_session_id = result.get("session_id")
+        durable_session_id = result.get("stored_session_id")
+        if not isinstance(live_session_id, str) or not live_session_id:
+            raise RuntimeError("gateway returned no live session identity")
+        if not isinstance(durable_session_id, str) or not durable_session_id:
+            raise RuntimeError("gateway returned no durable session identity")
+        return {
+            "conversation_key": durable_session_id,
+            "durable_session_id": durable_session_id,
+            "live_session_id": live_session_id,
+        }
+
+    def _start_frontend(self, identity: dict[str, str]) -> None:
+        frontend = self.frontend_factory(
+            durable_session_id=identity["durable_session_id"],
+            conversation_key=identity["conversation_key"],
+            profile=self.profile,
+            profile_home=self.profile_home,
+            on_row=self.on_row,
+        )
+        controller_factory = self.controller_factory or ClassicLiveRuntimeController
+        self.controller = controller_factory(frontend)
+        self.controller.start()
+
+    def start_new(self, *, cols: int, cwd: str) -> dict[str, str]:
+        result = self.gateway.request(
+            "session.create",
+            {
+                "attachment_mode": "control",
+                "cols": cols,
+                "cwd": cwd,
+                "profile": self.profile,
+                "source": "classic-cli",
+            },
+        )
+        identity = self._identity(result)
+        self._start_frontend(identity)
+        return identity
+
+    def start_resume(self, session_id: str, *, cols: int) -> dict[str, str]:
+        result = self.gateway.request(
+            "session.resume",
+            {
+                "attachment_mode": "control",
+                "cols": cols,
+                "omit_messages": True,
+                "profile": self.profile,
+                "session_id": session_id,
+                "source": "classic-cli",
+            },
+        )
+        identity = self._identity(result)
+        if self.conversation_key_resolver is None:
+            raise RuntimeError("resume requires a compression-root resolver")
+        conversation_key = self.conversation_key_resolver(
+            identity["durable_session_id"]
+        )
+        if not isinstance(conversation_key, str) or not conversation_key:
+            raise RuntimeError("resume returned no compression-root identity")
+        identity["conversation_key"] = conversation_key
+        self._start_frontend(identity)
+        return identity
+
+    def submit(self, text: str, **kwargs: Any) -> Any:
+        if self.controller is None:
+            raise RuntimeError("classic live runtime session is not started")
+        return self.controller.submit(text, **kwargs)
+
+    def respond_to_interaction(self, **kwargs: Any) -> Any:
+        if self.controller is None:
+            raise RuntimeError("classic live runtime session is not started")
+        return self.controller.respond_to_interaction(**kwargs)
+
+    def close(self) -> None:
+        if self.controller is not None:
+            self.controller.close()
+            self.controller = None
+        self.gateway.close()
 
 
 class ClassicLiveRuntimeController:
