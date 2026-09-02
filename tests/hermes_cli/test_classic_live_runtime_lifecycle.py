@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import threading
+import uuid
+from pathlib import Path
 from unittest.mock import AsyncMock
 
 import pytest
@@ -281,6 +283,29 @@ def test_sync_controller_runs_async_frontend_and_closes_its_thread():
     assert controller.is_alive is False
 
 
+def test_sync_controller_uses_separate_interaction_timeout():
+    class FakeFrontend:
+        async def respond_to_interaction(self, **kwargs):
+            return kwargs
+
+    controller = ClassicLiveRuntimeController(
+        FakeFrontend(), request_timeout=1800, interaction_timeout=30
+    )
+    observed = []
+
+    def fake_call(awaitable, *, timeout):
+        awaitable.close()
+        observed.append(timeout)
+        return {"accepted": True}
+
+    controller._call = fake_call
+
+    assert controller.respond_to_interaction(
+        interaction_type="approval", request_id="approval-1", choice="once"
+    ) == {"accepted": True}
+    assert observed == [30]
+
+
 def test_session_creates_gateway_owner_before_starting_classic_frontend(tmp_path):
     calls = []
 
@@ -442,3 +467,200 @@ def test_in_process_gateway_correlates_async_response_and_detaches():
 
     assert detached == [connection_id]
     assert client.transport.closed is True
+
+
+def test_session_submit_and_wait_blocks_until_terminal_assistant_row(tmp_path):
+    captured = {}
+
+    class FakeGateway:
+        def request(self, _method, _params):
+            return {"session_id": "live-1", "stored_session_id": "durable-1"}
+
+        def close(self):
+            pass
+
+    class FakeController:
+        def start(self):
+            pass
+
+        def submit(self, text, **kwargs):
+            captured["on_row"](
+                {"kind": "assistant", "status": "complete", "text": "answer"}
+            )
+            return {"accepted": True}
+
+        def close(self):
+            pass
+
+    def build_frontend(**kwargs):
+        captured.update(kwargs)
+        return object()
+
+    session = ClassicLiveRuntimeSession(
+        gateway=FakeGateway(),
+        profile=None,
+        profile_home=tmp_path,
+        frontend_factory=build_frontend,
+        controller_factory=lambda _frontend: FakeController(),
+        turn_timeout=1,
+    )
+    session.start_new(cols=80, cwd="/workspace")
+
+    terminal = session.submit_and_wait(
+        "hello", submitted_at=1.0, message_id="message-1"
+    )
+
+    assert terminal == {
+        "kind": "assistant",
+        "status": "complete",
+        "text": "answer",
+    }
+
+
+@pytest.mark.parametrize(
+    ("busy_input_mode", "expected_policy"),
+    [("queue", "queue"), ("steer", "interrupt")],
+)
+def test_cli_live_turn_routes_through_facade_without_direct_agent(
+    monkeypatch, capsys, busy_input_mode, expected_policy
+):
+    from cli import HermesCLI
+
+    captured = {}
+
+    class FakeRuntime:
+        def submit_and_wait(self, text, **kwargs):
+            captured["text"] = text
+            captured.update(kwargs)
+            return {"kind": "assistant", "status": "complete", "text": "answer"}
+
+    cli = object.__new__(HermesCLI)
+    cli._classic_live_runtime = FakeRuntime()
+    cli.busy_input_mode = busy_input_mode
+    cli._last_turn_interrupted = False
+    cli.conversation_history = []
+    cli.chat = lambda *_args, **_kwargs: pytest.fail("direct chat must not run")
+    monkeypatch.setattr(uuid, "uuid4", lambda: type("Id", (), {"hex": "message-1"})())
+
+    image_path = Path("/tmp/image.png")
+    terminal = cli._chat_via_classic_live_runtime(
+        "hello", images=[image_path]
+    )
+
+    assert terminal["text"] == "answer"
+    assert captured["text"] == "hello"
+    assert captured["message_id"] == "message-1"
+    assert captured["busy_policy"] == expected_policy
+    assert captured["attachment_refs"] == [str(image_path)]
+    assert captured["image_refs"] == [str(image_path)]
+    assert cli.conversation_history == [
+        {"role": "user", "content": "hello"},
+        {"role": "assistant", "content": "answer"},
+    ]
+    assert capsys.readouterr().out.strip() == "answer"
+
+
+def test_cli_relays_runtime_approval_and_clarification_through_existing_modals():
+    from cli import HermesCLI
+
+    responses = []
+
+    class FakeRuntime:
+        def respond_to_interaction(self, **kwargs):
+            responses.append(kwargs)
+
+    cli = object.__new__(HermesCLI)
+    cli._classic_live_runtime = FakeRuntime()
+    cli._approval_callback = lambda command, description, **kwargs: "session"
+    cli._clarify_callback = lambda question, choices, **kwargs: "production"
+
+    cli._resolve_classic_live_interaction(
+        {
+            "kind": "interaction",
+            "interaction_type": "approval",
+            "request_id": "approval-1",
+            "payload": {
+                "command": "deploy",
+                "description": "Deploy release?",
+                "choices": ["once", "session", "deny"],
+            },
+        }
+    )
+    cli._resolve_classic_live_interaction(
+        {
+            "kind": "interaction",
+            "interaction_type": "clarification",
+            "request_id": "clarify-1",
+            "payload": {
+                "question": "Which environment?",
+                "choices": ["staging", "production"],
+                "question_id": "environment",
+            },
+        }
+    )
+
+    assert responses == [
+        {
+            "interaction_type": "approval",
+            "request_id": "approval-1",
+            "choice": "session",
+        },
+        {
+            "interaction_type": "clarification",
+            "request_id": "clarify-1",
+            "answer": "production",
+            "question_id": "environment",
+        },
+    ]
+
+
+@pytest.mark.parametrize("resumed", [False, True])
+def test_cli_starts_authoritative_gateway_runtime(monkeypatch, tmp_path, resumed):
+    from cli import HermesCLI
+    from hermes_cli import classic_live_runtime as live_module
+
+    calls = []
+    gateway = object()
+
+    class FakeRuntime:
+        def __init__(self, **kwargs):
+            calls.append(("init", kwargs))
+
+        def start_new(self, **kwargs):
+            calls.append(("new", kwargs))
+            return {"durable_session_id": "durable-new"}
+
+        def start_resume(self, session_id, **kwargs):
+            calls.append(("resume", session_id, kwargs))
+            return {"durable_session_id": "durable-resumed"}
+
+        def close(self):
+            calls.append("close")
+
+    monkeypatch.setattr(live_module, "ClassicLiveRuntimeSession", FakeRuntime)
+    monkeypatch.setattr(
+        live_module, "build_in_process_gateway_client", lambda: gateway
+    )
+    monkeypatch.chdir(tmp_path)
+
+    cli = object.__new__(HermesCLI)
+    cli._session_db = type(
+        "DB", (), {"session_runtime_key": lambda self, value: value}
+    )()
+    cli._resumed = resumed
+    cli.session_id = "requested-session"
+    cli._classic_live_runtime = None
+
+    cli._start_classic_live_runtime()
+
+    assert calls[0][0] == "init"
+    assert calls[0][1]["gateway"] is gateway
+    assert calls[0][1]["conversation_key_resolver"]("root") == "root"
+    if resumed:
+        assert calls[1][0:2] == ("resume", "requested-session")
+        assert cli.session_id == "durable-resumed"
+    else:
+        assert calls[1][0] == "new"
+        assert calls[1][1]["cwd"] == str(tmp_path)
+        assert cli.session_id == "durable-new"
+    assert cli._classic_live_runtime is not None

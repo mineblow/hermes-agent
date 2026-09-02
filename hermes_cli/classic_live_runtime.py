@@ -170,6 +170,18 @@ class InProcessGatewayClient:
             self.transport.close()
 
 
+def build_in_process_gateway_client(*, timeout: float = 30 * 60) -> InProcessGatewayClient:
+    from tui_gateway.server import _close_sessions_for_transport, dispatch
+
+    return InProcessGatewayClient(
+        dispatch=lambda request, transport: dispatch(request, transport),
+        detach=lambda transport: _close_sessions_for_transport(
+            transport, end_reason="classic_cli_bootstrap_close"
+        ),
+        timeout=timeout,
+    )
+
+
 class ClassicLiveRuntimeSession:
     """Own the classic frontend's create/resume and proxy attachment lifecycle."""
 
@@ -181,6 +193,7 @@ class ClassicLiveRuntimeSession:
         profile_home: str | Path,
         on_row: Callable[[dict[str, Any]], Any] | None = None,
         conversation_key_resolver: Callable[[str], str] | None = None,
+        turn_timeout: float = 30 * 60,
         frontend_factory: Callable[..., Any] = build_classic_live_runtime_frontend,
         controller_factory: Callable[[Any], Any] | None = None,
     ) -> None:
@@ -189,9 +202,12 @@ class ClassicLiveRuntimeSession:
         self.profile_home = profile_home
         self.on_row = on_row
         self.conversation_key_resolver = conversation_key_resolver
+        self.turn_timeout = turn_timeout
         self.frontend_factory = frontend_factory
         self.controller_factory = controller_factory
         self.controller: Any | None = None
+        self._turn_condition = threading.Condition()
+        self._terminal_row: dict[str, Any] | None = None
 
     @staticmethod
     def _identity(result: Mapping[str, Any]) -> dict[str, str]:
@@ -207,13 +223,21 @@ class ClassicLiveRuntimeSession:
             "live_session_id": live_session_id,
         }
 
+    def _handle_row(self, row: dict[str, Any]) -> None:
+        if row.get("kind") in {"assistant", "error"}:
+            with self._turn_condition:
+                self._terminal_row = dict(row)
+                self._turn_condition.notify_all()
+        if self.on_row is not None:
+            self.on_row(row)
+
     def _start_frontend(self, identity: dict[str, str]) -> None:
         frontend = self.frontend_factory(
             durable_session_id=identity["durable_session_id"],
             conversation_key=identity["conversation_key"],
             profile=self.profile,
             profile_home=self.profile_home,
-            on_row=self.on_row,
+            on_row=self._handle_row,
         )
         controller_factory = self.controller_factory or ClassicLiveRuntimeController
         self.controller = controller_factory(frontend)
@@ -263,6 +287,24 @@ class ClassicLiveRuntimeSession:
             raise RuntimeError("classic live runtime session is not started")
         return self.controller.submit(text, **kwargs)
 
+    def submit_and_wait(self, text: str, **kwargs: Any) -> dict[str, Any]:
+        with self._turn_condition:
+            self._terminal_row = None
+        self.submit(text, **kwargs)
+        with self._turn_condition:
+            completed = self._turn_condition.wait_for(
+                lambda: self._terminal_row is not None,
+                timeout=self.turn_timeout,
+            )
+            if not completed or self._terminal_row is None:
+                raise TimeoutError("classic live runtime turn did not complete")
+            terminal = dict(self._terminal_row)
+        if terminal.get("kind") == "error":
+            raise RuntimeError(
+                str(terminal.get("message") or "classic live runtime turn failed")
+            )
+        return terminal
+
     def respond_to_interaction(self, **kwargs: Any) -> Any:
         if self.controller is None:
             raise RuntimeError("classic live runtime session is not started")
@@ -278,9 +320,16 @@ class ClassicLiveRuntimeSession:
 class ClassicLiveRuntimeController:
     """Run the async classic frontend behind the synchronous prompt loop."""
 
-    def __init__(self, frontend: Any, *, request_timeout: float = 30 * 60) -> None:
+    def __init__(
+        self,
+        frontend: Any,
+        *,
+        request_timeout: float = 30 * 60,
+        interaction_timeout: float = 30,
+    ) -> None:
         self.frontend = frontend
         self.request_timeout = request_timeout
+        self.interaction_timeout = interaction_timeout
         self._loop: asyncio.AbstractEventLoop | None = None
         self._thread: threading.Thread | None = None
         self._ready = threading.Event()
@@ -327,20 +376,25 @@ class ClassicLiveRuntimeController:
             loop.close()
             self._loop = None
 
-    def _call(self, awaitable: Any) -> Any:
+    def _call(self, awaitable: Any, *, timeout: float | None = None) -> Any:
         loop = self._loop
         if loop is None or not self.is_alive:
             if inspect.iscoroutine(awaitable):
                 awaitable.close()
             raise RuntimeError("classic live runtime is not running")
         future = asyncio.run_coroutine_threadsafe(awaitable, loop)
-        return future.result(timeout=self.request_timeout)
+        return future.result(
+            timeout=self.request_timeout if timeout is None else timeout
+        )
 
     def submit(self, text: str, **kwargs: Any) -> Any:
         return self._call(self.frontend.submit(text, **kwargs))
 
     def respond_to_interaction(self, **kwargs: Any) -> Any:
-        return self._call(self.frontend.respond_to_interaction(**kwargs))
+        return self._call(
+            self.frontend.respond_to_interaction(**kwargs),
+            timeout=self.interaction_timeout,
+        )
 
     def close(self) -> None:
         loop = self._loop
@@ -414,20 +468,25 @@ class ClassicLiveRuntimeFrontend:
         submitted_at: float,
         message_id: str,
         busy_policy: str = "interrupt",
+        attachment_refs: list[str] | None = None,
+        image_refs: list[str] | None = None,
     ) -> Any:
         self.remember_local_message_id(message_id)
         registered = self.client.register_local_message_id(message_id)
         if inspect.isawaitable(registered):
             await registered
-        return await self.client.request(
-            {
-                "busy_policy": busy_policy,
-                "display_text": text,
-                "message_id": message_id,
-                "submitted_at": submitted_at,
-                "text": text,
-            }
-        )
+        payload: dict[str, Any] = {
+            "busy_policy": busy_policy,
+            "display_text": text,
+            "message_id": message_id,
+            "submitted_at": submitted_at,
+            "text": text,
+        }
+        if attachment_refs:
+            payload["attachment_refs"] = list(attachment_refs)
+        if image_refs:
+            payload["image_refs"] = list(image_refs)
+        return await self.client.request(payload)
 
     def on_event(self, frame: Mapping[str, Any]) -> None:
         event = validate_runtime_event(frame)
@@ -453,6 +512,11 @@ class ClassicLiveRuntimeFrontend:
                 "kind": "assistant",
                 "status": payload.get("status"),
                 "text": payload.get("text", ""),
+            }
+        elif event_type == "error":
+            row = {
+                "kind": "error",
+                "message": str(payload.get("message") or "runtime error"),
             }
         if row is not None and self._on_row is not None:
             self._on_row(row)

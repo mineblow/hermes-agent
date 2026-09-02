@@ -5578,6 +5578,8 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
         self._preload_skills_requested: list = []
         self._preload_skills_finalized = False
         self._active_session_lease = None
+        self._classic_live_runtime = None
+        self._classic_pending_interaction_ids: set[str] = set()
 
         # Voice mode state (also reinitialized inside run() for interactive TUI).
         self._voice_lock = threading.Lock()
@@ -17545,6 +17547,165 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
             ] if item is not None
         ]
 
+    def _start_classic_live_runtime(self) -> None:
+        from hermes_cli.classic_live_runtime import (
+            ClassicLiveRuntimeSession,
+            build_in_process_gateway_client,
+        )
+
+        if self._session_db is None:
+            raise RuntimeError("classic live runtime requires the durable session store")
+        runtime = ClassicLiveRuntimeSession(
+            gateway=build_in_process_gateway_client(),
+            profile=None,
+            profile_home=_hermes_home,
+            conversation_key_resolver=self._session_db.session_runtime_key,
+            on_row=self._on_classic_live_runtime_row,
+        )
+        try:
+            cols = max(20, shutil.get_terminal_size(fallback=(80, 24)).columns)
+            if self._resumed:
+                identity = runtime.start_resume(self.session_id, cols=cols)
+            else:
+                identity = runtime.start_new(cols=cols, cwd=os.getcwd())
+        except BaseException:
+            runtime.close()
+            raise
+        self._classic_live_runtime = runtime
+        self.session_id = identity["durable_session_id"]
+
+    def _resolve_classic_live_interaction(self, row: dict[str, Any]) -> None:
+        request_id = str(row.get("request_id") or "").strip()
+        interaction_type = str(row.get("interaction_type") or "").strip()
+        payload = row.get("payload")
+        runtime = self._classic_live_runtime
+        try:
+            if runtime is None or not request_id or not isinstance(payload, dict):
+                raise RuntimeError("invalid canonical interaction request")
+            if interaction_type == "approval":
+                command = str(payload.get("command") or "").strip()
+                description = str(payload.get("description") or "Approval required")
+                choices = payload.get("choices")
+                allowed = (
+                    {str(choice) for choice in choices}
+                    if isinstance(choices, list)
+                    else {"once", "session", "always", "deny"}
+                )
+                choice = self._approval_callback(
+                    command,
+                    description,
+                    allow_permanent="always" in allowed,
+                    allow_session="session" in allowed,
+                    smart_denied=allowed <= {"once", "deny"},
+                )
+                if choice not in {"once", "session", "always", "deny"}:
+                    choice = "deny"
+                runtime.respond_to_interaction(
+                    interaction_type="approval",
+                    request_id=request_id,
+                    choice=choice,
+                )
+                return
+            if interaction_type == "clarification":
+                question = str(payload.get("question") or "").strip()
+                raw_choices = payload.get("choices")
+                choices = (
+                    [str(choice) for choice in raw_choices]
+                    if isinstance(raw_choices, list)
+                    else []
+                )
+                answer = self._clarify_callback(
+                    question,
+                    choices,
+                    multi_select=bool(payload.get("multi_select", False)),
+                )
+                response: dict[str, Any] = {
+                    "interaction_type": "clarification",
+                    "request_id": request_id,
+                    "answer": str(answer),
+                }
+                question_id = payload.get("question_id")
+                if isinstance(question_id, str) and question_id.strip():
+                    response["question_id"] = question_id
+                runtime.respond_to_interaction(**response)
+                return
+            raise RuntimeError("unsupported canonical interaction type")
+        except Exception as exc:
+            logger.warning(
+                "classic live runtime interaction relay failed request=%s: %s",
+                request_id or "unknown",
+                exc,
+            )
+            if runtime is not None and request_id and interaction_type == "approval":
+                try:
+                    runtime.respond_to_interaction(
+                        interaction_type="approval",
+                        request_id=request_id,
+                        choice="deny",
+                    )
+                except Exception:
+                    pass
+        finally:
+            pending = getattr(self, "_classic_pending_interaction_ids", None)
+            if pending is not None:
+                pending.discard(request_id)
+
+    def _on_classic_live_runtime_row(self, row: dict[str, Any]) -> None:
+        kind = row.get("kind")
+        if kind == "peer-user":
+            label = row.get("user_name") or row.get("surface") or "user"
+            text = str(row.get("text") or "")
+            _cprint(f"\n  {_DIM}[{label}]{_RST} {text}")
+        elif kind == "interaction":
+            request_id = str(row.get("request_id") or "").strip()
+            pending = getattr(self, "_classic_pending_interaction_ids", None)
+            if pending is None:
+                pending = set()
+                self._classic_pending_interaction_ids = pending
+            if not request_id or request_id in pending:
+                return
+            pending.add(request_id)
+            threading.Thread(
+                target=self._resolve_classic_live_interaction,
+                args=(dict(row),),
+                name=f"classic-interaction-{request_id[:8]}",
+                daemon=True,
+            ).start()
+
+    def _chat_via_classic_live_runtime(
+        self,
+        text: str,
+        *,
+        images: list[Path] | None = None,
+    ) -> dict[str, Any]:
+        runtime = self._classic_live_runtime
+        if runtime is None:
+            raise RuntimeError("classic live runtime is not started")
+        image_refs = [str(path) for path in (images or [])]
+        busy_policy = self.busy_input_mode
+        if busy_policy not in {"queue", "reject", "interrupt"}:
+            busy_policy = "interrupt"
+        terminal = runtime.submit_and_wait(
+            text,
+            submitted_at=time.time(),
+            message_id=uuid.uuid4().hex,
+            busy_policy=busy_policy,
+            attachment_refs=image_refs or None,
+            image_refs=image_refs or None,
+        )
+        response = str(terminal.get("text") or "")
+        status = str(terminal.get("status") or "")
+        self._last_turn_interrupted = status == "interrupted"
+        self.conversation_history.extend(
+            [
+                {"role": "user", "content": text},
+                {"role": "assistant", "content": response},
+            ]
+        )
+        if response:
+            print(response)
+        return terminal
+
     def run(self):
         """Run the interactive CLI loop with persistent input at bottom."""
         if not self._claim_active_session("cli"):
@@ -17592,6 +17753,15 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
         if self._resumed:
             if self._preload_resumed_session():
                 self._display_resumed_history()
+
+        try:
+            self._start_classic_live_runtime()
+        except Exception as exc:
+            self._console_print(
+                f"[bold red]Could not start canonical live runtime:[/] {exc}"
+            )
+            self._release_active_session()
+            return
 
         try:
             from hermes_cli.skin_engine import get_active_skin
@@ -17810,7 +17980,10 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
         self._voice_last_tts_text = ""  # most recently spoken TTS text (echo guard, #75780)
         self._voice_barge_phase = None  # "generation" or "playback" phase of the last barge trip
 
-        if os.environ.get("HERMES_DEFER_AGENT_STARTUP") != "1":
+        if (
+            os.environ.get("HERMES_DEFER_AGENT_STARTUP") != "1"
+            and self._classic_live_runtime is None
+        ):
             self._install_tool_callbacks()
 
         if os.environ.get("HERMES_DEFER_AGENT_STARTUP") != "1":
@@ -20490,7 +20663,10 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
                     app.invalidate()  # Refresh status line
 
                     try:
-                        self.chat(user_input, images=submit_images or None, voice_input=is_voice_input)
+                        self._chat_via_classic_live_runtime(
+                            user_input,
+                            images=submit_images or None,
+                        )
                     finally:
                         self._agent_running = False
                         self._spinner_text = ""
@@ -20845,6 +21021,12 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
                 print(f"{_DIM}Shutting down… (finalizing session){_RST}", flush=True)
             except Exception:
                 pass
+            if self._classic_live_runtime is not None:
+                try:
+                    self._classic_live_runtime.close()
+                except Exception as exc:
+                    logger.debug("Could not close classic live runtime: %s", exc)
+                self._classic_live_runtime = None
             # Interrupt the agent immediately so its daemon thread stops making
             # API calls and exits promptly (agent_thread is daemon, so the
             # process will exit once the main thread finishes, but interrupting
