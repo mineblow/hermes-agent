@@ -43,6 +43,8 @@ async def test_classic_frontend_submits_with_stable_identity_and_closes_cleanly(
     client.register_local_message_id.assert_called_once_with("local-1")
     client.request.assert_awaited_once_with(
         {
+            "kind": "runtime.input",
+            "protocol": 1,
             "busy_policy": "interrupt",
             "display_text": "hello",
             "message_id": "local-1",

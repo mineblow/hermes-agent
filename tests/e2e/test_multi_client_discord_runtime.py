@@ -17,6 +17,7 @@ from gateway.platforms.base import MessageEvent, Platform
 from gateway.runtime_proxy_connection import RuntimeProxyAsyncConnection
 from gateway.session import SessionSource
 from gateway.session_state import SessionState
+from hermes_cli.classic_live_runtime import build_classic_live_runtime_frontend
 from hermes_cli.live_runtime_owners import RuntimeOwner
 from tests.test_tui_gateway_server import _LifecycleTransport, _dispatch_sync
 from tui_gateway import server
@@ -38,8 +39,8 @@ async def _wait_for_event(events: list[dict], event_type: str, *, after: int = 0
             await asyncio.sleep(0.01)
 
 
-async def test_desktop_and_discord_share_one_live_runtime(monkeypatch, tmp_path):
-    """Desktop and Discord must observe and control one ordered canonical run."""
+async def test_tui_classic_and_discord_share_one_live_runtime(monkeypatch, tmp_path):
+    """TUI, classic CLI, and Discord observe and control one canonical run."""
     endpoint = tmp_path / "runtime.sock"
     profile_home = tmp_path / "profiles" / "worker"
     profile_home.mkdir(parents=True)
@@ -47,6 +48,7 @@ async def test_desktop_and_discord_share_one_live_runtime(monkeypatch, tmp_path)
     conversation_key = profile_scoped_runtime_key(durable_root, profile_home)
     desktop = _LifecycleTransport("desktop-controller")
     discord_events: list[dict] = []
+    classic_rows: list[dict] = []
     run_prompts: list[str] = []
 
     class Agent:
@@ -179,6 +181,18 @@ async def test_desktop_and_discord_share_one_live_runtime(monkeypatch, tmp_path)
         )
 
     try:
+        classic = build_classic_live_runtime_frontend(
+            durable_session_id=stored_sid,
+            conversation_key=durable_root,
+            profile="worker",
+            profile_home=profile_home,
+            client_id="classic-cli:e2e",
+            on_row=classic_rows.append,
+            owner_lookup=lambda key, registry_home=None: (
+                owner if key == conversation_key else None
+            ),
+        )
+        await classic.start()
         try:
             attachment = await asyncio.wait_for(
                 bridge.attach(
@@ -238,9 +252,41 @@ async def test_desktop_and_discord_share_one_live_runtime(monkeypatch, tmp_path)
                 await asyncio.sleep(0.01)
         assert run_prompts == ["desktop prompt", "discord prompt"]
 
+        with desktop._condition:
+            desktop.frames.clear()
+        classic_submit = await classic.submit(
+            "classic prompt",
+            submitted_at=time.time(),
+            message_id="classic-message-1",
+        )
+        assert classic_submit["status"] == "streaming"
+        await asyncio.to_thread(desktop.wait_for_event, "message.complete")
+        async with asyncio.timeout(5):
+            while len(run_prompts) < 3:
+                await asyncio.sleep(0.01)
+        assert run_prompts == [
+            "desktop prompt",
+            "discord prompt",
+            "classic prompt",
+        ]
+        async with asyncio.timeout(5):
+            while not any(
+                row.get("kind") == "assistant" and row.get("text") == "reply-3"
+                for row in classic_rows
+            ):
+                await asyncio.sleep(0.01)
+        assert any(
+            row.get("kind") == "assistant" and row.get("text") == "reply-3"
+            for row in classic_rows
+        )
+
         duplicate = await bridge.submit_message(attachment, discord_message)
         assert duplicate["duplicate"] is True
-        assert run_prompts == ["desktop prompt", "discord prompt"]
+        assert run_prompts == [
+            "desktop prompt",
+            "discord prompt",
+            "classic prompt",
+        ]
 
         watermark = attachment.client.replay_watermark
         assert watermark is not None
@@ -355,6 +401,8 @@ async def test_desktop_and_discord_share_one_live_runtime(monkeypatch, tmp_path)
             )
         ]
     finally:
+        if "classic" in locals():
+            await classic.close()
         await bridge.close_all()
         proxy.stop()
         for current_sid, current_session in list(server._sessions.items()):

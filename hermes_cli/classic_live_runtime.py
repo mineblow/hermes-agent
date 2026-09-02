@@ -11,7 +11,7 @@ from collections.abc import Callable, Mapping
 from pathlib import Path
 from typing import Any
 
-from hermes_cli.live_runtime_protocol import validate_runtime_event
+from hermes_cli.live_runtime_protocol import runtime_input, validate_runtime_event
 
 
 _REQUIRED_CAPABILITIES = frozenset(
@@ -475,17 +475,15 @@ class ClassicLiveRuntimeFrontend:
         registered = self.client.register_local_message_id(message_id)
         if inspect.isawaitable(registered):
             await registered
-        payload: dict[str, Any] = {
-            "busy_policy": busy_policy,
-            "display_text": text,
-            "message_id": message_id,
-            "submitted_at": submitted_at,
-            "text": text,
-        }
-        if attachment_refs:
-            payload["attachment_refs"] = list(attachment_refs)
-        if image_refs:
-            payload["image_refs"] = list(image_refs)
+        payload = runtime_input(
+            busy_policy=busy_policy,
+            display_text=text,
+            message_id=message_id,
+            submitted_at=submitted_at,
+            text=text,
+            attachment_refs=attachment_refs,
+            image_refs=image_refs,
+        )
         return await self.client.request(payload)
 
     def on_event(self, frame: Mapping[str, Any]) -> None:
