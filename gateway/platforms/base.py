@@ -2978,6 +2978,13 @@ class BasePlatformAdapter(ABC):
     - Handling media
     """
 
+    # Canonical live-session execution belongs to GatewayRunner and its runtime
+    # bridge. Adapters are presentation transports only: they receive the shared
+    # ordered stream through GatewayStreamConsumer and must never create a
+    # second runtime owner.
+    LIVE_RUNTIME_PRESENTATION_VIA_RUNNER: bool = True
+    STARTS_LIVE_RUNTIME: bool = False
+
     # Whether this platform renders triple-backtick fenced code blocks (i.e.
     # ``format_message`` translates/preserves markdown fences into a real code
     # block).  Capability flag for markdown-aware presentation choices.
