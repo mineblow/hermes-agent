@@ -268,6 +268,13 @@ class RuntimeProxyAsyncConnection:
                         )
             replay = hello.get("replay")
             since = replay["seq"] if isinstance(replay, dict) else 0
+            runtime_replaced = (
+                isinstance(replay, dict)
+                and isinstance(replay.get("runtime_id"), str)
+                and replay["runtime_id"] != live_session_id
+            )
+            if runtime_replaced:
+                since = 0
             replay_response = await asyncio.to_thread(
                 proxy.request,
                 {
@@ -320,7 +327,7 @@ class RuntimeProxyAsyncConnection:
         self._replay_epoch = replay_epoch
         events = replay_result.get("events")
         latest_seq = replay_result.get("latest_seq")
-        truncated = replay_result.get("truncated") is True
+        truncated = replay_result.get("truncated") is True or runtime_replaced
         if (
             not isinstance(events, list)
             or isinstance(latest_seq, bool)

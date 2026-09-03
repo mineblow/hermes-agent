@@ -169,7 +169,11 @@ async def test_reader_failure_drains_inflight_delivery_before_replay():
 
     assert delivered == [1]
     assert len(connected) == 2
-    assert connections[1].sent[0]["replay"] == {"epoch": "epoch-1", "seq": 1}
+    assert connections[1].sent[0]["replay"] == {
+        "epoch": "epoch-1",
+        "seq": 1,
+        "runtime_id": "runtime-1",
+    }
 
     await client.close()
 
@@ -293,6 +297,45 @@ def test_truncated_hello_adopts_authoritative_replay_baseline():
     assert len(resync) == 1
 
 
+def test_replacement_runtime_resets_same_epoch_replay_watermark():
+    resync = []
+    owner = _owner()
+    client = AsyncLiveRuntimeClient(
+        conversation_key="durable-root",
+        durable_root="durable-root",
+        client_id="gateway-client-1",
+        principal=PRINCIPAL,
+        surface="gateway",
+        requested_capabilities={"observe"},
+        owner_lookup=lambda _key: owner,
+        connector=lambda _owner: None,
+        on_resync_required=resync.append,
+    )
+    client._runtime_id = "superseded-runtime"
+    client._replay_epoch = "epoch-1"
+    client._last_seq = 41
+
+    client._accept_hello(
+        owner,
+        {
+            "kind": "frontend.hello.ok",
+            "protocol": 1,
+            "owner_id": owner.owner_id,
+            "generation": owner.generation,
+            "accepted_capabilities": ["observe"],
+            "runtime_id": "runtime-2",
+            "durable_session_id": "session-1",
+            "replay_epoch": "epoch-1",
+            "replay_truncated": True,
+            "replay_seq": 0,
+            "resync_snapshot": {"latest_assistant": None},
+        },
+    )
+
+    assert client.replay_watermark == ("epoch-1", 0)
+    assert len(resync) == 1
+
+
 @pytest.mark.asyncio
 async def test_connect_sends_neutral_hello_and_intersects_capabilities():
     owner = _owner()
@@ -408,7 +451,11 @@ async def test_reconnect_fences_generation_and_sends_last_replay_watermark():
         await first.inbound.put(EOFError("owner exited"))
         await asyncio.wait_for(client.wait_for_generation(2), timeout=1)
         assert first.closed is True
-        assert second.sent[0]["replay"] == {"epoch": "epoch-1", "seq": 7}
+        assert second.sent[0]["replay"] == {
+            "epoch": "epoch-1",
+            "seq": 7,
+            "runtime_id": "runtime-1",
+        }
     finally:
         await client.close()
 

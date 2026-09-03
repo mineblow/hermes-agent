@@ -86,7 +86,10 @@ def _validate_principal(principal: Any) -> dict[str, Any]:
 
 
 def _validate_replay(replay: Any) -> dict[str, Any]:
-    if not isinstance(replay, dict) or set(replay) != {"epoch", "seq"}:
+    if not isinstance(replay, dict) or not set(replay) in (
+        {"epoch", "seq"},
+        {"epoch", "seq", "runtime_id"},
+    ):
         raise LiveRuntimeProtocolError("invalid replay watermark")
     epoch = replay.get("epoch")
     seq = replay.get("seq")
@@ -98,6 +101,8 @@ def _validate_replay(replay: Any) -> dict[str, Any]:
         or seq < 0
     ):
         raise LiveRuntimeProtocolError("invalid replay watermark")
+    if "runtime_id" in replay:
+        _nonempty(replay["runtime_id"], "replay runtime identity")
     return {"epoch": epoch, "seq": seq}
 
 
@@ -110,6 +115,7 @@ def frontend_hello(
     durable_root: str,
     replay_epoch: str | None = None,
     replay_seq: int | None = None,
+    replay_runtime_id: str | None = None,
 ) -> dict[str, Any]:
     capabilities = validate_capabilities(requested_capabilities)
     frame: dict[str, Any] = {
@@ -123,6 +129,10 @@ def frontend_hello(
     }
     if replay_epoch is not None or replay_seq is not None:
         frame["replay"] = {"epoch": replay_epoch, "seq": replay_seq}
+        if replay_runtime_id is not None:
+            frame["replay"]["runtime_id"] = replay_runtime_id
+    elif replay_runtime_id is not None:
+        raise LiveRuntimeProtocolError("replay runtime identity requires watermark")
     return validate_frontend_hello(frame)
 
 

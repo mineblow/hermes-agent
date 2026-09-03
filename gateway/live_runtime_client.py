@@ -346,6 +346,7 @@ class AsyncLiveRuntimeClient:
             hello_kwargs = {
                 "replay_epoch": self._replay_epoch,
                 "replay_seq": self._last_seq,
+                "replay_runtime_id": self._runtime_id,
             }
         await connection.send(
             frontend_hello(
@@ -425,6 +426,7 @@ class AsyncLiveRuntimeClient:
             raise LiveRuntimeProtocolError("invalid runtime acknowledgement identity")
         if owner.generation < self._owner_generation:
             raise OwnerGenerationFenceError("runtime owner generation moved backwards")
+        runtime_changed = self._runtime_id is not None and self._runtime_id != runtime_id
         self._owner_id = owner.owner_id
         self._owner_generation = owner.generation
         self._runtime_id = runtime_id
@@ -464,7 +466,8 @@ class AsyncLiveRuntimeClient:
             )
         self._pending_interactions = normalized_pending
         epoch_changed = self._replay_epoch != replay_epoch
-        if epoch_changed:
+        replay_identity_changed = epoch_changed or runtime_changed
+        if replay_identity_changed:
             self._replay_epoch = replay_epoch
             self._last_seq = 0
         replay_seq = frame.get("replay_seq")
@@ -474,7 +477,7 @@ class AsyncLiveRuntimeClient:
             or replay_seq < self._last_seq
         ):
             raise LiveRuntimeProtocolError("invalid replay baseline")
-        if epoch_changed:
+        if replay_identity_changed:
             self._last_seq = replay_seq
         if frame.get("replay_truncated") is True:
             snapshot = frame.get("resync_snapshot")
@@ -493,9 +496,11 @@ class AsyncLiveRuntimeClient:
                 )
             ):
                 raise LiveRuntimeProtocolError("invalid presentation resync snapshot")
-            if not epoch_changed:
+            if not replay_identity_changed:
                 self._last_seq = replay_seq
             self._signal_resync(snapshot)
+        elif runtime_changed:
+            self._signal_resync()
         elif not epoch_changed and replay_seq != self._last_seq:
             raise LiveRuntimeProtocolError("unexpected replay baseline")
 

@@ -31,6 +31,7 @@ def test_frontend_hello_carries_transport_neutral_identity_and_replay_watermark(
         durable_root="durable-session-root",
         replay_epoch="epoch-2",
         replay_seq=41,
+        replay_runtime_id="runtime-2",
     )
 
     assert frame == {
@@ -41,7 +42,7 @@ def test_frontend_hello_carries_transport_neutral_identity_and_replay_watermark(
         "surface": "discord",
         "requested_capabilities": ["observe", "prompt.submit"],
         "durable_root": "durable-session-root",
-        "replay": {"epoch": "epoch-2", "seq": 41},
+        "replay": {"epoch": "epoch-2", "seq": 41, "runtime_id": "runtime-2"},
     }
     assert protocol.validate_frontend_hello(frame) == frame
 

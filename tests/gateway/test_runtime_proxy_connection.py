@@ -369,6 +369,44 @@ async def test_fresh_attachment_adopts_snapshot_without_replaying_history(owner)
 
 
 @pytest.mark.asyncio
+async def test_replacement_runtime_fences_same_epoch_replay_watermark(owner):
+    FakeProxy.replay_result = {
+        "events": [],
+        "latest_seq": 0,
+        "truncated": False,
+        "epoch": "epoch-1",
+    }
+    connection = _connection(owner)
+
+    await connection.send(
+        frontend_hello(
+            client_id="gateway-v1:client",
+            principal={"provider": "discord", "subject": "u", "authenticated": True},
+            surface="discord",
+            requested_capabilities={
+                "observe", "prompt.submit", "interaction.respond"
+            },
+            durable_root="root-1",
+            replay_epoch="epoch-1",
+            replay_seq=41,
+            replay_runtime_id="superseded-runtime",
+        )
+    )
+
+    acknowledgement = await connection.recv()
+    replay_request = next(
+        request
+        for request in FakeProxy.instances[0].requests
+        if request["method"] == "session.events.since"
+    )
+    assert replay_request["params"]["last_seen_seq"] == 0
+    assert acknowledgement["runtime_id"] == "live-session-1"
+    assert acknowledgement["replay_truncated"] is True
+    assert acknowledgement["replay_seq"] == 0
+    assert acknowledgement["resync_snapshot"] == {"latest_assistant": None}
+
+
+@pytest.mark.asyncio
 async def test_initial_replay_overflow_fences_before_acknowledgement(owner):
     FakeProxy.live_events_during_replay = [
         {
