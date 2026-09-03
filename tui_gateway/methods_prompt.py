@@ -431,6 +431,7 @@ def _(rid, params: dict) -> dict:
         busy_response = _handle_busy_submit(
             rid, sid, session, text, busy_transport,
             queued=bool(params.get("queued")),
+            busy_policy=params.get("busy_policy"),
             origin_client_id=_legacy_client_id_for_transport(busy_transport),
             display_kind=display_kind,
             display_metadata=display_metadata,

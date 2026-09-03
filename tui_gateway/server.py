@@ -10496,6 +10496,7 @@ def _handle_busy_submit(
     transport: Any,
     queued: bool = False,
     *,
+    busy_policy: str | None = None,
     origin_client_id: str | None = None,
     display_kind: str | None = None,
     display_metadata: dict | None = None,
@@ -10524,13 +10525,18 @@ def _handle_busy_submit(
     unwinding the turn) redirected the live turn with next-turn text — queue
     semantics betrayed by a millisecond race the user can't see.
     """
-    mode = "queue" if queued else _load_busy_input_mode()
+    if busy_policy not in {"interrupt", "queue", "reject", "steer"}:
+        busy_policy = None
+    mode = "queue" if queued else busy_policy or _load_busy_input_mode()
     agent = session.get("agent")
     with session["history_lock"]:
         if not session.get("running"):
             # The turn ended between prompt.submit's first busy check and this
             # helper. Let the caller retry and claim the now-idle session.
             return None
+    if mode == "reject":
+        _forget_accepted_client_message_id(session, client_message_id)
+        return _err(rid, -32001, "session busy")
     with session["history_lock"]:
         if not session.get("running"):
             return None

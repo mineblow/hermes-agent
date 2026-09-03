@@ -251,6 +251,9 @@ async def test_tui_classic_and_discord_share_one_live_runtime(monkeypatch, tmp_p
             while len(run_prompts) < 2:
                 await asyncio.sleep(0.01)
         assert run_prompts == ["desktop prompt", "discord prompt"]
+        async with asyncio.timeout(5):
+            while session["running"]:
+                await asyncio.sleep(0.01)
 
         with desktop._condition:
             desktop.frames.clear()

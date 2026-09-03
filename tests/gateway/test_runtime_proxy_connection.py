@@ -670,6 +670,7 @@ async def test_runtime_input_maps_to_prompt_submit_without_losing_identity(owner
         "session_id": "live-session-1",
         "text": "execution text",
         "client_message_id": "message-1",
+        "busy_policy": "queue",
         "queued": True,
         "display_text": "display text",
         "submitted_at": 1_000.0,

@@ -477,6 +477,7 @@ class RuntimeProxyAsyncConnection:
             "session_id": self._live_session_id,
             "text": payload["text"],
             "client_message_id": payload["message_id"],
+            "busy_policy": payload["busy_policy"],
             "queued": payload["busy_policy"] == "queue",
         }
         for key in (

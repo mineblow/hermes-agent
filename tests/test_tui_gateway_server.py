@@ -942,6 +942,59 @@ def test_dispatch_enforces_attachment_capability_before_handler(rpc_method, capa
         server._teardown_session(session)
 
 
+def test_explicit_canonical_interrupt_overrides_local_busy_policy(monkeypatch):
+    session = {
+        "history_lock": threading.Lock(),
+        "running": True,
+        "agent": object(),
+        "accepted_client_message_ids": ["message-1"],
+    }
+    interrupted = []
+    monkeypatch.setattr(server, "_load_busy_input_mode", lambda: "queue")
+    monkeypatch.setattr(
+        server,
+        "_interrupt_busy_session",
+        lambda sid, current, agent: interrupted.append((sid, current, agent)),
+    )
+
+    response = server._handle_busy_submit(
+        "request-1",
+        "sid",
+        session,
+        "replacement",
+        None,
+        busy_policy="interrupt",
+        client_message_id="message-1",
+    )
+
+    assert response["result"]["status"] == "queued"
+    assert session["queued_prompt"]["text"] == "replacement"
+    assert interrupted == [("sid", session, session["agent"])]
+
+
+def test_explicit_canonical_reject_does_not_queue_or_consume_identity():
+    session = {
+        "history_lock": threading.Lock(),
+        "running": True,
+        "agent": object(),
+        "accepted_client_message_ids": ["message-1"],
+    }
+
+    response = server._handle_busy_submit(
+        "request-1",
+        "sid",
+        session,
+        "replacement",
+        None,
+        busy_policy="reject",
+        client_message_id="message-1",
+    )
+
+    assert response["error"]["message"] == "session busy"
+    assert "queued_prompt" not in session
+    assert session["accepted_client_message_ids"] == []
+
+
 def test_busy_queue_preserves_durable_user_metadata_and_message_identity(monkeypatch):
     session = {
         "history_lock": threading.Lock(),
@@ -15455,7 +15508,10 @@ def test_session_create_close_race_does_not_orphan_worker(monkeypatch):
     assert resp.get("result"), f"got error: {resp.get('error')}"
     sid = resp["result"]["session_id"]
     own_key = resp["result"]["stored_session_id"]
-    assert build_entered.wait(timeout=1.0), "deferred build did not start"
+    # Parallel CI can delay the deferred timer/thread beyond one second even
+    # though the production race remains valid; match the fake build's own
+    # three-second scheduling budget.
+    assert build_entered.wait(timeout=3.0), "deferred build did not start"
 
     # Wait until the (deferred) build thread has actually entered
     # _make_agent — otherwise session.close pops _sessions[sid] before

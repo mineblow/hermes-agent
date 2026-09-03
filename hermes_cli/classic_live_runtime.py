@@ -206,8 +206,7 @@ class ClassicLiveRuntimeSession:
         self.frontend_factory = frontend_factory
         self.controller_factory = controller_factory
         self.controller: Any | None = None
-        self._turn_condition = threading.Condition()
-        self._terminal_row: dict[str, Any] | None = None
+        self._terminal_rows: queue.Queue[dict[str, Any]] = queue.Queue()
 
     @staticmethod
     def _identity(result: Mapping[str, Any]) -> dict[str, str]:
@@ -225,9 +224,7 @@ class ClassicLiveRuntimeSession:
 
     def _handle_row(self, row: dict[str, Any]) -> None:
         if row.get("kind") in {"assistant", "error"}:
-            with self._turn_condition:
-                self._terminal_row = dict(row)
-                self._turn_condition.notify_all()
+            self._terminal_rows.put(dict(row))
         if self.on_row is not None:
             self.on_row(row)
 
@@ -287,23 +284,33 @@ class ClassicLiveRuntimeSession:
             raise RuntimeError("classic live runtime session is not started")
         return self.controller.submit(text, **kwargs)
 
-    def submit_and_wait(self, text: str, **kwargs: Any) -> dict[str, Any]:
-        with self._turn_condition:
-            self._terminal_row = None
-        self.submit(text, **kwargs)
-        with self._turn_condition:
-            completed = self._turn_condition.wait_for(
-                lambda: self._terminal_row is not None,
-                timeout=self.turn_timeout,
+    def _clear_terminal_rows(self) -> None:
+        while True:
+            try:
+                self._terminal_rows.get_nowait()
+            except queue.Empty:
+                return
+
+    def start_turn(self, text: str, **kwargs: Any) -> Any:
+        self._clear_terminal_rows()
+        return self.submit(text, **kwargs)
+
+    def wait_for_terminal(self, *, timeout: float | None = None) -> dict[str, Any]:
+        try:
+            terminal = self._terminal_rows.get(
+                timeout=self.turn_timeout if timeout is None else timeout
             )
-            if not completed or self._terminal_row is None:
-                raise TimeoutError("classic live runtime turn did not complete")
-            terminal = dict(self._terminal_row)
+        except queue.Empty as exc:
+            raise TimeoutError("classic live runtime turn did not complete") from exc
         if terminal.get("kind") == "error":
             raise RuntimeError(
                 str(terminal.get("message") or "classic live runtime turn failed")
             )
         return terminal
+
+    def submit_and_wait(self, text: str, **kwargs: Any) -> dict[str, Any]:
+        self.start_turn(text, **kwargs)
+        return self.wait_for_terminal()
 
     def respond_to_interaction(self, **kwargs: Any) -> Any:
         if self.controller is None:

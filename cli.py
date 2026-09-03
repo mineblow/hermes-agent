@@ -17164,12 +17164,12 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
     def _persist_active_session_before_close(self):
         """Best-effort SQLite/JSON flush before the CLI marks a session closed.
 
-        ``run_conversation()`` normally persists at turn boundaries, but a
-        terminal close/SIGHUP/SIGTERM can unwind the prompt_toolkit app while
-        the agent thread still holds the current turn only in memory.  Flush the
-        agent's live ``_session_messages`` before ``end_session()`` so resume,
-        session_search, and state.db do not lose the interrupted turn.
+        Attached classic clients are presentation-only; the canonical runtime owner
+        has already persisted every accepted event and must remain the sole writer.
         """
+        if self._classic_live_runtime is not None:
+            return
+
         agent = getattr(self, "agent", None)
         if not agent or not hasattr(agent, "_persist_session"):
             return
@@ -17681,11 +17681,24 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
         runtime = self._classic_live_runtime
         if runtime is None:
             raise RuntimeError("classic live runtime is not started")
-        image_refs = [str(path) for path in (images or [])]
+
+        def _submit(prompt: str, prompt_images: list[Path], *, policy: str) -> None:
+            image_refs = [str(path) for path in prompt_images]
+            runtime.submit(
+                prompt,
+                submitted_at=time.time(),
+                message_id=uuid.uuid4().hex,
+                busy_policy=policy,
+                attachment_refs=image_refs or None,
+                image_refs=image_refs or None,
+            )
+
+        initial_images = list(images or [])
         busy_policy = self.busy_input_mode
         if busy_policy not in {"queue", "reject", "interrupt"}:
             busy_policy = "interrupt"
-        terminal = runtime.submit_and_wait(
+        image_refs = [str(path) for path in initial_images]
+        runtime.start_turn(
             text,
             submitted_at=time.time(),
             message_id=uuid.uuid4().hex,
@@ -17693,14 +17706,47 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
             attachment_refs=image_refs or None,
             image_refs=image_refs or None,
         )
+
+        outstanding = 1
+        submitted_prompts = [text]
+        terminal: dict[str, Any] = {}
+        deadline = time.monotonic() + runtime.turn_timeout
+        while outstanding:
+            interrupt_queue = getattr(self, "_interrupt_queue", None)
+            if interrupt_queue is not None:
+                while True:
+                    try:
+                        interrupt_payload = interrupt_queue.get_nowait()
+                    except queue.Empty:
+                        break
+                    interrupt_images: list[Path] = []
+                    interrupt_text = interrupt_payload
+                    if isinstance(interrupt_payload, tuple):
+                        interrupt_text, interrupt_images = interrupt_payload
+                    if not isinstance(interrupt_text, str) or not interrupt_text:
+                        continue
+                    _cprint("\n⚡ New message detected, interrupting canonical turn...")
+                    _submit(interrupt_text, list(interrupt_images or []), policy="interrupt")
+                    submitted_prompts.append(interrupt_text)
+                    outstanding += 1
+                    self._clear_active_overlays_for_interrupt()
+
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                raise TimeoutError("classic live runtime turn did not complete")
+            try:
+                terminal = runtime.wait_for_terminal(timeout=min(0.1, remaining))
+            except TimeoutError:
+                self._invalidate(min_interval=0.15)
+                continue
+            outstanding -= 1
+
         response = str(terminal.get("text") or "")
         status = str(terminal.get("status") or "")
         self._last_turn_interrupted = status == "interrupted"
         self.conversation_history.extend(
-            [
-                {"role": "user", "content": text},
-                {"role": "assistant", "content": response},
-            ]
+            [{"role": "user", "content": prompt} for prompt in submitted_prompts]
+            + [{"role": "assistant", "content": response}]
         )
         if response:
             print(response)
@@ -18217,16 +18263,19 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
                 # post-run next-turn message — defeating mid-run injection.
                 # agent.steer() is thread-safe (holds _pending_steer_lock).
                 if self._should_handle_steer_command_inline(text, has_images=has_images):
-                    self.process_command(text)
-                    event.app.current_buffer.reset(append_to_history=True)
-                    # Force a repaint after clearing the buffer.  /steer is
-                    # dispatched mid-run while the agent streams output through
-                    # patch_stdout; process_command() never invalidates the
-                    # app, so without this the submitted "/steer <text>" can
-                    # linger in the input area (looking unsent) and invite an
-                    # accidental re-submit. See issue #34569.
-                    event.app.invalidate()
-                    return
+                    if self._classic_live_runtime is not None:
+                        text = text.partition(" ")[2].strip()
+                    else:
+                        self.process_command(text)
+                        event.app.current_buffer.reset(append_to_history=True)
+                        # Force a repaint after clearing the buffer.  /steer is
+                        # dispatched mid-run while the agent streams output through
+                        # patch_stdout; process_command() never invalidates the
+                        # app, so without this the submitted "/steer <text>" can
+                        # linger in the input area (looking unsent) and invite an
+                        # accidental re-submit. See issue #34569.
+                        event.app.invalidate()
+                        return
 
                 # Same treatment for /background (/bg, /btw) while the agent is
                 # running.  Queuing it defeats the entire point of the command:
@@ -18262,7 +18311,12 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
                 if self._agent_running and not _is_local_dispatch:
                     _effective_mode = self.busy_input_mode
                     redirected = False
-                    if _effective_mode == "steer":
+                    if (
+                        _effective_mode == "steer"
+                        and self._classic_live_runtime is not None
+                    ):
+                        _effective_mode = "interrupt"
+                    elif _effective_mode == "steer":
                         # Route Enter through /steer — inject mid-run after the
                         # next tool call.  Images can't ride along (steer only
                         # appends text), so fall back to queue when images are
@@ -18289,7 +18343,11 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
                         preview = text if text else f"[{len(images)} image{'s' if len(images) != 1 else ''} attached]"
                         _cprint(f"  Queued for the next turn: {preview[:80]}{'...' if len(preview) > 80 else ''}")
                     elif _effective_mode == "interrupt":
-                        if not images and text:
+                        if (
+                            self._classic_live_runtime is None
+                            and not images
+                            and text
+                        ):
                             try:
                                 if (
                                     self.agent is not None
@@ -21026,7 +21084,6 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
                     self._classic_live_runtime.close()
                 except Exception as exc:
                     logger.debug("Could not close classic live runtime: %s", exc)
-                self._classic_live_runtime = None
             # Interrupt the agent immediately so its daemon thread stops making
             # API calls and exits promptly (agent_thread is daemon, so the
             # process will exit once the main thread finishes, but interrupting
@@ -21060,7 +21117,12 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
             self._persist_active_session_before_close()
 
             # Close session in SQLite
-            if hasattr(self, '_session_db') and self._session_db and self.agent:
+            if (
+                self._classic_live_runtime is None
+                and hasattr(self, '_session_db')
+                and self._session_db
+                and self.agent
+            ):
                 try:
                     self._session_db.end_session(self.agent.session_id, "cli_close")
                 except (Exception, KeyboardInterrupt) as e:

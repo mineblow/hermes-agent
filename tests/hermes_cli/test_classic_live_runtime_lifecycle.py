@@ -519,6 +519,23 @@ def test_session_submit_and_wait_blocks_until_terminal_assistant_row(tmp_path):
     }
 
 
+def test_session_terminal_rows_are_consumed_in_canonical_order(tmp_path):
+    session = ClassicLiveRuntimeSession(
+        gateway=object(),
+        profile=None,
+        profile_home=tmp_path,
+        turn_timeout=1,
+    )
+    first = {"kind": "assistant", "status": "interrupted", "text": ""}
+    second = {"kind": "assistant", "status": "complete", "text": "replacement"}
+
+    session._handle_row(first)
+    session._handle_row(second)
+
+    assert session.wait_for_terminal() == first
+    assert session.wait_for_terminal() == second
+
+
 @pytest.mark.parametrize(
     ("busy_input_mode", "expected_policy"),
     [("queue", "queue"), ("steer", "interrupt")],
@@ -531,9 +548,13 @@ def test_cli_live_turn_routes_through_facade_without_direct_agent(
     captured = {}
 
     class FakeRuntime:
-        def submit_and_wait(self, text, **kwargs):
+        turn_timeout = 1
+
+        def start_turn(self, text, **kwargs):
             captured["text"] = text
             captured.update(kwargs)
+
+        def wait_for_terminal(self, **_kwargs):
             return {"kind": "assistant", "status": "complete", "text": "answer"}
 
     cli = object.__new__(HermesCLI)
@@ -560,6 +581,103 @@ def test_cli_live_turn_routes_through_facade_without_direct_agent(
         {"role": "assistant", "content": "answer"},
     ]
     assert capsys.readouterr().out.strip() == "answer"
+
+
+def test_cli_busy_interrupt_submits_replacement_through_canonical_runtime(
+    monkeypatch,
+):
+    from cli import HermesCLI
+
+    submissions = []
+    interrupt_image = Path("/tmp/interrupt.png")
+
+    class FakeRuntime:
+        turn_timeout = 1
+
+        def __init__(self):
+            self.wait_count = 0
+
+        def start_turn(self, text, **kwargs):
+            submissions.append((text, kwargs))
+
+        def submit(self, text, **kwargs):
+            submissions.append((text, kwargs))
+
+        def wait_for_terminal(self, **_kwargs):
+            self.wait_count += 1
+            if self.wait_count == 1:
+                cli._interrupt_queue.put(("replacement", [interrupt_image]))
+                raise TimeoutError
+            if self.wait_count == 2:
+                return {"kind": "assistant", "status": "interrupted", "text": ""}
+            return {"kind": "assistant", "status": "complete", "text": "replacement answer"}
+
+    cli = object.__new__(HermesCLI)
+    cli._classic_live_runtime = FakeRuntime()
+    cli._interrupt_queue = __import__("queue").Queue()
+    cli.busy_input_mode = "interrupt"
+    cli._last_turn_interrupted = False
+    cli.conversation_history = []
+    cli._clear_active_overlays_for_interrupt = lambda: None
+    cli._invalidate = lambda **_kwargs: None
+    cli.agent = type(
+        "ForbiddenAgent",
+        (),
+        {
+            "interrupt": lambda *_args, **_kwargs: pytest.fail(
+                "direct agent interrupt must not run"
+            )
+        },
+    )()
+    ids = iter(["initial-id", "replacement-id"])
+    monkeypatch.setattr(
+        uuid,
+        "uuid4",
+        lambda: type("Id", (), {"hex": next(ids)})(),
+    )
+
+    terminal = cli._chat_via_classic_live_runtime("initial")
+
+    assert terminal == {
+        "kind": "assistant",
+        "status": "complete",
+        "text": "replacement answer",
+    }
+    assert submissions[0][0] == "initial"
+    assert submissions[0][1]["message_id"] == "initial-id"
+    assert submissions[1] == (
+        "replacement",
+        {
+            "submitted_at": submissions[1][1]["submitted_at"],
+            "message_id": "replacement-id",
+            "busy_policy": "interrupt",
+            "attachment_refs": [str(interrupt_image)],
+            "image_refs": [str(interrupt_image)],
+        },
+    )
+    assert cli.conversation_history == [
+        {"role": "user", "content": "initial"},
+        {"role": "user", "content": "replacement"},
+        {"role": "assistant", "content": "replacement answer"},
+    ]
+
+
+def test_attached_classic_shutdown_never_repersist_via_legacy_agent():
+    from cli import HermesCLI
+
+    cli = object.__new__(HermesCLI)
+    cli._classic_live_runtime = object()
+    cli.agent = type(
+        "ForbiddenAgent",
+        (),
+        {
+            "_persist_session": lambda *_args, **_kwargs: pytest.fail(
+                "presentation client must not persist canonical output"
+            )
+        },
+    )()
+
+    cli._persist_active_session_before_close()
 
 
 def test_cli_relays_runtime_approval_and_clarification_through_existing_modals():
