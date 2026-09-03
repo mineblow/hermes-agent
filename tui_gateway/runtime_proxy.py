@@ -154,7 +154,7 @@ class ProxyTransport:
                 self._closed = True
                 overflow = True
         if overflow:
-            self._fail_pending_writes()
+            self._close_and_fail_pending()
             return False
         return True
 
@@ -177,12 +177,10 @@ class ProxyTransport:
                 self._closed = True
                 overflow = True
         if overflow:
-            self._fail_pending_writes()
+            self._close_and_fail_pending()
             return False
         if not completed.wait(timeout=11.0):
-            with self._state_lock:
-                self._closed = True
-            self._fail_pending_writes()
+            self._close_and_fail_pending()
             return False
         return bool(outcome and outcome[0])
 
@@ -205,6 +203,16 @@ class ProxyTransport:
                 return
             self._fail_write(item)
 
+    def _close_and_fail_pending(self, *, wake_writer: bool = False) -> None:
+        with self._state_lock:
+            self._closed = True
+            self._fail_pending_writes()
+            if wake_writer:
+                try:
+                    self._outbound.put_nowait(None)
+                except queue.Full:
+                    pass
+
     def _write_loop(self) -> None:
         while True:
             item = self._outbound.get()
@@ -213,32 +221,24 @@ class ProxyTransport:
             envelope, completed, outcome = item
             if self._closed:
                 self._fail_write(item)
-                self._fail_pending_writes()
+                self._close_and_fail_pending()
                 return
             try:
                 result = self._send(envelope)
             except Exception:
-                self._closed = True
                 self._fail_write(item)
-                self._fail_pending_writes()
+                self._close_and_fail_pending()
                 return
             if result is False:
-                self._closed = True
                 self._fail_write(item)
-                self._fail_pending_writes()
+                self._close_and_fail_pending()
                 return
             if completed is not None:
                 outcome.append(True)
                 completed.set()
 
     def close(self) -> None:
-        with self._state_lock:
-            self._closed = True
-            self._fail_pending_writes()
-            try:
-                self._outbound.put_nowait(None)
-            except queue.Full:
-                pass
+        self._close_and_fail_pending(wake_writer=True)
 
 
 def handshake_frame(

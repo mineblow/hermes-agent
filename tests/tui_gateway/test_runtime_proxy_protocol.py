@@ -641,6 +641,54 @@ def test_proxy_transport_sender_failure_releases_all_synchronous_waiters():
     assert results == [False, False, False]
 
 
+def test_proxy_transport_sender_failure_serializes_with_inflight_enqueue(monkeypatch):
+    sending = threading.Event()
+    release_sender = threading.Event()
+    sender_returned = threading.Event()
+    enqueue_entered = threading.Event()
+    release_enqueue = threading.Event()
+
+    def failing_send(_frame):
+        sending.set()
+        assert release_sender.wait(timeout=2)
+        sender_returned.set()
+        return False
+
+    transport = runtime_proxy.ProxyTransport(
+        client_id="failing-race-client",
+        send=failing_send,
+        outbound_queue_size=2,
+    )
+    frame = {"jsonrpc": "2.0", "method": "event", "params": {}}
+    assert transport.write(frame) is True
+    assert sending.wait(timeout=1)
+
+    real_put = transport._outbound.put_nowait
+
+    def controlled_put(item):
+        enqueue_entered.set()
+        assert release_enqueue.wait(timeout=2)
+        real_put(item)
+
+    monkeypatch.setattr(transport._outbound, "put_nowait", controlled_put)
+    results = []
+    writer = threading.Thread(
+        target=lambda: results.append(transport.write_and_wait(frame)),
+        daemon=True,
+    )
+    writer.start()
+    assert enqueue_entered.wait(timeout=1)
+
+    release_sender.set()
+    assert sender_returned.wait(timeout=1)
+    transport._writer.join(timeout=0.2)
+    release_enqueue.set()
+    writer.join(timeout=1)
+
+    assert not writer.is_alive()
+    assert results == [False]
+
+
 def test_proxy_transport_fails_closed_when_slow_sender_fills_bounded_queue():
     sending = threading.Event()
     release = threading.Event()
