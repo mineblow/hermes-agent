@@ -1824,13 +1824,11 @@ def _(rid, params: dict) -> dict:
             "resolved": resolved,
         }
         if should_emit:
-            if not _emit(
+            _emit(
                 "approval.resolved",
                 str(params.get("session_id") or ""),
                 payload,
-                wait_for_delivery=True,
-            ):
-                return _err(rid, 5004, "approval resolved but event delivery failed")
+            )
         return _ok(rid, payload)
     except Exception as e:
         return _err(rid, 5004, str(e))

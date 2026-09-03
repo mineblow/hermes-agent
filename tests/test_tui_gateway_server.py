@@ -1200,6 +1200,45 @@ def test_approval_response_reports_atomic_winner_and_duplicate(monkeypatch):
         server._teardown_session(session)
 
 
+def test_approval_resolution_success_does_not_wait_for_observer_delivery(monkeypatch):
+    controller = _LifecycleTransport("approval-delivery-controller")
+    session = {
+        "history_lock": threading.Lock(),
+        "transport": controller,
+        "session_key": "approval-delivery-key",
+    }
+    server._attach_current_transport(
+        "approval-delivery-sid", session, "control", transport=controller
+    )
+    server._sessions["approval-delivery-sid"] = session
+    emissions = []
+    monkeypatch.setattr("tools.approval.resolve_gateway_approval", lambda *_a, **_k: 1)
+    monkeypatch.setattr(
+        server,
+        "_emit",
+        lambda *args, **kwargs: emissions.append((args, kwargs)) or False,
+    )
+    try:
+        response = _dispatch_sync(
+            {
+                "id": "approval-delivery",
+                "method": "approval.respond",
+                "params": {
+                    "session_id": "approval-delivery-sid",
+                    "request_id": "approval-delivery-request",
+                    "choice": "once",
+                },
+            },
+            controller,
+        )
+
+        assert response["result"]["status"] == "resolved"
+        assert emissions[0][1].get("wait_for_delivery") is not True
+    finally:
+        server._sessions.pop("approval-delivery-sid", None)
+        server._teardown_session(session)
+
+
 def test_approval_respond_requires_request_id_for_live_session(monkeypatch):
     controller = _LifecycleTransport("approval-id-controller")
     session = {
