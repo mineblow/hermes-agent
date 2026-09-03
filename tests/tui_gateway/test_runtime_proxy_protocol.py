@@ -757,6 +757,40 @@ def test_unix_proxy_drops_peer_that_does_not_finish_handshake(tmp_path):
         server.stop()
 
 
+def test_unix_proxy_enforces_absolute_handshake_deadline_against_slow_drip(tmp_path):
+    if os.name == "nt":
+        pytest.skip("Unix socket integration")
+    endpoint = tmp_path / "runtime.sock"
+    server = runtime_proxy.RuntimeProxyServer(
+        endpoint=endpoint,
+        owner_lookup=lambda _key: None,
+        dispatch=lambda _request, _transport: None,
+        handshake_timeout_seconds=0.08,
+    )
+    peer = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    try:
+        assert server.start() is True
+        peer.connect(str(endpoint))
+        deadline = time.monotonic() + 1
+        while not server._connections and time.monotonic() < deadline:
+            time.sleep(0.005)
+        assert server._connections
+
+        started = time.monotonic()
+        while server._connections and time.monotonic() - started < 0.3:
+            try:
+                peer.sendall(b"{")
+            except (BrokenPipeError, ConnectionResetError):
+                break
+            time.sleep(0.02)
+
+        assert server._connections == set()
+        assert time.monotonic() - started < 0.2
+    finally:
+        peer.close()
+        server.stop()
+
+
 def test_unix_proxy_rejects_connections_before_spawning_unbounded_workers(tmp_path):
     if os.name == "nt":
         pytest.skip("Unix socket integration")

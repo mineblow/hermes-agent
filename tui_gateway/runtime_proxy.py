@@ -10,6 +10,7 @@ import socket
 import stat
 import struct
 import threading
+import time
 import uuid
 from collections import OrderedDict
 from pathlib import Path
@@ -308,6 +309,46 @@ def read_frame(stream: Any) -> dict[str, Any]:
     return frame
 
 
+def read_frame_before_deadline(
+    connection: socket.socket, *, timeout_seconds: float
+) -> dict[str, Any]:
+    """Read exactly one frame before a wall-clock deadline.
+
+    ``socket.settimeout`` alone is an idle timeout: a peer can retain the
+    connection forever by dripping bytes. Peeking lets us consume through the
+    first newline without stealing bytes from the next RPC frame.
+    """
+    deadline = time.monotonic() + timeout_seconds
+    raw = bytearray()
+    while True:
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            raise socket.timeout("runtime proxy handshake timed out")
+        connection.settimeout(remaining)
+        chunk = connection.recv(
+            min(64 * 1024, MAX_FRAME_BYTES + 2 - len(raw)), socket.MSG_PEEK
+        )
+        if not chunk:
+            raise EOFError("runtime proxy peer closed")
+        newline = chunk.find(b"\n")
+        take = newline + 1 if newline >= 0 else len(chunk)
+        raw.extend(connection.recv(take))
+        if newline >= 0:
+            break
+        if len(raw) >= MAX_FRAME_BYTES + 2:
+            raise RuntimeProxyProtocolError("runtime proxy frame is too large")
+
+    if len(raw) > MAX_FRAME_BYTES + 1:
+        raise RuntimeProxyProtocolError("runtime proxy frame is too large")
+    try:
+        frame = json.loads(raw.decode("utf-8"))
+    except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+        raise RuntimeProxyProtocolError("runtime proxy frame is malformed") from exc
+    if not isinstance(frame, dict):
+        raise RuntimeProxyProtocolError("runtime proxy frame is malformed")
+    return frame
+
+
 class RuntimeProxyServer:
     """Persistent authenticated Unix-socket owner endpoint."""
 
@@ -436,10 +477,11 @@ class RuntimeProxyServer:
         transport: ProxyTransport | None = None
         stream = None
         try:
-            connection.settimeout(self._handshake_timeout_seconds)
             peer_pid, peer_uid, _peer_gid = require_posix_peer_credentials(connection)
+            hello = read_frame_before_deadline(
+                connection, timeout_seconds=self._handshake_timeout_seconds
+            )
             stream = connection.makefile("rwb", buffering=0)
-            hello = read_frame(stream)
             key = hello.get("conversation_key")
             current = self._owner_lookup(key) if isinstance(key, str) else None
             if current is None:
