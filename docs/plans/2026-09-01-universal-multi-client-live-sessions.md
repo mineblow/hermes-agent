@@ -502,7 +502,7 @@ local fallback and the no-local-retry rule after an unknown submission outcome.
     scope idempotency by authenticated principal, client, and message ID;
   - [x] fix classic interrupt replacement completion accounting and bound pending IDs;
   - [ ] remove network-delivery waits from session ingress/interaction-resolution locks;
-  - [ ] make approval retries request-ID safe and idempotent;
+  - [x] make approval retries request-ID safe and idempotent;
   - [ ] filter sensitive interaction payloads from unauthorized observers in live
     delivery and replay;
   - [ ] bound busy queues, payload bytes, runtime-proxy pre-handshake connections,
