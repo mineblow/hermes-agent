@@ -493,8 +493,29 @@ local fallback and the no-local-retry rule after an unknown submission outcome.
   Nix, and Desktop E2E gates when suitable runners or safe capacity are available.
 - [ ] Complete Task 16 manual acceptance across Desktop PC A, Desktop/TUI PC B,
   Discord, and dashboard/web when the user is available.
-- [ ] Finish Task 17 specification, code-quality, security, and full PR-scope review;
-  resolve every critical and important finding before readiness.
+- [ ] Finish Task 17 specification, code-quality, security, and full PR-scope review:
+  - [ ] fail closed for unclassified live-session RPCs and prevent observer or
+    unattached-client escalation through `session.active_list`/`session.activate`;
+  - [ ] preserve monotonic owner generations across clean owner replacement;
+  - [ ] fence stale replay watermarks when a runtime ID changes in the same epoch;
+  - [ ] consume stable message IDs exactly once for redirect/steer outcomes and
+    scope idempotency by authenticated principal, client, and message ID;
+  - [ ] fix classic interrupt replacement completion accounting and bound pending IDs;
+  - [ ] remove network-delivery waits from session ingress/interaction-resolution locks;
+  - [ ] make approval retries request-ID safe and idempotent;
+  - [ ] filter sensitive interaction payloads from unauthorized observers in live
+    delivery and replay;
+  - [ ] bound busy queues, payload bytes, runtime-proxy pre-handshake connections,
+    and stale bridge lock entries;
+  - [ ] repair Desktop truncation hydration and runtime-takeover rebound notification;
+  - [ ] handle TUI truncated replay and peer attachment-only messages;
+  - [ ] either add dashboard event-feed replay or narrow dashboard recovery claims;
+  - [ ] align callback/watermark semantics and documentation with actual behavior;
+  - [ ] correct busy-policy and recovery documentation claims;
+  - [ ] repeat focused regression, specification, security, and scope review after fixes.
+- [ ] Before any possible upstream proposal, re-port onto current upstream `main`,
+  reconcile competing PRs, remove/split the unrelated Desktop Vite packaging fix,
+  drop internal planning artifacts, and decompose the feature into reviewable PRs.
 - [ ] Keep fork PR #1 draft and unmerged until the user explicitly approves
   changing its readiness or merge state.
 - [ ] Take no upstream PR, push, or other submission action without a separate
