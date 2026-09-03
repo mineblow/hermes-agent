@@ -3738,6 +3738,7 @@ def _(rid, params: dict) -> dict:
     session, err = _sess_nowait(params, rid)
     if err:
         return err
+    queue_transport = current_transport() or _stdio_transport
     with session["history_lock"]:
         if _client_message_id_is_accepted(
             session, client_message_id, client_identity
@@ -3750,28 +3751,29 @@ def _(rid, params: dict) -> dict:
                     "client_message_id": client_message_id,
                 },
             )
-    agent = session.get("agent")
-    # Turn-build window: a fresh turn flips running=True and kicks off an async
-    # agent build, so session["agent"] is briefly None. That is not an
-    # unsupported runtime — queue the correction server-side so it reaches the
-    # model as the next turn, instead of a misleading 4010 the client silently
-    # swallows into a lost follow-up.
-    if agent is None and session.get("running"):
-        queue_transport = current_transport() or _stdio_transport
-        _enqueue_prompt(
-            session,
-            text,
-            queue_transport,
-            origin_client_id=_legacy_client_id_for_transport(queue_transport),
-            request_id=str(rid),
-            client_message_id=client_message_id,
-            client_identity=client_identity,
-        )
-        _remember_accepted_client_message_id(
-            session, client_message_id, client_identity
-        )
-        session["last_active"] = time.time()
-        return _ok(rid, {"status": "queued", "text": text})
+        agent = session.get("agent")
+        # Turn-build window: a fresh turn flips running=True and kicks off an async
+        # agent build, so session["agent"] is briefly None. That is not an
+        # unsupported runtime — queue the correction server-side so it reaches the
+        # model as the next turn, instead of a misleading 4010 the client silently
+        # swallows into a lost follow-up.
+        if agent is None and session.get("running"):
+            admitted = _enqueue_prompt(
+                session,
+                text,
+                queue_transport,
+                origin_client_id=_legacy_client_id_for_transport(queue_transport),
+                request_id=str(rid),
+                client_message_id=client_message_id,
+                client_identity=client_identity,
+            )
+            if not admitted:
+                return _err(rid, -32002, "busy queue capacity exceeded")
+            _remember_accepted_client_message_id(
+                session, client_message_id, client_identity
+            )
+            session["last_active"] = time.time()
+            return _ok(rid, {"status": "queued", "text": text})
     if (
         agent is None
         or getattr(agent, "_supports_active_turn_redirect", False) is not True

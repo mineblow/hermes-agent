@@ -99,6 +99,40 @@ def test_control_rpc_idempotency_is_scoped_to_stable_client(
     assert calls == ["correction", "correction"]
 
 
+def test_redirect_build_window_capacity_rejection_does_not_poison_retry(monkeypatch):
+    monkeypatch.setattr(server, "_BUSY_QUEUE_MAX_ENTRIES", 1)
+    monkeypatch.setattr(server, "_BUSY_QUEUE_MAX_PAYLOAD_BYTES", 1_000_000)
+    session = _live_session(None)
+    session["queued_prompt"] = {
+        "text": "already queued",
+        "transport": "ws-1",
+        "image_paths": ["old.png"],
+    }
+    transport = _Transport("client-a")
+    hub = server._ensure_session_event_hub("sid", session)
+    hub.attach(transport, client_id=transport.client_id, mode=AttachmentMode.CONTROL)
+    server._sessions["sid"] = session
+    params = {
+        "session_id": "sid",
+        "text": "correction",
+        "client_message_id": "retryable-id",
+    }
+    try:
+        rejected = _dispatch("session.redirect", params, transport)
+        session.pop("queued_prompt")
+        accepted = _dispatch("session.redirect", params, transport)
+    finally:
+        server._sessions.pop("sid", None)
+        hub.close()
+
+    assert rejected["error"] == {
+        "code": -32002,
+        "message": "busy queue capacity exceeded",
+    }
+    assert accepted["result"]["status"] == "queued"
+    assert session["queued_prompt"]["text"] == "correction"
+
+
 def test_authenticated_principal_is_stable_across_reconnected_client_ids():
     first = _Transport("window-before-reload", {"user_id": "account-1"})
     reconnected = _Transport("window-after-reload", {"user_id": "account-1"})
