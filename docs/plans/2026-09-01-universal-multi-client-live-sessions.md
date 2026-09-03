@@ -508,6 +508,11 @@ local fallback and the no-local-retry rule after an unknown submission outcome.
     delivery and replay;
   - [ ] bound busy queues, payload bytes, runtime-proxy pre-handshake connections,
     and stale bridge lock entries;
+  - [ ] single-flight remote proxy-client creation so the cached client is the
+    attachment retained by the canonical owner;
+  - [ ] serialize runtime-proxy request/close and transport enqueue/close so no
+    request sees a raw closed-socket race and no frame is acknowledged behind a
+    close sentinel;
   - [ ] repair Desktop truncation hydration and runtime-takeover rebound notification;
   - [ ] handle TUI truncated replay and peer attachment-only messages;
   - [ ] either add dashboard event-feed replay or narrow dashboard recovery claims;
