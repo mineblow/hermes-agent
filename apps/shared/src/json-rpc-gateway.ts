@@ -39,10 +39,7 @@ export interface GatewayEvent<P = unknown> {
 
 export type ConnectionState = 'idle' | 'connecting' | 'open' | 'closed' | 'error'
 export type DurableResyncReason =
-  | 'replay_epoch_changed'
-  | 'replay_truncated'
-  | 'runtime_host_changed'
-  | 'runtime_owner_lost'
+  'replay_epoch_changed' | 'replay_truncated' | 'runtime_host_changed' | 'runtime_owner_lost'
 export interface DurableResyncRequest {
   durable_session_id?: string
   reason: DurableResyncReason
@@ -65,11 +62,7 @@ export type AttachmentCapability =
   | 'ui.respond'
 export type ClientCapability = 'session.observe' | 'session.control' | 'session.replay'
 export type MultiClientMethod =
-  | 'client.attach'
-  | 'session.attach'
-  | 'session.detach'
-  | 'session.attachments'
-  | 'session.events.since'
+  'client.attach' | 'session.attach' | 'session.detach' | 'session.attachments' | 'session.events.since'
 
 export interface GatewayReadyPayload {
   capabilities?: MultiClientMethod[]
@@ -332,10 +325,11 @@ export class JsonRpcGatewayClient {
       GatewayClientOptions,
       'clientAttachment' | 'onDurableResyncRequired' | 'onRuntimeSessionRebound' | 'socketFactory'
     >
-  > & Pick<
-    GatewayClientOptions,
-    'clientAttachment' | 'onDurableResyncRequired' | 'onRuntimeSessionRebound' | 'socketFactory'
-  >
+  > &
+    Pick<
+      GatewayClientOptions,
+      'clientAttachment' | 'onDurableResyncRequired' | 'onRuntimeSessionRebound' | 'socketFactory'
+    >
   private negotiatingConnect: {
     reject: (error: Error) => void
     resolve: () => void
@@ -714,11 +708,7 @@ export class JsonRpcGatewayClient {
     })
   }
 
-  private trackSuccessfulSessionRequest(
-    method: string,
-    params: Record<string, unknown>,
-    value: unknown
-  ): void {
+  private trackSuccessfulSessionRequest(method: string, params: Record<string, unknown>, value: unknown): void {
     if (method !== 'session.create' && method !== 'session.resume') {
       return
     }
@@ -732,16 +722,15 @@ export class JsonRpcGatewayClient {
 
     const requested = typeof params.session_id === 'string' ? params.session_id : ''
 
-    const storedSessionId = typeof result?.stored_session_id === 'string'
-      ? result.stored_session_id
-      : ''
+    const storedSessionId = typeof result?.stored_session_id === 'string' ? result.stored_session_id : ''
 
     const resultKey = typeof result?.session_key === 'string' ? result.session_key : ''
     const resumed = typeof result?.resumed === 'string' ? result.resumed : ''
 
-    const durableSessionId = method === 'session.resume'
-      ? (requested || resumed || resultKey || liveSessionId)
-      : (storedSessionId || resultKey || liveSessionId)
+    const durableSessionId =
+      method === 'session.resume'
+        ? requested || resumed || resultKey || liveSessionId
+        : storedSessionId || resultKey || liveSessionId
 
     let mode: AttachmentMode = 'control'
 
@@ -761,7 +750,19 @@ export class JsonRpcGatewayClient {
 
     for (const [staleSessionId, session] of tracked) {
       try {
-        await this.request('session.resume', { session_id: session.durableSessionId })
+        const result = await this.request<{ session_id?: string }>('session.resume', {
+          session_id: session.durableSessionId
+        })
+
+        const recoveredSessionId = result?.session_id
+
+        if (session.durableSessionId && recoveredSessionId) {
+          this.options.onRuntimeSessionRebound?.({
+            durable_session_id: session.durableSessionId,
+            new_session_id: recoveredSessionId,
+            old_session_id: staleSessionId
+          })
+        }
       } catch (error: unknown) {
         // Never attach a stale process-local id to a replacement runtime.
         this.trackedSessions.delete(staleSessionId)
@@ -771,9 +772,10 @@ export class JsonRpcGatewayClient {
           session_id: staleSessionId,
           payload: {
             code: 'runtime_recovery_failed',
-            message: error instanceof Error
-              ? `Session recovery failed: ${error.message}`
-              : 'Session recovery failed after runtime host takeover.'
+            message:
+              error instanceof Error
+                ? `Session recovery failed: ${error.message}`
+                : 'Session recovery failed after runtime host takeover.'
           }
         })
       }
@@ -787,7 +789,9 @@ export class JsonRpcGatewayClient {
 
     if (result.truncated) {
       this.lastSeenSeq.delete(result.session_id)
+      const durableSessionId = this.trackedSessions.get(result.session_id)?.durableSessionId
       this.options.onDurableResyncRequired?.({
+        ...(durableSessionId ? { durable_session_id: durableSessionId } : {}),
         reason: 'replay_truncated',
         session_id: result.session_id
       })
@@ -822,9 +826,7 @@ export class JsonRpcGatewayClient {
         }
 
         if (methods.includes('session.attach') && this.trackedSessions.size > 0) {
-          this.replayHold = new Map(
-            [...this.trackedSessions.keys()].map(sessionId => [sessionId, []])
-          )
+          this.replayHold = new Map([...this.trackedSessions.keys()].map(sessionId => [sessionId, []]))
 
           try {
             for (const [sessionId, tracked] of this.trackedSessions) {
@@ -919,26 +921,29 @@ export class JsonRpcGatewayClient {
           if (tracked?.durableSessionId) {
             void this.request<{ session_id?: string }>('session.resume', {
               session_id: tracked.durableSessionId
-            }).then(result => {
-              if (typeof result?.session_id === 'string' && result.session_id) {
-                this.options.onRuntimeSessionRebound?.({
-                  durable_session_id: tracked.durableSessionId!,
-                  new_session_id: result.session_id,
-                  old_session_id: sessionId
-                })
-              }
-            }).catch((error: unknown) => {
-              this.dispatchEvent({
-                type: 'error',
-                session_id: sessionId,
-                payload: {
-                  code: 'runtime_recovery_failed',
-                  message: error instanceof Error
-                    ? `Session recovery failed: ${error.message}`
-                    : 'Session recovery failed after runtime owner loss.'
+            })
+              .then(result => {
+                if (typeof result?.session_id === 'string' && result.session_id) {
+                  this.options.onRuntimeSessionRebound?.({
+                    durable_session_id: tracked.durableSessionId!,
+                    new_session_id: result.session_id,
+                    old_session_id: sessionId
+                  })
                 }
               })
-            })
+              .catch((error: unknown) => {
+                this.dispatchEvent({
+                  type: 'error',
+                  session_id: sessionId,
+                  payload: {
+                    code: 'runtime_recovery_failed',
+                    message:
+                      error instanceof Error
+                        ? `Session recovery failed: ${error.message}`
+                        : 'Session recovery failed after runtime owner loss.'
+                  }
+                })
+              })
           }
         }
       }
@@ -1009,8 +1014,10 @@ export class JsonRpcGatewayClient {
         return
       }
 
-      this.recordSeq(frame.params)
+      // Presentation owns acknowledgement: only persist the watermark after
+      // every registered callback accepted the frame without throwing.
       this.dispatchEvent(frame.params)
+      this.recordSeq(frame.params)
     }
   }
 
@@ -1071,11 +1078,7 @@ export class JsonRpcGatewayClient {
           this.request<{
             events?: Array<{ type: string; session_id?: string; seq?: number; payload?: unknown }>
             truncated?: boolean
-          }>(
-            'session.events.since',
-            { session_id: sid, last_seen: lastSeen },
-            REPLAY_REQUEST_TIMEOUT_MS
-          )
+          }>('session.events.since', { session_id: sid, last_seen: lastSeen }, REPLAY_REQUEST_TIMEOUT_MS)
         )
       )
 
@@ -1144,7 +1147,12 @@ export class JsonRpcGatewayClient {
         return
       }
 
+      // A replay callback may fail while applying the event to presentation
+      // state. Keep the previous durable watermark so a reconnect can retry it.
+      this.dispatchEvent(event)
       this.lastSeenSeq.set(sid, seq)
+
+      return
     }
 
     this.dispatchEvent(event)

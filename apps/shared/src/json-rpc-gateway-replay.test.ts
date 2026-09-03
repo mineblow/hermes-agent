@@ -346,6 +346,58 @@ describe('JsonRpcGatewayClient event-seq tracking + replay resume', () => {
     client.close()
   })
 
+  it('identifies the durable session when attach replay is truncated', async () => {
+    const resync = vi.fn()
+    const client = makeClient({ onDurableResyncRequired: resync })
+    const connected = client.connect('ws://x')
+    sockets[0].open()
+    await connected
+
+    const resumed = client.request('session.resume', { session_id: 'stored-truncated' })
+    let request = sockets[0].lastRequest()
+    sockets[0].serverFrame({
+      jsonrpc: '2.0',
+      id: request.id,
+      result: {
+        session_id: 'live-truncated',
+        session_key: 'stored-truncated',
+        resumed: 'stored-truncated'
+      }
+    })
+    await resumed
+
+    const attached = client.attachSession({
+      session_id: 'live-truncated',
+      mode: 'observe',
+      last_seen_seq: 42
+    })
+
+    request = sockets[0].lastRequest()
+    sockets[0].serverFrame({
+      jsonrpc: '2.0',
+      id: request.id,
+      result: {
+        capabilities: ['observe'],
+        client_id: 'stable-client',
+        epoch: 'epoch-1',
+        events: [],
+        latest_seq: 90,
+        mode: 'observe',
+        replay_epoch: 'epoch-1',
+        session_id: 'live-truncated',
+        truncated: true
+      }
+    })
+    await attached
+
+    expect(resync).toHaveBeenCalledWith({
+      durable_session_id: 'stored-truncated',
+      reason: 'replay_truncated',
+      session_id: 'live-truncated'
+    })
+    client.close()
+  })
+
   it('requests durable reconstruction when the canonical runtime owner is lost', async () => {
     const resync = vi.fn()
     const client = makeClient({ onDurableResyncRequired: resync })
@@ -526,11 +578,13 @@ describe('JsonRpcGatewayClient event-seq tracking + replay resume', () => {
     })
 
     await vi.waitFor(() => {
-      expect(errors).toHaveBeenCalledWith(expect.objectContaining({
-        type: 'error',
-        session_id: 'live-before-loss',
-        payload: expect.objectContaining({ code: 'runtime_recovery_failed' })
-      }))
+      expect(errors).toHaveBeenCalledWith(
+        expect.objectContaining({
+          type: 'error',
+          session_id: 'live-before-loss',
+          payload: expect.objectContaining({ code: 'runtime_recovery_failed' })
+        })
+      )
     })
     client.close()
   })
@@ -607,12 +661,15 @@ describe('JsonRpcGatewayClient event-seq tracking + replay resume', () => {
   })
 
   it('reconstructs durable sessions before attachment after runtime host takeover', async () => {
+    const rebound = vi.fn()
+
     const client = makeClient({
       clientAttachment: {
         client_id: 'stable-web',
         protocol_version: 1,
         surface: 'web'
-      }
+      },
+      onRuntimeSessionRebound: rebound
     })
 
     const connectFirst = client.connect('ws://x')
@@ -682,6 +739,12 @@ describe('JsonRpcGatewayClient event-seq tracking + replay resume', () => {
     })
 
     await vi.waitFor(() => expect(sockets[1].lastRequest().method).toBe('session.attach'))
+    expect(rebound).toHaveBeenCalledOnce()
+    expect(rebound).toHaveBeenCalledWith({
+      durable_session_id: 'stored-session',
+      new_session_id: 'live-new',
+      old_session_id: 'live-old'
+    })
     request = sockets[1].lastRequest()
     expect(request.params.session_id).toBe('live-new')
     sockets[1].serverFrame({
@@ -751,9 +814,21 @@ describe('JsonRpcGatewayClient event-seq tracking + replay resume', () => {
     sockets[0].open()
     await p
 
-    sockets[0].serverFrame({ jsonrpc: '2.0', method: 'event', params: { type: 'message.delta', session_id: 's1', seq: 4 } })
-    sockets[0].serverFrame({ jsonrpc: '2.0', method: 'event', params: { type: 'message.delta', session_id: 's1', seq: 2 } }) // out of order / late
-    sockets[0].serverFrame({ jsonrpc: '2.0', method: 'event', params: { type: 'tool.start', session_id: 's2', seq: 9 } })
+    sockets[0].serverFrame({
+      jsonrpc: '2.0',
+      method: 'event',
+      params: { type: 'message.delta', session_id: 's1', seq: 4 }
+    })
+    sockets[0].serverFrame({
+      jsonrpc: '2.0',
+      method: 'event',
+      params: { type: 'message.delta', session_id: 's1', seq: 2 }
+    }) // out of order / late
+    sockets[0].serverFrame({
+      jsonrpc: '2.0',
+      method: 'event',
+      params: { type: 'tool.start', session_id: 's2', seq: 9 }
+    })
     sockets[0].serverFrame({ jsonrpc: '2.0', method: 'event', params: { type: 'skin.changed' } }) // no sid/seq
 
     expect(client.getSeqWatermarks()).toEqual({ s1: 4, s2: 9 })
@@ -858,6 +933,47 @@ describe('JsonRpcGatewayClient event-seq tracking + replay resume', () => {
     client.close()
   })
 
+  it('retains the acknowledged watermark when replay presentation fails', async () => {
+    const client = makeClient()
+    const first = client.connect('ws://x')
+    let sock = sockets[sockets.length - 1]
+    sock.open()
+    await first
+    sock.serverFrame({
+      jsonrpc: '2.0',
+      method: 'event',
+      params: { type: 'message.delta', session_id: 's1', seq: 3 }
+    })
+
+    const present = vi.fn(() => {
+      throw new Error('presentation failed')
+    })
+
+    client.on('tool.complete', present)
+    client.invalidate('drop')
+    const second = client.connect('ws://x')
+    sock = sockets[sockets.length - 1]
+    sock.open()
+    await second
+
+    await vi.waitFor(() => expect(sock.lastRequest().method).toBe('session.events.since'))
+    const request = sock.lastRequest()
+    sock.serverFrame({
+      jsonrpc: '2.0',
+      id: request.id,
+      result: {
+        events: [{ type: 'tool.complete', session_id: 's1', seq: 4 }],
+        latest_seq: 4,
+        truncated: false,
+        count: 1
+      }
+    })
+
+    await vi.waitFor(() => expect(present).toHaveBeenCalledOnce())
+    expect(client.getSeqWatermarks().s1).toBe(3)
+    client.close()
+  })
+
   it('requests durable reconstruction when the legacy replay path is truncated', async () => {
     const resync = vi.fn()
     const client = makeClient({ onDurableResyncRequired: resync })
@@ -939,7 +1055,12 @@ describe('JsonRpcGatewayClient event-seq tracking + replay resume', () => {
     sock.serverFrame({
       jsonrpc: '2.0',
       id: req.id,
-      result: { events: [{ type: 'status.update', session_id: 's1', seq: 2 }], latest_seq: 10, truncated: false, count: 1 }
+      result: {
+        events: [{ type: 'status.update', session_id: 's1', seq: 2 }],
+        latest_seq: 10,
+        truncated: false,
+        count: 1
+      }
     })
     await Promise.resolve()
     expect(client.getSeqWatermarks().s1).toBe(10)

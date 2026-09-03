@@ -72,11 +72,12 @@ export function handleLifecycleEvent(ctx: GatewayEventContext): boolean {
   }
 
   if (event.type === 'session.runtime_recovered') {
-    const recovery = payload as (typeof payload & {
+    const recovery = payload as typeof payload & {
       durable_session_id?: string
       new_session_id?: string
       old_session_id?: string
-    })
+    }
+
     const oldRuntimeId = String(recovery?.old_session_id ?? '')
     const newRuntimeId = String(recovery?.new_session_id ?? event.session_id ?? '')
 
@@ -101,11 +102,16 @@ export function handleLifecycleEvent(ctx: GatewayEventContext): boolean {
   }
 
   if (event.type === 'session.durable_resync_required') {
-    const resync = payload as (typeof payload & { durable_session_id?: string; session_id?: string })
+    const resync = payload as typeof payload & { durable_session_id?: string; session_id?: string }
     const runtimeSessionId = String(resync?.session_id ?? event.session_id ?? '') || null
     const durableSessionId = String(resync?.durable_session_id ?? '') || null
 
-    void deps.hydrateFromStoredSession(3, durableSessionId, runtimeSessionId)
+    // Recovery presentation needs both identities. Passing an absent durable id
+    // merely schedules a hydrate that immediately no-ops, hiding an upstream
+    // replay-contract defect instead of leaving it observable and retryable.
+    if (durableSessionId && runtimeSessionId) {
+      void deps.hydrateFromStoredSession(3, durableSessionId, runtimeSessionId)
+    }
 
     return true
   }
