@@ -132,43 +132,48 @@ class ProxyTransport:
         self._outbound: queue.Queue[
             tuple[dict[str, Any], threading.Event | None, list[bool]] | None
         ] = queue.Queue(maxsize=outbound_queue_size)
+        self._state_lock = threading.Lock()
         self._closed = False
         self._writer = threading.Thread(target=self._write_loop, daemon=True)
         self._writer.start()
 
     @property
     def closed(self) -> bool:
-        return self._closed
+        with self._state_lock:
+            return self._closed
 
     def write(self, frame: dict[str, Any]) -> bool:
-        if self._closed:
-            return False
         kind = "event" if frame.get("method") == "event" else "rpc.response"
-        try:
-            self._outbound.put_nowait(({"kind": kind, "frame": frame}, None, []))
-        except queue.Full:
-            self._closed = True
-            return False
+        with self._state_lock:
+            if self._closed:
+                return False
+            try:
+                self._outbound.put_nowait(({"kind": kind, "frame": frame}, None, []))
+            except queue.Full:
+                self._closed = True
+                return False
         return True
 
     def write_and_wait(self, frame: dict[str, Any]) -> bool:
         """Write a frame and wait until the proxy sender has completed it."""
-        if self._closed:
-            return False
         kind = "event" if frame.get("method") == "event" else "rpc.response"
         completed = threading.Event()
         outcome: list[bool] = []
-        try:
-            self._outbound.put_nowait((
-                {"kind": kind, "frame": frame},
-                completed,
-                outcome,
-            ))
-        except queue.Full:
-            self._closed = True
-            return False
+        with self._state_lock:
+            if self._closed:
+                return False
+            try:
+                self._outbound.put_nowait((
+                    {"kind": kind, "frame": frame},
+                    completed,
+                    outcome,
+                ))
+            except queue.Full:
+                self._closed = True
+                return False
         if not completed.wait(timeout=11.0):
-            self._closed = True
+            with self._state_lock:
+                self._closed = True
             return False
         return bool(outcome and outcome[0])
 
@@ -202,13 +207,14 @@ class ProxyTransport:
                 completed.set()
 
     def close(self) -> None:
-        if self._closed:
-            return
-        self._closed = True
-        try:
-            self._outbound.put_nowait(None)
-        except queue.Full:
-            pass
+        with self._state_lock:
+            if self._closed:
+                return
+            self._closed = True
+            try:
+                self._outbound.put_nowait(None)
+            except queue.Full:
+                pass
 
 
 def handshake_frame(
@@ -609,6 +615,8 @@ class RuntimeProxyCoordinator:
         self._stopped = False
         self._local_leases: dict[str, _TrackedRuntimeOwnerLease] = {}
         self._clients: dict[tuple[str, str, int], RuntimeProxyClient] = {}
+        self._client_connecting: set[tuple[str, str, int]] = set()
+        self._client_connect_condition = threading.Condition(self._lock)
         self._routes: dict[tuple[str, str], tuple[str, str, int]] = {}
         self._stable_routes: OrderedDict[tuple[str, str], RuntimeOwner] = OrderedDict()
         self._server = RuntimeProxyServer(
@@ -716,10 +724,15 @@ class RuntimeProxyCoordinator:
     ) -> tuple[tuple[str, str, int], "RuntimeProxyClient"] | None:
         connection_id = str(getattr(transport, "connection_id", id(transport)))
         client_key = (connection_id, owner.owner_id, owner.generation)
-        with self._lock:
+        with self._client_connect_condition:
+            while client_key in self._client_connecting:
+                self._client_connect_condition.wait()
             client = self._clients.get(client_key)
-        if client is not None:
-            return client_key, client
+            if client is not None:
+                return client_key, client
+            if self._stopped:
+                return None
+            self._client_connecting.add(client_key)
 
         client_id = proxy_scoped_client_id(transport)
         raw_capabilities = getattr(transport, "negotiated_capabilities", None)
@@ -734,13 +747,18 @@ class RuntimeProxyCoordinator:
                 client_key, candidate, transport, owner
             ),
         )
-        candidate.connect()
-        with self._lock:
-            client = self._clients.get(client_key)
-            if client is None and not candidate.closed:
-                self._clients[client_key] = candidate
-                client = candidate
-        if client is not candidate:
+        client = None
+        try:
+            candidate.connect()
+            with self._client_connect_condition:
+                if not candidate.closed and not self._stopped:
+                    self._clients[client_key] = candidate
+                    client = candidate
+        finally:
+            with self._client_connect_condition:
+                self._client_connecting.discard(client_key)
+                self._client_connect_condition.notify_all()
+        if client is None:
             candidate.close()
         return (client_key, client) if client is not None else None
 
@@ -951,7 +969,8 @@ class RuntimeProxyClient:
 
     @property
     def closed(self) -> bool:
-        return self._closed
+        with self._write_lock:
+            return self._closed
 
     def connect(self) -> None:
         endpoint = Path(self.owner.endpoint)
@@ -989,47 +1008,88 @@ class RuntimeProxyClient:
         *,
         timeout: float = DEFAULT_REQUEST_TIMEOUT_SECONDS,
     ) -> dict[str, Any]:
-        if self._closed or self._socket is None:
-            raise RuntimeProxyProtocolError("runtime proxy is not connected")
         request_id = frame.get("id")
         if request_id is None:
             raise ValueError("proxied JSON-RPC request requires an id")
+        payload = encode_frame({"kind": "rpc.request", "frame": frame})
         waiter = threading.Event()
         result: list[dict[str, Any]] = []
-        with self._pending_lock:
-            if request_id in self._pending:
-                raise ValueError("duplicate proxied JSON-RPC request id")
-            self._pending[request_id] = (waiter, result)
-        try:
-            with self._write_lock:
-                self._socket.sendall(
-                    encode_frame({"kind": "rpc.request", "frame": frame})
-                )
-            if not waiter.wait(timeout=timeout):
-                self.close()
-                self._notify_disconnect()
+        failed_pending = []
+        failed_socket = None
+        send_failed = False
+
+        with self._write_lock:
+            if self._closed or self._socket is None:
                 return _owner_unavailable_response(self.owner, request_id)
-            return result[0]
-        finally:
             with self._pending_lock:
-                self._pending.pop(request_id, None)
+                if request_id in self._pending:
+                    raise ValueError("duplicate proxied JSON-RPC request id")
+                self._pending[request_id] = (waiter, result)
+            try:
+                self._socket.sendall(payload)
+            except OSError:
+                send_failed = True
+                failed_socket = self._detach_socket_locked()
+                with self._pending_lock:
+                    failed_pending = list(self._pending.items())
+                    self._pending.clear()
+
+        if send_failed:
+            self._close_socket(failed_socket)
+            self._resolve_unavailable(failed_pending)
+            self._notify_disconnect()
+        elif not waiter.wait(timeout=timeout):
+            timed_out = False
+            with self._write_lock:
+                with self._pending_lock:
+                    if request_id in self._pending:
+                        timed_out = True
+                        failed_socket = self._detach_socket_locked()
+                        failed_pending = list(self._pending.items())
+                        self._pending.clear()
+            if timed_out:
+                self._close_socket(failed_socket)
+                self._resolve_unavailable(failed_pending)
+                self._notify_disconnect()
+            else:
+                waiter.wait()
+        return result[0]
+
+    def _detach_socket_locked(self) -> socket.socket | None:
+        self._closed = True
+        connection = self._socket
+        self._socket = None
+        return connection
+
+    @staticmethod
+    def _close_socket(connection: socket.socket | None) -> None:
+        if connection is None:
+            return
+        try:
+            connection.shutdown(socket.SHUT_RDWR)
+        except OSError:
+            pass
+        try:
+            connection.close()
+        except OSError:
+            pass
 
     def close(self) -> None:
-        self._closed = True
-        if self._socket is not None:
-            try:
-                self._socket.shutdown(socket.SHUT_RDWR)
-            except OSError:
-                pass
-            self._socket.close()
-            self._socket = None
-        if self._reader_thread is not None:
-            self._reader_thread.join(timeout=2)
-            self._reader_thread = None
+        with self._write_lock:
+            connection = self._detach_socket_locked()
+            with self._pending_lock:
+                pending = list(self._pending.items())
+                self._pending.clear()
+        self._close_socket(connection)
+        self._resolve_unavailable(pending)
+        reader = self._reader_thread
+        if reader is not None and reader is not threading.current_thread():
+            reader.join(timeout=2)
+        self._reader_thread = None
 
     def _read_loop(self) -> None:
         try:
-            while not self._closed and self._stream is not None:
+            while not self.closed and self._stream is not None:
                 envelope = read_frame(self._stream)
                 frame = envelope.get("frame")
                 if not isinstance(frame, dict):
@@ -1045,14 +1105,19 @@ class RuntimeProxyClient:
                     )
                 request_id = frame.get("id")
                 with self._pending_lock:
-                    pending = self._pending.get(request_id)
-                if pending is not None:
-                    pending[1].append(frame)
-                    pending[0].set()
+                    pending = self._pending.pop(request_id, None)
+                    if pending is not None:
+                        pending[1].append(frame)
+                        pending[0].set()
         except (EOFError, OSError, RuntimeProxyProtocolError):
-            unexpected = not self._closed
-            self._closed = True
-            self._fail_pending()
+            with self._write_lock:
+                unexpected = not self._closed
+                connection = self._detach_socket_locked()
+                with self._pending_lock:
+                    pending = list(self._pending.items())
+                    self._pending.clear()
+            self._close_socket(connection)
+            self._resolve_unavailable(pending)
             if unexpected:
                 self._notify_disconnect()
 
@@ -1067,6 +1132,13 @@ class RuntimeProxyClient:
     def _fail_pending(self) -> None:
         with self._pending_lock:
             pending = list(self._pending.items())
+            self._pending.clear()
+        self._resolve_unavailable(pending)
+
+    def _resolve_unavailable(
+        self,
+        pending: list[tuple[Any, tuple[threading.Event, list[dict[str, Any]]]]],
+    ) -> None:
         for request_id, (waiter, result) in pending:
             result.append(_owner_unavailable_response(self.owner, request_id))
             waiter.set()

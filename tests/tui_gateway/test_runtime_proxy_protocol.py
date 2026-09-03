@@ -627,6 +627,68 @@ def test_proxy_transport_fails_closed_when_slow_sender_fills_bounded_queue():
         transport.close()
 
 
+@pytest.mark.parametrize(
+    ("write_method", "expected_result"),
+    [("write", True), ("write_and_wait", False)],
+)
+def test_proxy_transport_close_serializes_with_inflight_enqueue(
+    monkeypatch, write_method, expected_result
+):
+    sending = threading.Event()
+    release_sender = threading.Event()
+
+    def blocked_send(_frame):
+        sending.set()
+        assert release_sender.wait(timeout=2)
+        return True
+
+    transport = runtime_proxy.ProxyTransport(client_id="racing-client", send=blocked_send)
+    assert transport.write({"jsonrpc": "2.0", "method": "event", "params": {}})
+    assert sending.wait(timeout=1)
+
+    real_put = transport._outbound.put_nowait
+    enqueue_barrier = threading.Barrier(2)
+    release_enqueue = threading.Event()
+    inserted = []
+
+    def controlled_put(item):
+        if item is not None:
+            enqueue_barrier.wait(timeout=2)
+            assert release_enqueue.wait(timeout=2)
+        inserted.append(item)
+        real_put(item)
+
+    monkeypatch.setattr(transport._outbound, "put_nowait", controlled_put)
+    write_result = []
+    writer = threading.Thread(
+        target=lambda: write_result.append(
+            getattr(transport, write_method)(
+                {"jsonrpc": "2.0", "method": "event", "params": {}}
+            )
+        )
+    )
+    writer.start()
+    enqueue_barrier.wait(timeout=2)
+    closer = threading.Thread(target=transport.close)
+    closer.start()
+    deadline = time.monotonic() + 1
+    while not inserted and time.monotonic() < deadline:
+        time.sleep(0.001)
+    release_enqueue.set()
+    deadline = time.monotonic() + 1
+    while len(inserted) < 2 and time.monotonic() < deadline:
+        time.sleep(0.001)
+    release_sender.set()
+    writer.join(timeout=2)
+    closer.join(timeout=2)
+
+    assert not writer.is_alive()
+    assert not closer.is_alive()
+    assert write_result == [expected_result]
+    assert inserted[-1] is None
+    assert inserted[0] is not None
+
+
 def test_proxy_responses_are_point_to_point_and_events_are_not_restamped():
     sent_a = []
     sent_b = []
@@ -822,11 +884,11 @@ def test_unix_proxy_rejects_connections_before_spawning_unbounded_workers(tmp_pa
         server.stop()
 
 
-def test_concurrent_proxy_connect_installs_one_client_and_ignores_loser_disconnect(
-    monkeypatch, tmp_path
-):
+def test_concurrent_proxy_connect_single_flights_one_physical_client(monkeypatch, tmp_path):
     owner = _owner(endpoint=str(tmp_path / "remote.sock"))
-    connect_barrier = threading.Barrier(2)
+    start_barrier = threading.Barrier(3)
+    connect_entered = threading.Event()
+    release_connect = threading.Event()
     candidates = []
 
     class Claim:
@@ -843,7 +905,8 @@ def test_concurrent_proxy_connect_installs_one_client_and_ignores_loser_disconne
             candidates.append(self)
 
         def connect(self):
-            connect_barrier.wait(timeout=2)
+            connect_entered.set()
+            assert release_connect.wait(timeout=2)
 
         def request(self, frame):
             return {
@@ -880,6 +943,7 @@ def test_concurrent_proxy_connect_installs_one_client_and_ignores_loser_disconne
     responses = []
 
     def prepare(request_id):
+        start_barrier.wait(timeout=2)
         responses.append(
             coordinator.prepare_resume(
                 conversation_key=owner.conversation_key,
@@ -897,19 +961,21 @@ def test_concurrent_proxy_connect_installs_one_client_and_ignores_loser_disconne
     second = threading.Thread(target=prepare, args=("r2",))
     first.start()
     second.start()
+    start_barrier.wait(timeout=2)
+    assert connect_entered.wait(timeout=1)
+    time.sleep(0.02)
+    assert len(candidates) == 1
+    release_connect.set()
     first.join(timeout=2)
     second.join(timeout=2)
 
     assert not first.is_alive()
     assert not second.is_alive()
     assert len(responses) == 2
-    assert len(candidates) == 2
-    assert sum(candidate.closed for candidate in candidates) == 1
+    assert len(candidates) == 1
+    assert candidates[0].closed is False
     assert len(coordinator._clients) == 1
-    winner = next(iter(coordinator._clients.values()))
-    loser = next(candidate for candidate in candidates if candidate is not winner)
-    loser._on_disconnect()
-    assert next(iter(coordinator._clients.values())) is winner
+    assert next(iter(coordinator._clients.values())) is candidates[0]
     assert coordinator.has_remote_route(transport, "live-session") is True
     assert transport.writes == []
 
@@ -984,6 +1050,177 @@ def test_proxy_timeout_returns_unknown_non_retryable_and_fences_connection(tmp_p
         release.set()
         client.close()
         server.stop()
+
+
+def test_proxy_client_close_resolves_every_pending_request_once():
+    owner = _owner()
+    client = runtime_proxy.RuntimeProxyClient(
+        owner=owner,
+        client_id="closing-client",
+        on_event=lambda _frame: None,
+    )
+    start_barrier = threading.Barrier(3)
+    all_sent = threading.Event()
+    send_count = 0
+    send_lock = threading.Lock()
+
+    class FakeSocket:
+        def sendall(self, _payload):
+            nonlocal send_count
+            with send_lock:
+                send_count += 1
+                if send_count == 2:
+                    all_sent.set()
+
+        def shutdown(self, _how):
+            return None
+
+        def close(self):
+            return None
+
+    client._socket = FakeSocket()
+    responses = []
+    failures = []
+
+    def request(request_id):
+        start_barrier.wait(timeout=2)
+        try:
+            responses.append(
+                client.request(
+                    {"jsonrpc": "2.0", "id": request_id, "method": "session.attach"},
+                    timeout=2,
+                )
+            )
+        except BaseException as exc:
+            failures.append(exc)
+
+    requesters = [
+        threading.Thread(target=request, args=(request_id,)) for request_id in (1, 2)
+    ]
+    for requester in requesters:
+        requester.start()
+    start_barrier.wait(timeout=2)
+    assert all_sent.wait(timeout=1)
+    client.close()
+    for requester in requesters:
+        requester.join(timeout=1)
+
+    assert all(not requester.is_alive() for requester in requesters)
+    assert failures == []
+    assert sorted(response["id"] for response in responses) == [1, 2]
+    assert all(response["error"]["code"] == -32072 for response in responses)
+    assert client._pending == {}
+
+
+def test_proxy_client_request_and_close_share_one_write_fence():
+    owner = _owner()
+    client = runtime_proxy.RuntimeProxyClient(
+        owner=owner,
+        client_id="request-close-client",
+        on_event=lambda _frame: None,
+    )
+    sent = []
+
+    class FakeSocket:
+        def sendall(self, payload):
+            sent.append(payload)
+
+        def shutdown(self, _how):
+            return None
+
+        def close(self):
+            return None
+
+    client._socket = FakeSocket()
+    start_close = threading.Barrier(2)
+    client._write_lock.acquire()
+    closer = threading.Thread(target=lambda: (start_close.wait(timeout=2), client.close()))
+    closer.start()
+    start_close.wait(timeout=2)
+    time.sleep(0.02)
+    responses = []
+    failures = []
+
+    def request():
+        try:
+            responses.append(
+                client.request(
+                    {"jsonrpc": "2.0", "id": "race", "method": "session.attach"},
+                    timeout=1,
+                )
+            )
+        except BaseException as exc:
+            failures.append(exc)
+
+    requester = threading.Thread(target=request)
+    requester.start()
+    client._write_lock.release()
+    requester.join(timeout=2)
+    closer.join(timeout=2)
+
+    assert not requester.is_alive()
+    assert not closer.is_alive()
+    assert failures == []
+    assert responses[0]["error"]["code"] == -32072
+    assert client._pending == {}
+
+
+def test_proxy_client_timeout_fences_later_requests_without_raw_exceptions():
+    owner = _owner()
+    client = runtime_proxy.RuntimeProxyClient(
+        owner=owner,
+        client_id="timeout-race-client",
+        on_event=lambda _frame: None,
+    )
+    first_sent = threading.Event()
+
+    class FakeSocket:
+        def sendall(self, _payload):
+            first_sent.set()
+
+        def shutdown(self, _how):
+            return None
+
+        def close(self):
+            return None
+
+    client._socket = FakeSocket()
+    responses = []
+    failures = []
+
+    def request(request_id, timeout):
+        try:
+            responses.append(
+                client.request(
+                    {"jsonrpc": "2.0", "id": request_id, "method": "session.attach"},
+                    timeout=timeout,
+                )
+            )
+        except BaseException as exc:
+            failures.append(exc)
+
+    first = threading.Thread(target=request, args=("timed-out", 0.05))
+    first.start()
+    assert first_sent.wait(timeout=1)
+    client._write_lock.acquire()
+    time.sleep(0.08)
+    start_second = threading.Barrier(2)
+    second = threading.Thread(
+        target=lambda: (start_second.wait(timeout=2), request("later", 1))
+    )
+    second.start()
+    start_second.wait(timeout=2)
+    time.sleep(0.02)
+    client._write_lock.release()
+    first.join(timeout=2)
+    second.join(timeout=2)
+
+    assert not first.is_alive()
+    assert not second.is_alive()
+    assert failures == []
+    assert sorted(response["id"] for response in responses) == ["later", "timed-out"]
+    assert all(response["error"]["code"] == -32072 for response in responses)
+    assert client._pending == {}
 
 
 def test_stale_owner_generation_cannot_publish_async_event(tmp_path):
