@@ -404,6 +404,16 @@ TUI/classic/Discord, full TUI, typecheck, lint, and build gates pass.
 
 **Decision rule:** Persistent conversational frontends attach; request/response automation submits as a producer; tool-serving protocols remain outside the conversation-renderer contract.
 
+**Result:** `website/docs/reference/live-session-surface-classification.md` is the
+normative support matrix. ACP is a persistent frontend but currently owns separate
+`AIAgent` sessions and is explicitly not a canonical gateway attachment. Configured
+MCP servers and `hermes mcp serve` remain tool/control protocols outside the renderer
+contract. A2A inbound, cron, and webhooks are producer/request-response surfaces even
+when they reuse, mirror, or seed durable gateway conversation context; A2A outbound
+remains a tool integration. Each affected user guide links to the matrix, and the
+matrix assigns canonical persistence authority so history access cannot be mistaken
+for runtime ownership.
+
 ---
 
 ## Phase 7: Documentation, acceptance, and publication
@@ -415,6 +425,15 @@ TUI/classic/Discord, full TUI, typecheck, lint, and build gates pass.
 - Modify: relevant CLI, gateway, messaging, and session documentation indexes.
 
 **Document:** supported surfaces, attachment modes, identity/idempotency, authorization, replay/recovery, runtime topology, fallback behavior, platform delivery differences, and exact manual test steps.
+
+**Result:** `website/docs/user-guide/features/multi-client-live-sessions.md`
+documents the single-owner topology, supported and excluded surfaces, create/resume/
+reconnect semantics, stable input identity, scheduler ordering, interaction races,
+authorization and capability intersection, replay/truncation recovery, guarded fallback,
+platform rendering differences, and an exact TUI/classic/messaging/dashboard acceptance
+procedure. Session, CLI, TUI, Desktop, dashboard, messaging, and gateway-internals
+pages link to the guide. Gateway internals now documents the canonical bridge before
+local fallback and the no-local-retry rule after an unknown submission outcome.
 
 ### Task 15: Run final automated gates
 

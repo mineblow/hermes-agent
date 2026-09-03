@@ -315,6 +315,12 @@ disable MCP.
 
 ACP sessions are tracked by the ACP adapter's in-memory session manager while the server is running.
 
+:::note Live-session boundary
+ACP is a persistent frontend, but its current session manager owns a separate
+`AIAgent` runtime; it does not attach to an already-running canonical gateway
+session. See the [live-session surface classification](/reference/live-session-surface-classification).
+:::
+
 Each session stores:
 
 - session ID

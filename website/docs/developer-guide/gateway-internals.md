@@ -40,12 +40,13 @@ The messaging gateway is the long-running process that connects Hermes to 20+ ex
 │                     ▼                           │
 │              _handle_message()                  │
 │                     │                           │
-│         ┌───────────┼───────────┐               │
-│         ▼           ▼           ▼               │
-│  Slash command   AIAgent    Queue/BG            │
-│    dispatch      creation   sessions            │
+│         ┌───────────┼──────────────┐            │
+│         ▼           ▼              ▼            │
+│  Slash command  LiveRuntime    Local fallback   │
+│    dispatch       Bridge       (pre-submit only)│
 │                     │                           │
-│                     ▼                           │
+│          Canonical owner/runtime proxy          │
+│                     │                           │
 │                 SessionStore                    │
 │              (SQLite persistence)               │
 └───────┴─────────────┴─────────────┴─────────────┘
@@ -56,16 +57,22 @@ The messaging gateway is the long-running process that connects Hermes to 20+ ex
 When a message arrives from any platform:
 
 1. **Platform adapter** receives raw event, normalizes it into a `MessageEvent`
-2. **Base adapter** checks active session guard:
-   - If agent is running for this session → queue message, set interrupt event
-   - If `/approve`, `/deny`, `/stop` → bypass guard (dispatched inline)
+2. **Base adapter** applies its active-session and control-command guards.
 3. **GatewayRunner._handle_message()** receives the event:
    - Resolve session key via `_session_key_for_source()` (format: `agent:main:{platform}:{chat_type}:{chat_id}`)
    - Check authorization (see Authorization below)
    - Check if it's a slash command → dispatch to command handler
-   - Check if agent is already running → intercept commands like `/stop`, `/status`
-   - Otherwise → create `AIAgent` instance and run conversation
-4. **Response** is sent back through the platform adapter
+   - Resolve the durable transcript/root and any authenticated canonical owner
+   - Attach/reuse the profile- and principal-scoped `LiveRuntimeBridge`
+4. **Shared-runtime path** normalizes a stable native `client_message_id`,
+   attachments, author metadata, timestamp, and busy policy, then submits once
+   through the runtime proxy. Canonical events return through the common stream
+   consumer and platform renderer.
+5. **Local fallback** may create a process-local `AIAgent` only when owner IPC is
+   absent or unsupported *before* canonical submission. An unknown post-submit
+   outcome is never retried locally.
+6. **Response** is rendered through the platform adapter. The canonical owner,
+   not the presentation adapter, persists canonical runtime output.
 
 ### Session Key Format
 
@@ -200,7 +207,10 @@ Outgoing deliveries (`gateway/delivery.py`) handle:
 - **Explicit target delivery** — the send engine specifying `telegram:-1001234567890`, exposed via the [`hermes send` CLI](/guides/pipe-script-output) for shell scripts and via cron `deliver:` targets
 - **Cross-platform delivery** — deliver to a different platform than the originating message
 
-Cron job deliveries are NOT mirrored into gateway session history — they live in their own cron session only. This is a deliberate design choice to avoid message alternation violations.
+Cron jobs run in their own execution sessions. An explicitly enabled origin
+delivery mirror or continuable-thread seed may add a labelled user-role brief to
+the destination transcript so a later human reply has context; the scheduler
+still does not become an attached live-session client.
 
 ## Hooks
 
@@ -266,6 +276,8 @@ The gateway runs as a long-lived process, managed via:
 
 ## Related Docs
 
+- [Multi-Client Live Sessions](/user-guide/features/multi-client-live-sessions)
+- [Live Session Surface Classification](/reference/live-session-surface-classification)
 - [Session Storage](./session-storage.md)
 - [Cron Internals](./cron-internals.md)
 - [ACP Internals](./acp-internals.md)
