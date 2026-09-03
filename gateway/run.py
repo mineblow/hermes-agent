@@ -25,6 +25,7 @@ except ModuleNotFoundError:
     pass
 
 import asyncio
+import hashlib
 import concurrent.futures
 import dataclasses
 import faulthandler
@@ -6947,6 +6948,541 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             return None
         return sessions.get(session_key)
 
+    def _live_runtime_attachment_bridge(self):
+        """Lazily expose platform-neutral attachment state.
+
+        Creating this registry never constructs an ``AIAgent``. Task 8 binds
+        its async clients to canonical owners when routing approved input.
+        """
+        bridge = self.__dict__.get("_live_runtime_bridge_instance")
+        if bridge is None:
+            from gateway.live_runtime_bridge import LiveRuntimeBridge
+
+            bridge = LiveRuntimeBridge(self._session_state)
+            self.__dict__["_live_runtime_bridge_instance"] = bridge
+        return bridge
+
+    async def _close_live_runtime_attachments(self) -> None:
+        """Close an existing bridge without creating one during shutdown."""
+        bridge = self.__dict__.get("_live_runtime_bridge_instance")
+        if bridge is not None:
+            await bridge.close_all()
+
+    async def _lookup_live_runtime_owner(self, conversation_key: str):
+        from hermes_cli.live_runtime_owners import lookup_runtime_owner
+
+        registry_home = getattr(
+            self, "_live_runtime_registry_home", str(Path(_hermes_home).resolve())
+        )
+        return await asyncio.to_thread(
+            lookup_runtime_owner,
+            conversation_key=conversation_key,
+            registry_home=registry_home,
+        )
+
+    def _make_live_runtime_renderer(self, source, *, on_interaction=None):
+        """Build one presentation-only canonical runtime renderer."""
+        from gateway.config import StreamingConfig
+        from gateway.display_config import resolve_display_setting
+        from gateway.stream_consumer import (
+            GatewayStreamConsumer,
+            LiveRuntimeStreamRenderer,
+        )
+
+        adapter = self._adapter_for_source(source)
+        if adapter is None:
+            raise RuntimeError("no platform adapter for canonical runtime output")
+        scfg = getattr(getattr(self, "config", None), "streaming", None)
+        if scfg is None:
+            scfg = StreamingConfig()
+        platform_key = _platform_config_key(source.platform)
+        platform_streaming = resolve_display_setting(
+            _load_gateway_config(), platform_key, "streaming"
+        )
+        streaming_enabled = (
+            scfg.enabled and scfg.transport != "off"
+            if platform_streaming is None
+            else bool(platform_streaming)
+        )
+        consumer_cfg, pause_typing = self._build_stream_consumer_config(
+            source,
+            scfg,
+            adapter,
+            on_missing_cursor="fallback",
+        )
+        if not streaming_enabled:
+            consumer_cfg.buffer_only = True
+            consumer_cfg.cursor = ""
+            consumer_cfg.transport = "edit"
+        metadata = self._thread_metadata_for_source(source)
+
+        def consumer_factory():
+            return GatewayStreamConsumer(
+                adapter=adapter,
+                chat_id=source.chat_id,
+                config=consumer_cfg,
+                metadata=metadata,
+                on_before_finalize=pause_typing,
+                run_still_current=lambda: True,
+            )
+
+        async def present_peer_user(event):
+            author = str(event.display_metadata.get("user_name") or "User").strip()
+            content = f"{author}: {event.text}" if author else event.text
+            await adapter.send(source.chat_id, content, metadata=metadata)
+
+        return LiveRuntimeStreamRenderer(
+            adapter,
+            consumer_factory,
+            on_peer_user=present_peer_user,
+            on_interaction=on_interaction,
+        )
+
+    def _make_live_runtime_client(self, request):
+        from gateway.live_runtime_client import AsyncLiveRuntimeClient
+        from gateway.runtime_proxy_connection import RuntimeProxyAsyncConnection
+
+        registry_home = getattr(
+            self, "_live_runtime_registry_home", str(Path(_hermes_home).resolve())
+        )
+
+        async def owner_lookup(conversation_key):
+            from hermes_cli.live_runtime_owners import lookup_runtime_owner
+
+            return await asyncio.to_thread(
+                lookup_runtime_owner,
+                conversation_key=conversation_key,
+                registry_home=registry_home,
+            )
+
+        interaction_tasks: dict[str, asyncio.Task] = {}
+        clarification_lock = asyncio.Lock()
+        client_holder = {}
+        interaction_session_key = self._session_key_for_source(request.source)
+        adapter = self._adapter_for_source(request.source)
+        metadata = self._thread_metadata_for_source(request.source)
+
+        async def wait_until_set(event, expires_at=None, timeout_seconds=None):
+            if (
+                isinstance(timeout_seconds, bool)
+                or not isinstance(timeout_seconds, (int, float))
+                or timeout_seconds < 0
+            ):
+                timeout_seconds = 300.0
+            if isinstance(expires_at, bool) or not isinstance(expires_at, (int, float)):
+                remaining = timeout_seconds
+            else:
+                remaining = min(
+                    timeout_seconds,
+                    max(0.0, expires_at - time.time()),
+                )
+            monotonic_deadline = asyncio.get_running_loop().time() + remaining
+            while not event.is_set():
+                remaining = monotonic_deadline - asyncio.get_running_loop().time()
+                if remaining <= 0:
+                    return False
+                await asyncio.sleep(min(0.25, remaining))
+            return True
+
+        async def run_interaction(event):
+            client = client_holder["client"]
+            if "interaction.respond" not in client.accepted_capabilities:
+                return
+            if event.interaction_type == "approval":
+                from tools import approval as approval_mod
+
+                data = dict(event.payload)
+                data["request_id"] = event.request_id
+                sender = getattr(type(adapter), "send_exec_approval", None)
+                approval_session_key = interaction_session_key
+                if sender is not None:
+                    correlation = hashlib.sha256(
+                        event.request_id.encode("utf-8")
+                    ).hexdigest()[:24]
+                    approval_session_key = (
+                        f"{interaction_session_key}:interaction:{correlation}"
+                    )
+                entry = approval_mod.register_external_gateway_approval(
+                    approval_session_key, data
+                )
+                try:
+                    if sender is not None:
+                        sent = await adapter.send_exec_approval(
+                            chat_id=request.source.chat_id,
+                            command=str(data.get("command") or ""),
+                            session_key=approval_session_key,
+                            description=str(
+                                data.get("description") or "dangerous command"
+                            ),
+                            metadata=metadata,
+                            allow_permanent=data.get("allow_permanent") is not False,
+                            allow_session=data.get("allow_session") is not False,
+                            smart_denied=bool(data.get("smart_denied")),
+                        )
+                    else:
+                        await adapter.send(
+                            request.source.chat_id,
+                            "Approval requires a controller-capable client; "
+                            "this adapter cannot safely correlate the response.",
+                            metadata=metadata,
+                        )
+                        return
+                    if not getattr(sent, "success", False):
+                        return
+                    if not await wait_until_set(
+                        entry.event,
+                        data.get("expires_at"),
+                        data.get("timeout_seconds"),
+                    ):
+                        return
+                    choice = entry.result
+                    if choice == "approve":
+                        choice = "once"
+                    if choice not in {"once", "session", "always", "deny"}:
+                        return
+                    response = {
+                        "interaction_type": "approval",
+                        "request_id": event.request_id,
+                        "choice": choice,
+                    }
+                    if entry.reason:
+                        response["reason"] = entry.reason
+                    owner_result = await asyncio.wait_for(
+                        client.respond_to_interaction(response), timeout=30.0
+                    )
+                    if isinstance(owner_result, dict):
+                        if owner_result.get("resolved"):
+                            confirmation = (
+                                "✅ Approved by the active runtime."
+                                if choice != "deny"
+                                else "❌ Denied by the active runtime."
+                            )
+                        elif owner_result.get("status") in {
+                            "expired",
+                            "already_resolved",
+                        }:
+                            confirmation = (
+                                "⌛ Approval expired or was resolved elsewhere; "
+                                "the command was not approved by this response."
+                            )
+                        else:
+                            confirmation = None
+                        if confirmation:
+                            await adapter.send(
+                                request.source.chat_id,
+                                confirmation,
+                                metadata=metadata,
+                            )
+                finally:
+                    approval_mod.cancel_external_gateway_approval(
+                        approval_session_key, entry
+                    )
+                return
+
+            if event.interaction_type == "clarification":
+                from tools import clarify_gateway as clarify_mod
+
+                async with clarification_lock:
+                    data = dict(event.payload)
+                    choices = data.get("choices")
+                    if not isinstance(choices, list):
+                        choices = None
+                    entry = clarify_mod.register(
+                        event.request_id,
+                        interaction_session_key,
+                        str(data.get("question") or "Clarification required"),
+                        choices,
+                        bool(data.get("multi_select")),
+                    )
+                    forwarded = False
+                    try:
+                        sender = getattr(type(adapter), "send_clarify", None)
+                        if sender is not None:
+                            sent = await adapter.send_clarify(
+                                chat_id=request.source.chat_id,
+                                question=entry.question,
+                                choices=entry.choices,
+                                clarify_id=event.request_id,
+                                session_key=interaction_session_key,
+                                metadata=metadata,
+                            )
+                        else:
+                            sent = None
+                        if not getattr(sent, "success", False):
+                            sent = await adapter.send(
+                                request.source.chat_id,
+                                entry.question,
+                                metadata=metadata,
+                            )
+                        if not getattr(sent, "success", False):
+                            return
+                        if not await wait_until_set(
+                            entry.event,
+                            data.get("expires_at"),
+                            data.get("timeout_seconds"),
+                        ):
+                            return
+                        answer = clarify_mod.wait_for_response(event.request_id, 0.001)
+                        if answer is None:
+                            return
+                        forwarded = True
+                        await asyncio.wait_for(
+                            client.respond_to_interaction(
+                                {
+                                    "interaction_type": "clarification",
+                                    "request_id": event.request_id,
+                                    "answer": answer,
+                                }
+                            ),
+                            timeout=30.0,
+                        )
+                    finally:
+                        if not forwarded:
+                            clarify_mod.resolve_gateway_clarify(event.request_id, "")
+                            clarify_mod.wait_for_response(event.request_id, 0.001)
+
+        def interaction_done(task, request_id):
+            interaction_tasks.pop(request_id, None)
+            if task.cancelled():
+                return
+            error = task.exception()
+            if error is not None:
+                logger.error(
+                    "live runtime interaction %s failed: %s",
+                    request_id,
+                    error,
+                )
+
+        def present_interaction(event):
+            if event.request_id in interaction_tasks:
+                return
+            if len(interaction_tasks) >= 64:
+                logger.error("live runtime interaction broker is full")
+                return
+            task = asyncio.create_task(run_interaction(event))
+            interaction_tasks[event.request_id] = task
+            task.add_done_callback(
+                lambda done, request_id=event.request_id: interaction_done(
+                    done, request_id
+                )
+            )
+
+        def restore_interaction(interaction):
+            present_interaction(
+                InteractionRequest(
+                    request_id=interaction["request_id"],
+                    interaction_type=interaction["interaction_type"],
+                    payload=dict(interaction["payload"]),
+                )
+            )
+
+        renderer = self._make_live_runtime_renderer(
+            request.source, on_interaction=present_interaction
+        )
+
+        async def close_presentation():
+            tasks = list(interaction_tasks.values())
+            for task in tasks:
+                task.cancel()
+            if tasks:
+                await asyncio.gather(*tasks, return_exceptions=True)
+            await renderer.close()
+
+        client = AsyncLiveRuntimeClient(
+            conversation_key=request.conversation_key,
+            durable_root=request.durable_root,
+            client_id=request.stable_client_id,
+            principal={
+                "provider": request.surface,
+                "subject": request.principal_id,
+                "authenticated": True,
+            },
+            surface=request.surface,
+            requested_capabilities=request.requested_capabilities,
+            owner_lookup=owner_lookup,
+            on_event=renderer.on_event,
+            on_resync_required=renderer.reset,
+            on_pending_interaction=restore_interaction,
+            on_local_message_id=renderer.register_local_message_id,
+            on_close=close_presentation,
+            connector=lambda owner: RuntimeProxyAsyncConnection(
+                owner=owner,
+                durable_session_id=request.durable_session_id,
+                profile=(
+                    request.routing_key.profile
+                    if request.routing_key.profile != "default"
+                    else None
+                ),
+                client_id=request.stable_client_id,
+                requested_capabilities=request.requested_capabilities,
+            ),
+        )
+        client_holder["client"] = client
+        return client
+
+    async def _live_runtime_attachment_for_input(
+        self,
+        *,
+        source,
+        session_key: str,
+        durable_session_id: str,
+    ):
+        """Return a canonical control attachment when safely available."""
+        principal_id = str(source.user_id or "").strip()
+        if not principal_id or self._session_db is None:
+            return None
+        from gateway.live_runtime_bridge import (
+            AttachmentMode,
+            LiveRuntimeRoutingKey,
+            profile_scoped_runtime_key,
+        )
+
+        profile_home = self._resolve_profile_home_for_source(source)
+        durable_root = await asyncio.to_thread(
+            self._session_db.session_runtime_key, durable_session_id
+        )
+        conversation_key = profile_scoped_runtime_key(durable_root, profile_home)
+        bridge = self._live_runtime_attachment_bridge()
+        routing_key = LiveRuntimeRoutingKey.from_source(source, principal_id)
+        existing = bridge.attachment_for(session_key, routing_key)
+        if (
+            existing is not None
+            and existing.durable_root == durable_root
+            and existing.durable_session_id == durable_session_id
+            and existing.mode is AttachmentMode.CONTROL
+        ):
+            return existing
+        try:
+            owner = await self._lookup_live_runtime_owner(conversation_key)
+        except Exception:
+            logger.debug("Canonical runtime owner lookup failed", exc_info=True)
+            return None
+        if owner is None or str(owner.endpoint).startswith("process-local:"):
+            return None
+        if Path(owner.profile_home).expanduser().resolve() != Path(
+            profile_home
+        ).expanduser().resolve():
+            logger.warning("Ignoring canonical runtime owner from another profile")
+            return None
+
+        try:
+            return await asyncio.wait_for(
+                bridge.attach(
+                    session_key=session_key,
+                    source=source,
+                    principal_id=principal_id,
+                    durable_root=durable_root,
+                    durable_session_id=durable_session_id,
+                    profile_home=profile_home,
+                    mode=AttachmentMode.CONTROL,
+                    client_factory=self._make_live_runtime_client,
+                ),
+                timeout=3.0,
+            )
+        except Exception:
+            # Safe local fallback is permitted only before scheduler submission.
+            logger.info(
+                "Canonical runtime attachment unavailable; using local gateway runtime",
+                exc_info=True,
+            )
+            return None
+
+    async def _try_route_live_runtime_input(
+        self,
+        *,
+        event,
+        source,
+        session_key: str,
+        durable_session_id: str,
+    ) -> bool:
+        """Route one already-prepared input to the canonical scheduler."""
+        if getattr(event, "internal", False):
+            return False
+        attachment = await self._live_runtime_attachment_for_input(
+            source=source,
+            session_key=session_key,
+            durable_session_id=durable_session_id,
+        )
+        if attachment is None:
+            return False
+        bridge = self._live_runtime_attachment_bridge()
+        # Once request() begins, failures may represent an unknown execution
+        # outcome. Never replay the same logical message into a local agent.
+        await bridge.submit_message(attachment, event)
+        attachment.refresh_runtime_state()
+        return True
+
+    async def _try_route_preprocessed_live_runtime_input(
+        self,
+        *,
+        event,
+        source,
+        session_key: str,
+        durable_session_id: str,
+        history: list,
+    ) -> bool:
+        """Select a canonical owner, preserve gateway preprocessing, and submit."""
+        if getattr(event, "internal", False):
+            return False
+        attachment = await self._live_runtime_attachment_for_input(
+            source=source,
+            session_key=session_key,
+            durable_session_id=durable_session_id,
+        )
+        if attachment is None:
+            return False
+
+        display_text = event.text
+        message_text = await self._prepare_profile_scoped_inbound_message_text(
+            event=event,
+            source=source,
+            history=history,
+            session_key=session_key,
+        )
+        if message_text is None:
+            return True
+        try:
+            from hermes_time import get_timezone as _get_live_evt_tz
+            from gateway.message_timestamps import (
+                coerce_message_timestamp as _coerce_live_ts,
+                render_user_content_with_timestamp as _render_live_ts,
+                strip_leading_message_timestamps as _strip_live_ts,
+            )
+
+            live_tz = _get_live_evt_tz()
+            clean_text, embedded_timestamp = _strip_live_ts(
+                message_text, tz=live_tz
+            )
+            event_timestamp = _coerce_live_ts(
+                getattr(event, "timestamp", None), tz=live_tz
+            )
+            timestamp = (
+                event_timestamp if event_timestamp is not None else embedded_timestamp
+            )
+            message_text = (
+                _render_live_ts(clean_text, timestamp, tz=live_tz)
+                if _message_timestamps_enabled(_load_gateway_config())
+                else clean_text
+            )
+        except Exception as exc:
+            logger.debug(
+                "Canonical message timestamp injection failed (non-fatal): %s",
+                exc,
+            )
+        if not isinstance(event.metadata, dict):
+            event.metadata = {}
+        event.metadata["live_runtime_display_text"] = display_text
+        event.metadata["live_runtime_image_refs"] = (
+            self._consume_pending_native_image_paths(session_key)
+        )
+        event.text = message_text
+        bridge = self._live_runtime_attachment_bridge()
+        # Once request() begins, failures may represent an unknown execution
+        # outcome. Never replay locally after this boundary.
+        await bridge.submit_message(attachment, event)
+        attachment.refresh_runtime_state()
+        return True
+
     def _is_session_running(self, session_key: str) -> bool:
         """True when the session holds a running-turn slot (agent or sentinel)."""
         state = self._peek_session_state(session_key)
@@ -7104,6 +7640,9 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         # self._session_state(key) (get-or-create) or
         # self._peek_session_state(key) (read-only).
         self._sessions: Dict[str, SessionState] = {}
+        # Pin the owner registry to the launch profile. Multiplex profile
+        # context is task-local and must never redirect cross-process lookup.
+        self._live_runtime_registry_home = str(Path(_hermes_home).resolve())
         # Per-SESSION_ID turn lease (#64934): serializes the
         # [load history → run → flush] region when two ROUTING KEYS resolve
         # to one session_id (switch_session's many-to-one mapping). The
@@ -10243,18 +10782,82 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             entry = session_store._entries.get(session_key)  # noqa: SLF001
         return getattr(entry, "session_id", None) if entry is not None else None
 
-    # Hard cap on per-session pending follow-ups for busy_input_mode=queue
-    # (and the draining/steer-fallback/subagent-demotion paths that share
-    # this entry point).  Without a cap, a stuck agent + a rapid-fire user
-    # could grow the overflow list unboundedly.  32 turns of queued
-    # follow-ups is far beyond any realistic conversational backlog while
-    # still small enough to never threaten memory.
+    # Hard caps on per-session pending follow-ups for busy_input_mode=queue
+    # (and the draining/steer-fallback/subagent-demotion paths that share this
+    # entry point). Count alone is insufficient because media albums merge into
+    # one slot, and data URLs / attachment metadata can make that slot grow
+    # without bound. The byte budget covers retained UTF-8 text, media paths or
+    # URLs, and MIME types (not the media files themselves).
     _BUSY_QUEUE_MAX_PENDING = 32
+    _BUSY_QUEUE_MAX_BYTES = 1024 * 1024
 
-    def _queue_or_replace_pending_event(self, session_key: str, event: MessageEvent) -> None:
+    @staticmethod
+    def _pending_event_payload_bytes(event: MessageEvent) -> int:
+        """Return retained UTF-8 payload/media-metadata bytes for one event."""
+
+        def _utf8_size(value: Any) -> int:
+            if value is None:
+                return 0
+            if isinstance(value, bytes):
+                return len(value)
+            if isinstance(value, str):
+                return len(value.encode("utf-8"))
+            if isinstance(value, dict):
+                return sum(
+                    _utf8_size(key) + _utf8_size(item)
+                    for key, item in value.items()
+                )
+            if isinstance(value, (list, tuple, set, frozenset)):
+                return sum(_utf8_size(item) for item in value)
+            return len(str(value).encode("utf-8"))
+
+        payload_fields = (
+            "text",
+            "user_id",
+            "user_name",
+            "message_id",
+            "media_urls",
+            "media_types",
+            "reply_to_message_id",
+            "reply_to_text",
+            "reply_to_author_id",
+            "reply_to_author_name",
+            "prompt_response",
+            "auto_skill",
+            "channel_prompt",
+            "channel_context",
+            "metadata",
+        )
+        return sum(_utf8_size(getattr(event, field, None)) for field in payload_fields)
+
+    def _busy_queue_payload_bytes(self, session_key: str, adapter: Any) -> int:
+        """Return aggregate retained payload bytes across the head and FIFO tail."""
+        pending_slot = getattr(adapter, "_pending_messages", None)
+        head = pending_slot.get(session_key) if isinstance(pending_slot, dict) else None
+        state = self._peek_session_state(session_key)
+        overflow = state.conversation.queued_events if state else []
+        return sum(
+            self._pending_event_payload_bytes(queued_event)
+            for queued_event in ([head] if head is not None else []) + list(overflow)
+        )
+
+    @staticmethod
+    def _busy_queue_rejection_message(admission: str) -> str:
+        if admission == "full":
+            return "⚠️ Pending queue is full — your message was not queued. Try again after the current turn finishes."
+        return "⚠️ Your message could not be queued and was not accepted. Please try again."
+
+    def _queue_or_replace_pending_event(
+        self,
+        session_key: str,
+        event: MessageEvent,
+        *,
+        merge_text: bool = False,
+    ) -> str:
+        """Admit a busy follow-up, returning ``queued``, ``full``, or ``rejected``."""
         adapter = self._adapter_for_source(event.source)
         if not adapter:
-            return
+            return "rejected"
         # #28503 — Previously this called ``merge_pending_message_event``
         # with the default ``merge_text=False``, which silently OVERWROTE
         # the single pending slot when consecutive text messages arrived
@@ -10264,7 +10867,9 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         # the head slot via ``merge_pending_message_event`` (album
         # semantics); everything else appends to the overflow tail.
         pending_slot = getattr(adapter, "_pending_messages", None)
-        existing = pending_slot.get(session_key) if isinstance(pending_slot, dict) else None
+        if not isinstance(pending_slot, dict):
+            return "rejected"
+        existing = pending_slot.get(session_key)
         security_metadata_keys = (
             "hermes_plugin_id",
             "hermes_plugin_injection",
@@ -10282,30 +10887,69 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 for key in security_metadata_keys
             )
         )
-        if same_security_context and (
-            getattr(existing, "message_type", None) == MessageType.PHOTO
+        merge_head = same_security_context and (
+            (
+                merge_text
+                and getattr(existing, "message_type", None) == MessageType.TEXT
+                and event.message_type == MessageType.TEXT
+            )
+            or getattr(existing, "message_type", None) == MessageType.PHOTO
             or event.message_type == MessageType.PHOTO
             or bool(getattr(existing, "media_urls", None))
             or bool(getattr(event, "media_urls", None))
-        ):
-            # Preserve photo-burst / media-merge semantics for the head slot.
+        )
+
+        current_bytes = self._busy_queue_payload_bytes(session_key, adapter)
+        if merge_head:
+            # Project the exact merge against detached media lists so a rejected
+            # album item cannot mutate the live head before admission succeeds.
+            projected = dataclasses.replace(
+                existing,
+                media_urls=list(getattr(existing, "media_urls", None) or []),
+                media_types=list(getattr(existing, "media_types", None) or []),
+            )
+            projected_slot = {session_key: projected}
             merge_pending_message_event(
-                adapter._pending_messages,
+                projected_slot,
                 session_key,
                 event,
                 merge_text=event.message_type == MessageType.TEXT,
             )
-            return
-
-        if self._queue_depth(session_key, adapter=adapter) >= self._BUSY_QUEUE_MAX_PENDING:
-            logger.warning(
-                "Dropping busy-mode follow-up for session %s — pending queue at cap (%d).",
-                session_key,
-                self._BUSY_QUEUE_MAX_PENDING,
+            projected_bytes = (
+                current_bytes
+                - self._pending_event_payload_bytes(existing)
+                + self._pending_event_payload_bytes(projected_slot[session_key])
             )
-            return
+        else:
+            if self._queue_depth(session_key, adapter=adapter) >= self._BUSY_QUEUE_MAX_PENDING:
+                logger.warning(
+                    "Dropping busy-mode follow-up for session %s — pending queue at cap (%d).",
+                    session_key,
+                    self._BUSY_QUEUE_MAX_PENDING,
+                )
+                return "full"
+            projected_bytes = current_bytes + self._pending_event_payload_bytes(event)
 
-        self._enqueue_fifo(session_key, event, adapter)
+        if projected_bytes > self._BUSY_QUEUE_MAX_BYTES:
+            logger.warning(
+                "Dropping busy-mode follow-up for session %s — pending payload byte budget exceeded (%d > %d).",
+                session_key,
+                projected_bytes,
+                self._BUSY_QUEUE_MAX_BYTES,
+            )
+            return "full"
+
+        if merge_head:
+            # Preserve photo-burst / media-merge semantics for the head slot.
+            merge_pending_message_event(
+                pending_slot,
+                session_key,
+                event,
+                merge_text=event.message_type == MessageType.TEXT,
+            )
+        else:
+            self._enqueue_fifo(session_key, event, adapter)
+        return "queued"
 
     async def _prepare_busy_steer_text(self, event: MessageEvent) -> str:
         """Return steerable text for a busy follow-up, transcribing voice first.
@@ -10372,8 +11016,12 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             reply_anchor = self._reply_anchor_for_event(event)
             thread_meta = self._thread_metadata_for_source(event.source, reply_anchor)
             if self._queue_during_drain_enabled(effective_mode):
-                self._queue_or_replace_pending_event(session_key, event)
-                message = f"⏳ Gateway {self._status_action_gerund()} — queued for the next turn after it comes back."
+                admission = self._queue_or_replace_pending_event(session_key, event)
+                message = (
+                    f"⏳ Gateway {self._status_action_gerund()} — queued for the next turn after it comes back."
+                    if admission == "queued"
+                    else self._busy_queue_rejection_message(admission)
+                )
             else:
                 message = f"⏳ Gateway is {self._status_action_gerund()} and is not accepting another turn right now."
 
@@ -10599,8 +11247,9 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         # turn (#43066 sub-bug 2). The FIFO path gives each text its own
         # turn in arrival order while still preserving photo-burst / album
         # merge semantics for media.
+        queue_admission = "queued"
         if not steered and not redirected:
-            self._queue_or_replace_pending_event(session_key, event)
+            queue_admission = self._queue_or_replace_pending_event(session_key, event)
 
         is_queue_mode = effective_mode == "queue"
         is_steer_mode = effective_mode == "steer"
@@ -10612,6 +11261,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         if (
             effective_mode == "interrupt"
             and not redirected
+            and queue_admission == "queued"
             and running_agent
             and running_agent is not _AGENT_PENDING_SENTINEL
         ):
@@ -10636,7 +11286,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         # Placed before debounce so we don't stamp a "last ack" timestamp that was
         # never actually delivered.
         busy_ack_enabled = os.environ.get("HERMES_GATEWAY_BUSY_ACK_ENABLED", "true").lower() == "true"
-        if not busy_ack_enabled:
+        if not busy_ack_enabled and queue_admission == "queued":
             logger.debug("Busy ack suppressed for session %s", session_key)
             return True  # input still processed, just no ack sent
 
@@ -10646,7 +11296,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         _BUSY_ACK_COOLDOWN = 30
         now = time.time()
         last_ack = _busy_state.turn.busy_ack_ts if _busy_state else 0
-        if now - last_ack < _BUSY_ACK_COOLDOWN:
+        if queue_admission == "queued" and now - last_ack < _BUSY_ACK_COOLDOWN:
             return True  # interrupt sent (if not queue), ack already delivered recently
 
         from gateway.display_config import resolve_display_setting
@@ -10673,7 +11323,8 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 logger.debug("Busy steer ack suppressed for session %s", session_key)
                 return True
 
-        self._session_state(session_key).turn.busy_ack_ts = now
+        if queue_admission == "queued":
+            self._session_state(session_key).turn.busy_ack_ts = now
 
         # Build a status-rich acknowledgment. Mobile chat defaults keep this
         # terse; detailed iteration/tool state is still available in logs and
@@ -10707,7 +11358,9 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 pass
 
         status_detail = f" ({', '.join(status_parts)})" if status_parts else ""
-        if is_steer_mode:
+        if queue_admission != "queued":
+            message = self._busy_queue_rejection_message(queue_admission)
+        elif is_steer_mode:
             message = (
                 f"⏩ Steered into current run{status_detail}. "
                 f"Your message arrives after the next tool call."
@@ -10753,7 +11406,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 mark_seen,
             )
             _user_cfg = _load_gateway_config()
-            if not is_seen(_user_cfg, BUSY_INPUT_FLAG):
+            if queue_admission == "queued" and not is_seen(_user_cfg, BUSY_INPUT_FLAG):
                 if is_steer_mode:
                     _hint_mode = "steer"
                 elif is_queue_mode:
@@ -15225,7 +15878,6 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 "Shutdown phase: notify_active_sessions done at +%.2fs",
                 _phase_elapsed(),
             )
-
             timeout = self._restart_drain_timeout
 
             # Pre-mark sessions as resume_pending BEFORE the drain wait.
@@ -15451,6 +16103,8 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             )
             if cancel_completion_batches is not None:
                 await cancel_completion_batches()
+
+            await self._close_live_runtime_attachments()
 
             for platform, adapter in list(self.adapters.items()):
                 await self._bounded_adapter_teardown(adapter, platform)
@@ -17742,10 +18396,12 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
 
             if event.message_type == MessageType.PHOTO:
                 logger.debug("PRIORITY photo follow-up for session %s — queueing without interrupt", _quick_key)
-                adapter = self._adapter_for_source(source)
-                if adapter:
-                    merge_pending_message_event(adapter._pending_messages, _quick_key, event)
-                return None
+                admission = self._queue_or_replace_pending_event(_quick_key, event)
+                return (
+                    None
+                    if admission == "queued"
+                    else self._busy_queue_rejection_message(admission)
+                )
 
             effective_busy_input_mode = self._effective_busy_input_mode(source)
             _telegram_followup_grace = float(
@@ -17765,18 +18421,16 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     time.time() - _started_at,
                     _quick_key,
                 )
-                adapter = self._adapter_for_source(source)
-                if adapter:
-                    if effective_busy_input_mode == "queue":
-                        self._enqueue_fifo(_quick_key, event, adapter)
-                    else:
-                        merge_pending_message_event(
-                            adapter._pending_messages,
-                            _quick_key,
-                            event,
-                            merge_text=True,
-                        )
-                return None
+                admission = self._queue_or_replace_pending_event(
+                    _quick_key,
+                    event,
+                    merge_text=effective_busy_input_mode != "queue",
+                )
+                return (
+                    None
+                    if admission == "queued"
+                    else self._busy_queue_rejection_message(admission)
+                )
 
             _ra_state = self._peek_session_state(_quick_key)
             running_agent = _ra_state.turn.agent if _ra_state else None
@@ -17789,30 +18443,38 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     return EphemeralReply("⚡ Force-stopped. The agent was still starting — session unlocked.")
                 # Queue the message so it will be picked up after the
                 # agent starts.
-                adapter = self._adapter_for_source(source)
-                if adapter:
-                    merge_pending_message_event(
-                        adapter._pending_messages,
-                        _quick_key,
-                        event,
-                        merge_text=True,
-                    )
-                return None
+                admission = self._queue_or_replace_pending_event(
+                    _quick_key, event, merge_text=True
+                )
+                return (
+                    None
+                    if admission == "queued"
+                    else self._busy_queue_rejection_message(admission)
+                )
             if self._draining:
                 queue_during_drain = self._queue_during_drain_enabled(
                     effective_busy_input_mode
                 )
+                admission = "rejected"
                 if queue_during_drain:
-                    self._queue_or_replace_pending_event(_quick_key, event)
+                    admission = self._queue_or_replace_pending_event(_quick_key, event)
                 return (
                     f"⏳ Gateway {self._status_action_gerund()} — queued for the next turn after it comes back."
-                    if queue_during_drain
-                    else f"⏳ Gateway is {self._status_action_gerund()} and is not accepting another turn right now."
+                    if admission == "queued"
+                    else (
+                        self._busy_queue_rejection_message(admission)
+                        if queue_during_drain
+                        else f"⏳ Gateway is {self._status_action_gerund()} and is not accepting another turn right now."
+                    )
                 )
             if effective_busy_input_mode == "queue":
                 logger.debug("PRIORITY queue follow-up for session %s", _quick_key)
-                self._queue_or_replace_pending_event(_quick_key, event)
-                return None
+                admission = self._queue_or_replace_pending_event(_quick_key, event)
+                return (
+                    None
+                    if admission == "queued"
+                    else self._busy_queue_rejection_message(admission)
+                )
             if effective_busy_input_mode == "steer":
                 # Steer mode: inject text into the running agent mid-run via
                 # agent.steer().  Falls back to queue semantics if the payload
@@ -17835,8 +18497,12 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     logger.debug("PRIORITY steer for session %s", _quick_key)
                     return None
                 logger.debug("PRIORITY steer-fallback-to-queue for session %s", _quick_key)
-                self._queue_or_replace_pending_event(_quick_key, event)
-                return None
+                admission = self._queue_or_replace_pending_event(_quick_key, event)
+                return (
+                    None
+                    if admission == "queued"
+                    else self._busy_queue_rejection_message(admission)
+                )
             # #30170 — Subagent protection (PRIORITY path). Same rationale
             # as ``_handle_active_session_busy_message``: an interrupt
             # cascades through ``_active_children`` and aborts in-flight
@@ -17851,8 +18517,12 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     "because the running agent has active subagents (#30170)",
                     _quick_key,
                 )
-                self._queue_or_replace_pending_event(_quick_key, event)
-                return None
+                admission = self._queue_or_replace_pending_event(_quick_key, event)
+                return (
+                    None
+                    if admission == "queued"
+                    else self._busy_queue_rejection_message(admission)
+                )
             # #56391 — Compression protection (PRIORITY path). Same
             # rationale as ``_handle_active_session_busy_message``: context
             # compression is interrupt-protected (#23975), but an interrupt
@@ -17867,8 +18537,12 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     "because context compression is in flight (#56391)",
                     _quick_key,
                 )
-                self._queue_or_replace_pending_event(_quick_key, event)
-                return None
+                admission = self._queue_or_replace_pending_event(_quick_key, event)
+                return (
+                    None
+                    if admission == "queued"
+                    else self._busy_queue_rejection_message(admission)
+                )
             # Text-only corrections redirect the live turn (preserving
             # displayed context) when the runtime supports it; media/voice and
             # older runtimes fall back to the proven interrupt path below.
@@ -19655,6 +20329,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         # onto subsequent messages in the same session (issue #6508).
         if getattr(session_entry, "is_fresh_reset", False):
             session_entry.is_fresh_reset = False
+
         if _is_new_session:
             await self.hooks.emit("session:start", {
                 "platform": source.platform.value if source.platform else "",
@@ -19872,7 +20547,25 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
 
         # Load conversation history from transcript
         history = await self.async_session_store.load_transcript(session_entry.session_id)
-        
+
+        # Canonical-owner routing happens after transcript resolution but before
+        # session hygiene or any process-local AIAgent construction. The helper
+        # applies the same preprocessing used by the local path and preserves the
+        # original renderer-facing text separately.
+        if await self._try_route_preprocessed_live_runtime_input(
+            event=event,
+            source=source,
+            session_key=session_key,
+            durable_session_id=session_entry.session_id,
+            history=history,
+        ):
+            logger.info(
+                "Inbound message accepted by canonical runtime: platform=%s session=%s",
+                _platform_name,
+                session_entry.session_id,
+            )
+            return None
+
         # -----------------------------------------------------------------
         # Session hygiene: auto-compress pathologically large transcripts
         #

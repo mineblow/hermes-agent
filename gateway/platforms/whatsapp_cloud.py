@@ -1830,7 +1830,11 @@ class WhatsAppCloudAdapter(WhatsAppBehaviorMixin, BasePlatformAdapter):
             # that lands after the wait timed out (count == 0) must not claim
             # the command was approved: it was already denied fail-closed.
             try:
-                if count:
+                if count and ":interaction:" in session_key:
+                    confirm_text = (
+                        "⏳ Response submitted; awaiting active runtime confirmation."
+                    )
+                elif count:
                     confirm_text = (
                         "✅ Approved." if choice == "approve" else "❌ Denied."
                     )

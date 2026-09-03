@@ -8,6 +8,11 @@ description: "Receive events from GitHub, GitLab, and other services to trigger 
 
 Receive events from external services (GitHub, GitLab, JIRA, Stripe, etc.) and trigger Hermes agent runs automatically. The webhook adapter runs an HTTP server that accepts POST requests, validates HMAC signatures, transforms payloads into agent prompts, and routes responses back to the source or to another configured platform.
 
+Webhooks are bounded producers or direct-delivery automation, not persistent
+live-session clients. A POST does not acquire runtime membership or a replay
+cursor. See the
+[live-session surface classification](/reference/live-session-surface-classification).
+
 The agent processes the event and can respond by posting comments on PRs, sending messages to Telegram/Discord, or logging the result.
 
 ## Video Tutorial

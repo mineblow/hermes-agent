@@ -2,6 +2,7 @@ import type { BillingBlock } from '@hermes/shared'
 
 import { burstVibeHearts } from '@/components/chat/vibe-hearts'
 import { translateNow } from '@/i18n'
+import { chatMessageText, textPart } from '@/lib/chat-messages'
 import { coerceGatewayText, coerceThinkingText } from '@/lib/chat-runtime'
 import { playCompletionSound } from '@/lib/completion-sound'
 import { parseErrorSurface } from '@/lib/error-surface'
@@ -79,6 +80,73 @@ export function handleMessageStreamEvent(ctx: GatewayEventContext): boolean {
     sessionStateByRuntimeIdRef,
     updateSessionState
   } = deps
+
+  if (event.type === 'message.user') {
+    if (!sessionId || payload?.display_kind === 'hidden') {
+      return true
+    }
+
+    const messageId = typeof payload?.message_id === 'string' ? payload.message_id.trim() : ''
+    const text = coerceGatewayText(payload?.text)
+    const attachmentRefs = Array.isArray(payload?.attachment_refs)
+      ? payload.attachment_refs.filter((ref): ref is string => typeof ref === 'string' && Boolean(ref))
+      : []
+
+    if (!messageId || (!text && !attachmentRefs.length)) {
+      return true
+    }
+
+    updateSessionState(sessionId, state => {
+      const normalizedText = text.replace(/\s+/g, ' ').trim()
+      const refsKey = attachmentRefs.join('\n')
+      const exact = state.messages.find(message => message.id === messageId)
+
+      if (exact) {
+        return state
+      }
+
+      const streamIndex = state.streamId
+        ? state.messages.findIndex(message => message.id === state.streamId && message.role === 'assistant')
+        : -1
+      // The state.db watcher can win the tiny persistence→event race. Only the
+      // row immediately before this turn's pending assistant (or the transcript
+      // tail when hydration replaced that placeholder) can be its equivalent.
+      // Searching all history would wrongly collapse a legitimate later turn
+      // when the user intentionally repeats the same prompt.
+      const equivalentCandidate = state.messages[streamIndex >= 0 ? streamIndex - 1 : state.messages.length - 1]
+      const equivalent =
+        equivalentCandidate?.role === 'user' &&
+        !equivalentCandidate.hidden &&
+        chatMessageText(equivalentCandidate).replace(/\s+/g, ' ').trim() === normalizedText &&
+        (equivalentCandidate.attachmentRefs ?? []).join('\n') === refsKey
+
+      if (equivalent) {
+        return state
+      }
+
+      const userMessage = {
+        id: messageId,
+        role: 'user' as const,
+        parts: text ? [textPart(text, occurredAt)] : [],
+        timestamp: occurredAt,
+        ...(attachmentRefs.length ? { attachmentRefs } : {})
+      }
+      const messages = [...state.messages]
+
+      // message.start is emitted when the gateway accepts the turn, before the
+      // agent persists the inbound row. Put the durable user event immediately
+      // before that turn's pending assistant placeholder.
+      if (streamIndex >= 0) {
+        messages.splice(streamIndex, 0, userMessage)
+      } else {
+        messages.push(userMessage)
+      }
+
+      return { ...state, messages }
+    })
+
+    return true
+  }
 
   if (event.type === 'message.start') {
     if (!sessionId) {

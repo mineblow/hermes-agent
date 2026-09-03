@@ -490,6 +490,19 @@ class ComputeHost:
                 session,
                 text,
                 display_kind=frame.get("display_kind") or None,
+                display_metadata=frame.get("display_metadata"),
+                client_message_id=frame.get("client_message_id") or None,
+                client_identity=(
+                    tuple(frame["client_identity"])
+                    if isinstance(frame.get("client_identity"), list)
+                    and len(frame["client_identity"]) == 2
+                    else None
+                ),
+                display_text=(
+                    frame.get("display_text") if "display_text" in frame else None
+                ),
+                submitted_at=frame.get("submitted_at"),
+                attachment_refs=frame.get("attachment_refs"),
             )
             run_thread = session.get("_run_thread")
             if run_thread is not None and hasattr(run_thread, "join"):

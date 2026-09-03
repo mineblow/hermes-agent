@@ -7741,7 +7741,12 @@ class SlackAdapter(BasePlatformAdapter):
             "deny": f"❌ Denied by {user_name}",
         }
         decision_text = label_map.get(choice, f"Resolved by {user_name}")
-        if not count:
+        if count and ":interaction:" in session_key:
+            decision_text = (
+                f"⏳ Response submitted by {user_name}; "
+                "awaiting active runtime confirmation"
+            )
+        elif not count:
             decision_text = (
                 "⌛ Approval expired — command was not run "
                 "(already timed out or resolved elsewhere)"

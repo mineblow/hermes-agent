@@ -8,6 +8,11 @@ description: "Connect Hermes Agent to external tool servers via MCP — and cont
 
 MCP lets Hermes Agent connect to external tool servers so the agent can use tools that live outside Hermes itself — GitHub, databases, file systems, browser stacks, internal APIs, and more.
 
+MCP is a tool/control protocol, not a live-session renderer. This remains true
+for `hermes mcp serve`: sending and polling through MCP does not make the MCP
+client a canonical runtime member. See the
+[live-session surface classification](/reference/live-session-surface-classification).
+
 If you have ever wanted Hermes to use a tool that already exists somewhere else, MCP is usually the cleanest way to do it.
 
 :::tip Coming from Claude Code?

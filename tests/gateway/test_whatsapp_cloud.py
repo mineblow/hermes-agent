@@ -1127,6 +1127,39 @@ class TestDispatchInteractiveReplyApproval:
         assert confirm_payload["type"] == "text"
         assert "Approved" in confirm_payload["text"]["body"]
 
+    @pytest.mark.asyncio
+    async def test_canonical_approval_tap_waits_for_runtime_confirmation(
+        self, monkeypatch
+    ):
+        adapter = _make_adapter()
+        canonical_key = "sess-app-1:interaction:abc123"
+        adapter._exec_approval_state["app1"] = canonical_key
+        adapter._http_client = MagicMock()
+        adapter._http_client.post = AsyncMock(
+            return_value=_mock_httpx_response(200, {"messages": [{"id": "x"}]})
+        )
+        monkeypatch.setattr(
+            "tools.approval.resolve_gateway_approval",
+            lambda session_key, choice: 1,
+        )
+        raw = {
+            "from": "15551234567",
+            "type": "interactive",
+            "interactive": {
+                "type": "button_reply",
+                "button_reply": {"id": "appr:app1:approve", "title": "Approve"},
+            },
+        }
+
+        handled = await adapter._dispatch_interactive_reply(raw, {})
+
+        assert handled is True
+        confirm_payload = adapter._http_client.post.call_args.kwargs["json"]
+        body = confirm_payload["text"]["body"]
+        assert "submitted" in body
+        assert "awaiting active runtime confirmation" in body
+        assert "Approved" not in body
+
 
 @pytest.mark.usefixtures("authorized_interactive_env")
 class TestDispatchInteractiveReplySlashConfirm:

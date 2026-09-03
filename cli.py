@@ -5578,6 +5578,8 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
         self._preload_skills_requested: list = []
         self._preload_skills_finalized = False
         self._active_session_lease = None
+        self._classic_live_runtime = None
+        self._classic_pending_interaction_ids: set[str] = set()
 
         # Voice mode state (also reinitialized inside run() for interactive TUI).
         self._voice_lock = threading.Lock()
@@ -17162,12 +17164,12 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
     def _persist_active_session_before_close(self):
         """Best-effort SQLite/JSON flush before the CLI marks a session closed.
 
-        ``run_conversation()`` normally persists at turn boundaries, but a
-        terminal close/SIGHUP/SIGTERM can unwind the prompt_toolkit app while
-        the agent thread still holds the current turn only in memory.  Flush the
-        agent's live ``_session_messages`` before ``end_session()`` so resume,
-        session_search, and state.db do not lose the interrupted turn.
+        Attached classic clients are presentation-only; the canonical runtime owner
+        has already persisted every accepted event and must remain the sole writer.
         """
+        if self._classic_live_runtime is not None:
+            return
+
         agent = getattr(self, "agent", None)
         if not agent or not hasattr(agent, "_persist_session"):
             return
@@ -17545,6 +17547,219 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
             ] if item is not None
         ]
 
+    def _start_classic_live_runtime(self) -> None:
+        from hermes_cli.classic_live_runtime import (
+            ClassicLiveRuntimeSession,
+            build_in_process_gateway_client,
+        )
+
+        if self._session_db is None:
+            raise RuntimeError("classic live runtime requires the durable session store")
+        runtime = ClassicLiveRuntimeSession(
+            gateway=build_in_process_gateway_client(),
+            profile=None,
+            profile_home=_hermes_home,
+            conversation_key_resolver=self._session_db.session_runtime_key,
+            on_row=self._on_classic_live_runtime_row,
+        )
+        try:
+            cols = max(20, shutil.get_terminal_size(fallback=(80, 24)).columns)
+            if self._resumed:
+                identity = runtime.start_resume(self.session_id, cols=cols)
+            else:
+                identity = runtime.start_new(cols=cols, cwd=os.getcwd())
+        except BaseException:
+            runtime.close()
+            raise
+        self._classic_live_runtime = runtime
+        self.session_id = identity["durable_session_id"]
+
+    def _resolve_classic_live_interaction(self, row: dict[str, Any]) -> None:
+        request_id = str(row.get("request_id") or "").strip()
+        interaction_type = str(row.get("interaction_type") or "").strip()
+        payload = row.get("payload")
+        runtime = self._classic_live_runtime
+        try:
+            if runtime is None or not request_id or not isinstance(payload, dict):
+                raise RuntimeError("invalid canonical interaction request")
+            if interaction_type == "approval":
+                command = str(payload.get("command") or "").strip()
+                description = str(payload.get("description") or "Approval required")
+                choices = payload.get("choices")
+                allowed = (
+                    {str(choice) for choice in choices}
+                    if isinstance(choices, list)
+                    else {"once", "session", "always", "deny"}
+                )
+                choice = self._approval_callback(
+                    command,
+                    description,
+                    allow_permanent="always" in allowed,
+                    allow_session="session" in allowed,
+                    smart_denied=allowed <= {"once", "deny"},
+                )
+                if choice not in {"once", "session", "always", "deny"}:
+                    choice = "deny"
+                runtime.respond_to_interaction(
+                    interaction_type="approval",
+                    request_id=request_id,
+                    choice=choice,
+                )
+                return
+            if interaction_type == "clarification":
+                question = str(payload.get("question") or "").strip()
+                raw_choices = payload.get("choices")
+                choices = (
+                    [str(choice) for choice in raw_choices]
+                    if isinstance(raw_choices, list)
+                    else []
+                )
+                answer = self._clarify_callback(
+                    question,
+                    choices,
+                    multi_select=bool(payload.get("multi_select", False)),
+                )
+                response: dict[str, Any] = {
+                    "interaction_type": "clarification",
+                    "request_id": request_id,
+                    "answer": str(answer),
+                }
+                question_id = payload.get("question_id")
+                if isinstance(question_id, str) and question_id.strip():
+                    response["question_id"] = question_id
+                runtime.respond_to_interaction(**response)
+                return
+            raise RuntimeError("unsupported canonical interaction type")
+        except Exception as exc:
+            logger.warning(
+                "classic live runtime interaction relay failed request=%s: %s",
+                request_id or "unknown",
+                exc,
+            )
+            if runtime is not None and request_id and interaction_type == "approval":
+                try:
+                    runtime.respond_to_interaction(
+                        interaction_type="approval",
+                        request_id=request_id,
+                        choice="deny",
+                    )
+                except Exception:
+                    pass
+        finally:
+            pending = getattr(self, "_classic_pending_interaction_ids", None)
+            if pending is not None:
+                pending.discard(request_id)
+
+    def _on_classic_live_runtime_row(self, row: dict[str, Any]) -> None:
+        kind = row.get("kind")
+        if kind == "peer-user":
+            label = row.get("user_name") or row.get("surface") or "user"
+            text = str(row.get("text") or "")
+            _cprint(f"\n  {_DIM}[{label}]{_RST} {text}")
+        elif kind == "interaction":
+            request_id = str(row.get("request_id") or "").strip()
+            pending = getattr(self, "_classic_pending_interaction_ids", None)
+            if pending is None:
+                pending = set()
+                self._classic_pending_interaction_ids = pending
+            if not request_id or request_id in pending:
+                return
+            pending.add(request_id)
+            threading.Thread(
+                target=self._resolve_classic_live_interaction,
+                args=(dict(row),),
+                name=f"classic-interaction-{request_id[:8]}",
+                daemon=True,
+            ).start()
+
+    def _chat_via_classic_live_runtime(
+        self,
+        text: str,
+        *,
+        images: list[Path] | None = None,
+    ) -> dict[str, Any]:
+        runtime = self._classic_live_runtime
+        if runtime is None:
+            raise RuntimeError("classic live runtime is not started")
+
+        def _submit(prompt: str, prompt_images: list[Path], *, policy: str) -> Any:
+            image_refs = [str(path) for path in prompt_images]
+            return runtime.submit(
+                prompt,
+                submitted_at=time.time(),
+                message_id=uuid.uuid4().hex,
+                busy_policy=policy,
+                attachment_refs=image_refs or None,
+                image_refs=image_refs or None,
+            )
+
+        initial_images = list(images or [])
+        busy_policy = self.busy_input_mode
+        if busy_policy not in {"queue", "reject", "interrupt"}:
+            busy_policy = "interrupt"
+        image_refs = [str(path) for path in initial_images]
+        runtime.start_turn(
+            text,
+            submitted_at=time.time(),
+            message_id=uuid.uuid4().hex,
+            busy_policy=busy_policy,
+            attachment_refs=image_refs or None,
+            image_refs=image_refs or None,
+        )
+
+        outstanding = 1
+        submitted_prompts = [text]
+        terminal: dict[str, Any] = {}
+        deadline = time.monotonic() + runtime.turn_timeout
+        while outstanding:
+            interrupt_queue = getattr(self, "_interrupt_queue", None)
+            if interrupt_queue is not None:
+                while True:
+                    try:
+                        interrupt_payload = interrupt_queue.get_nowait()
+                    except queue.Empty:
+                        break
+                    interrupt_images: list[Path] = []
+                    interrupt_text = interrupt_payload
+                    if isinstance(interrupt_payload, tuple):
+                        interrupt_text, interrupt_images = interrupt_payload
+                    if not isinstance(interrupt_text, str) or not interrupt_text:
+                        continue
+                    _cprint("\n⚡ New message detected, interrupting canonical turn...")
+                    submission = _submit(
+                        interrupt_text,
+                        list(interrupt_images or []),
+                        policy="interrupt",
+                    )
+                    submitted_prompts.append(interrupt_text)
+                    if not (
+                        isinstance(submission, dict)
+                        and submission.get("status") == "redirected"
+                    ):
+                        outstanding += 1
+                    self._clear_active_overlays_for_interrupt()
+
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                raise TimeoutError("classic live runtime turn did not complete")
+            try:
+                terminal = runtime.wait_for_terminal(timeout=min(0.1, remaining))
+            except TimeoutError:
+                self._invalidate(min_interval=0.15)
+                continue
+            outstanding -= 1
+
+        response = str(terminal.get("text") or "")
+        status = str(terminal.get("status") or "")
+        self._last_turn_interrupted = status == "interrupted"
+        self.conversation_history.extend(
+            [{"role": "user", "content": prompt} for prompt in submitted_prompts]
+            + [{"role": "assistant", "content": response}]
+        )
+        if response:
+            print(response)
+        return terminal
+
     def run(self):
         """Run the interactive CLI loop with persistent input at bottom."""
         if not self._claim_active_session("cli"):
@@ -17592,6 +17807,15 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
         if self._resumed:
             if self._preload_resumed_session():
                 self._display_resumed_history()
+
+        try:
+            self._start_classic_live_runtime()
+        except Exception as exc:
+            self._console_print(
+                f"[bold red]Could not start canonical live runtime:[/] {exc}"
+            )
+            self._release_active_session()
+            return
 
         try:
             from hermes_cli.skin_engine import get_active_skin
@@ -17810,7 +18034,10 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
         self._voice_last_tts_text = ""  # most recently spoken TTS text (echo guard, #75780)
         self._voice_barge_phase = None  # "generation" or "playback" phase of the last barge trip
 
-        if os.environ.get("HERMES_DEFER_AGENT_STARTUP") != "1":
+        if (
+            os.environ.get("HERMES_DEFER_AGENT_STARTUP") != "1"
+            and self._classic_live_runtime is None
+        ):
             self._install_tool_callbacks()
 
         if os.environ.get("HERMES_DEFER_AGENT_STARTUP") != "1":
@@ -18044,16 +18271,19 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
                 # post-run next-turn message — defeating mid-run injection.
                 # agent.steer() is thread-safe (holds _pending_steer_lock).
                 if self._should_handle_steer_command_inline(text, has_images=has_images):
-                    self.process_command(text)
-                    event.app.current_buffer.reset(append_to_history=True)
-                    # Force a repaint after clearing the buffer.  /steer is
-                    # dispatched mid-run while the agent streams output through
-                    # patch_stdout; process_command() never invalidates the
-                    # app, so without this the submitted "/steer <text>" can
-                    # linger in the input area (looking unsent) and invite an
-                    # accidental re-submit. See issue #34569.
-                    event.app.invalidate()
-                    return
+                    if self._classic_live_runtime is not None:
+                        text = text.partition(" ")[2].strip()
+                    else:
+                        self.process_command(text)
+                        event.app.current_buffer.reset(append_to_history=True)
+                        # Force a repaint after clearing the buffer.  /steer is
+                        # dispatched mid-run while the agent streams output through
+                        # patch_stdout; process_command() never invalidates the
+                        # app, so without this the submitted "/steer <text>" can
+                        # linger in the input area (looking unsent) and invite an
+                        # accidental re-submit. See issue #34569.
+                        event.app.invalidate()
+                        return
 
                 # Same treatment for /background (/bg, /btw) while the agent is
                 # running.  Queuing it defeats the entire point of the command:
@@ -18089,7 +18319,12 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
                 if self._agent_running and not _is_local_dispatch:
                     _effective_mode = self.busy_input_mode
                     redirected = False
-                    if _effective_mode == "steer":
+                    if (
+                        _effective_mode == "steer"
+                        and self._classic_live_runtime is not None
+                    ):
+                        _effective_mode = "interrupt"
+                    elif _effective_mode == "steer":
                         # Route Enter through /steer — inject mid-run after the
                         # next tool call.  Images can't ride along (steer only
                         # appends text), so fall back to queue when images are
@@ -18116,7 +18351,11 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
                         preview = text if text else f"[{len(images)} image{'s' if len(images) != 1 else ''} attached]"
                         _cprint(f"  Queued for the next turn: {preview[:80]}{'...' if len(preview) > 80 else ''}")
                     elif _effective_mode == "interrupt":
-                        if not images and text:
+                        if (
+                            self._classic_live_runtime is None
+                            and not images
+                            and text
+                        ):
                             try:
                                 if (
                                     self.agent is not None
@@ -20490,7 +20729,10 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
                     app.invalidate()  # Refresh status line
 
                     try:
-                        self.chat(user_input, images=submit_images or None, voice_input=is_voice_input)
+                        self._chat_via_classic_live_runtime(
+                            user_input,
+                            images=submit_images or None,
+                        )
                     finally:
                         self._agent_running = False
                         self._spinner_text = ""
@@ -20845,6 +21087,11 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
                 print(f"{_DIM}Shutting down… (finalizing session){_RST}", flush=True)
             except Exception:
                 pass
+            if self._classic_live_runtime is not None:
+                try:
+                    self._classic_live_runtime.close()
+                except Exception as exc:
+                    logger.debug("Could not close classic live runtime: %s", exc)
             # Interrupt the agent immediately so its daemon thread stops making
             # API calls and exits promptly (agent_thread is daemon, so the
             # process will exit once the main thread finishes, but interrupting
@@ -20878,7 +21125,12 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
             self._persist_active_session_before_close()
 
             # Close session in SQLite
-            if hasattr(self, '_session_db') and self._session_db and self.agent:
+            if (
+                self._classic_live_runtime is None
+                and hasattr(self, '_session_db')
+                and self._session_db
+                and self.agent
+            ):
                 try:
                     self._session_db.end_session(self.agent.session_id, "cli_close")
                 except (Exception, KeyboardInterrupt) as e:

@@ -171,11 +171,13 @@ def test_resume_closes_profile_db_on_live_session_fast_path(profile_dbs, monkeyp
     live_session = {}
     with server._sessions_lock:
         server._sessions["live-sid"] = live_session
-    monkeypatch.setattr(
-        server,
-        "_find_live_session_by_key",
-        lambda _key: ("live-sid", live_session),
-    )
+    runtime_lookups = []
+
+    def _find_runtime(runtime_key, profile_home=None):
+        runtime_lookups.append((runtime_key, profile_home))
+        return "live-sid", live_session
+
+    monkeypatch.setattr(server, "_find_live_session_by_runtime_key", _find_runtime)
     monkeypatch.setattr(
         server,
         "_live_session_payload",
@@ -186,6 +188,7 @@ def test_resume_closes_profile_db_on_live_session_fast_path(profile_dbs, monkeyp
     resp = _resume(session_id="s1", profile="work")
 
     assert resp["result"]["resumed"] == "s1"
+    assert runtime_lookups and runtime_lookups[0][0] == "s1"
     assert profile_dbs[0].closed == 1
 
 

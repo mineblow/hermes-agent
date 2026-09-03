@@ -108,6 +108,31 @@ describe('submissionCore.submitPrompt — synchronous busy (queue-race fix)', ()
 
     expect(calls).toContain('prompt.submit')
   })
+
+  it('submits stable display metadata and gives repeated identical prompts distinct client message IDs', async () => {
+    const request = vi.fn((method: string) => Promise.resolve(
+      method === 'input.detect_drop' ? { matched: false } : { ok: true }
+    ))
+
+    const gw = { request } as unknown as GatewayClient
+    const appendMessage = vi.fn()
+
+    submitPrompt('same prompt', makeDeps(gw, { appendMessage }))
+    await vi.waitFor(() => expect(request.mock.calls.filter(call => call[0] === 'prompt.submit')).toHaveLength(1))
+    patchUiState({ busy: false })
+    submitPrompt('same prompt', makeDeps(gw, { appendMessage }))
+    await vi.waitFor(() => expect(request.mock.calls.filter(call => call[0] === 'prompt.submit')).toHaveLength(2))
+
+    const submissions = request.mock.calls.filter(call => call[0] === 'prompt.submit').map(call => call[1])
+    expect(submissions[0]).toMatchObject({ display_text: 'same prompt', session_id: 'sess-1', text: 'same prompt' })
+    expect(submissions[0].client_message_id).toEqual(expect.any(String))
+    expect(submissions[0].submitted_at).toEqual(expect.any(Number))
+    expect(submissions[1].client_message_id).not.toBe(submissions[0].client_message_id)
+    expect(appendMessage.mock.calls.map(call => call[0].messageId)).toEqual([
+      submissions[0].client_message_id,
+      submissions[1].client_message_id
+    ])
+  })
 })
 
 describe('submissionCore.markSubmitting', () => {

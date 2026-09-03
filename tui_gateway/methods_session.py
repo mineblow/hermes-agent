@@ -33,6 +33,9 @@ def _(rid, params: dict) -> dict:
         explicit_cwd = False
     resolved_cwd = _completion_cwd(params)
     source = _resolve_session_source(str(params.get("source") or "").strip() or None)
+    from tui_gateway.session_events import AttachmentMode
+
+    attachment_mode = AttachmentMode.parse(params.get("attachment_mode", "control"))
     _enable_gateway_prompts()
 
     # ``profile`` (app-global remote mode): a new chat started under a non-launch
@@ -70,6 +73,9 @@ def _(rid, params: dict) -> dict:
             "priority" if is_truthy_value(params.get("fast")) else ""
         )
 
+    runtime_owner_lease = _claim_local_runtime_owner(
+        key, profile_home or Path(_hermes_home)
+    )
     ready = threading.Event()
     now = time.time()
     lease = None  # claimed lazily on the first turn (_ensure_active_session_slot)
@@ -101,6 +107,7 @@ def _(rid, params: dict) -> dict:
             "pending_hidden": is_truthy_value(params.get("hidden", False)),
             "profile_home": str(profile_home) if profile_home is not None else None,
             "running": False,
+            "runtime_owner_lease": runtime_owner_lease,
             "session_key": key,
             "show_reasoning": _load_show_reasoning(),
             "source": source,
@@ -110,6 +117,11 @@ def _(rid, params: dict) -> dict:
             "transport": current_transport() or _stdio_transport,
         }
         _register_session_cwd(_sessions[sid])
+    _attach_current_transport(
+        sid,
+        _sessions[sid],
+        attachment_mode,
+    )
 
     # NOTE: we intentionally do NOT persist a DB row here. Every TUI/desktop
     # launch (and every "New agent" / draft) opens a session here just to paint
@@ -393,6 +405,7 @@ def _(rid, params: dict) -> dict:
     # that returns before that transfer must close it. Otherwise reuse the
     # shared launch db, which outlives the RPC and is never closed here.
     owns_db = False
+    runtime_build_guard = None
     if profile_home is not None:
         from hermes_state import SessionDB
 
@@ -464,9 +477,12 @@ def _(rid, params: dict) -> dict:
                     # unpersisted sibling of the storm-killer paths (#91276).
                     transport = current_transport()
                     if transport is not None:
-                        with live.setdefault("history_lock", threading.Lock()):
-                            live["transport"] = transport
-                            live.setdefault("viewers", {})[transport] = time.time()
+                        _attach_current_transport(
+                            live_sid,
+                            live,
+                            params.get("attachment_mode", "control"),
+                            transport=transport,
+                        )
                     _cancel_ws_orphan_reap(live_sid)
                     history = live.get("history") or []
                     return _ok(
@@ -594,6 +610,13 @@ def _(rid, params: dict) -> dict:
         profile_resume_cwd = str(found.get("cwd") or "").strip() or _profile_configured_cwd(
             profile_home
         )
+        runtime_key_resolver = getattr(db, "session_runtime_key", None)
+        runtime_key = str(
+            runtime_key_resolver(target) if callable(runtime_key_resolver) else target
+        )
+        runtime_build_key = _profile_scoped_runtime_key(
+            runtime_key, profile_home or Path(_hermes_home)
+        )
 
         def _reuse_live_payload(sid: str, session: dict) -> dict:
             payload = _live_session_payload(
@@ -602,6 +625,7 @@ def _(rid, params: dict) -> dict:
                 cols=cols,
                 touch=True,
                 transport=current_transport() or _stdio_transport,
+                attachment_mode=params.get("attachment_mode", "control"),
                 omit_messages=omit_messages,
             )
             payload["resumed"] = target
@@ -637,9 +661,9 @@ def _(rid, params: dict) -> dict:
                 _cancel_ws_orphan_reap(sid)
                 return _ok(rid, _reuse_live_payload(sid, session))
 
-        # Fast path: if the session is already live, reuse it under the lock.
+        # Fast path: if the canonical runtime is already live in this profile, reuse it.
         with _session_resume_lock:
-            live = _find_live_session_by_key(target)
+            live = _find_live_session_by_runtime_key(runtime_key, profile_home)
         if live is not None:
             return _reuse_live_response(*live)
 
@@ -670,7 +694,11 @@ def _(rid, params: dict) -> dict:
                     lease.release()
                 return _err(rid, 5000, f"resume failed: {e}")
             cwd = profile_resume_cwd or _default_session_cwd()
+            runtime_owner_lease = _claim_local_runtime_owner(
+                runtime_key, profile_home or Path(_hermes_home)
+            )
             record = _deferred_session_record(
+                sid,
                 target,
                 cols=cols,
                 cwd=cwd,
@@ -680,6 +708,8 @@ def _(rid, params: dict) -> dict:
                 close_on_disconnect=is_truthy_value(params.get("close_on_disconnect", False)),
                 profile_home=profile_home,
                 lazy=True,
+                runtime_owner_key=runtime_key,
+                runtime_owner_lease=runtime_owner_lease,
             )
             if (live := _claim_or_reuse_live(sid, target, record, lease)) is not None:
                 return _reuse_live_response(*live)
@@ -737,7 +767,11 @@ def _(rid, params: dict) -> dict:
             overrides = _stored_session_runtime_overrides(found) or {}
             model_override = overrides.get("model_override") or {}
             cwd = profile_resume_cwd or _default_session_cwd()
+            runtime_owner_lease = _claim_local_runtime_owner(
+                runtime_key, profile_home or Path(_hermes_home)
+            )
             record = _deferred_session_record(
+                sid,
                 target,
                 cols=cols,
                 cwd=cwd,
@@ -748,6 +782,8 @@ def _(rid, params: dict) -> dict:
                 profile_home=profile_home,
                 model_override=overrides.get("model_override"),
                 resume_runtime_overrides=overrides or None,
+                runtime_owner_key=runtime_key,
+                runtime_owner_lease=runtime_owner_lease,
             )
             record["resume_history_ready"] = threading.Event()
             record["resume_hydrating"] = True
@@ -832,7 +868,11 @@ def _(rid, params: dict) -> dict:
             overrides = _stored_session_runtime_overrides(found) or {}
             model_override = overrides.get("model_override") or {}
             cwd = profile_resume_cwd or _default_session_cwd()
+            runtime_owner_lease = _claim_local_runtime_owner(
+                runtime_key, profile_home or Path(_hermes_home)
+            )
             record = _deferred_session_record(
+                sid,
                 target,
                 cols=cols,
                 cwd=cwd,
@@ -844,6 +884,8 @@ def _(rid, params: dict) -> dict:
                 profile_home=profile_home,
                 model_override=overrides.get("model_override"),
                 resume_runtime_overrides=overrides or None,
+                runtime_owner_key=runtime_key,
+                runtime_owner_lease=runtime_owner_lease,
             )
             if (live := _claim_or_reuse_live(sid, target, record, lease)) is not None:
                 return _reuse_live_response(*live)
@@ -882,6 +924,8 @@ def _(rid, params: dict) -> dict:
         sid = uuid.uuid4().hex[:8]
         source = _resolve_session_source(str(params.get("source") or "").strip() or None)
         lease = None  # claimed lazily on the first turn (_ensure_active_session_slot)
+        runtime_owner_lease = None
+        runtime_owner_transferred = False
         _enable_gateway_prompts()
         home_token = (
             set_hermes_home_override(str(profile_home)) if profile_home is not None else None
@@ -915,6 +959,15 @@ def _(rid, params: dict) -> dict:
             )
             history = sanitize_replay_history(raw_history)
             messages = [] if omit_messages else _history_to_messages(display_history)
+            runtime_build_guard = _runtime_build_singleflight(runtime_build_key)
+            runtime_build_guard.__enter__()
+            with _session_resume_lock:
+                live = _find_live_session_by_runtime_key(runtime_key, profile_home)
+            if live is not None:
+                return _reuse_live_response(*live)
+            runtime_owner_lease = _claim_local_runtime_owner(
+                runtime_key, profile_home or Path(_hermes_home)
+            )
             tokens = _set_session_context(target)
             try:
                 # Pass the profile's db so the agent persists turns to the right
@@ -936,6 +989,8 @@ def _(rid, params: dict) -> dict:
         except Exception as e:
             if lease is not None:
                 lease.release()
+            if runtime_owner_lease is not None and not runtime_owner_transferred:
+                runtime_owner_lease.release()
             return _err(rid, 5000, f"resume failed: {e}")
         finally:
             if home_token is not None:
@@ -949,6 +1004,8 @@ def _(rid, params: dict) -> dict:
         with _session_resume_lock:
             live = _find_live_session_by_key(target)
             if live is not None:
+                if runtime_owner_lease is not None:
+                    live[1].setdefault("runtime_owner_lease", runtime_owner_lease)
                 try:
                     if hasattr(agent, "close"):
                         agent.close()
@@ -1026,6 +1083,9 @@ def _(rid, params: dict) -> dict:
                     if profile_home is not None:
                         _sessions[sid]["profile_home"] = str(profile_home)
                     _sessions[sid]["active_session_lease"] = lease
+                    _sessions[sid]["runtime_owner_key"] = runtime_key
+                    _sessions[sid]["runtime_owner_lease"] = runtime_owner_lease
+                    runtime_owner_transferred = True
             except Exception as e:
                 # _init_session registers _sessions[sid] BEFORE its first read
                 # through this handle. If it raised in between — "database is
@@ -1041,9 +1101,13 @@ def _(rid, params: dict) -> dict:
                         _sessions.pop(sid, None)
                 if lease is not None:
                     lease.release()
+                if runtime_owner_lease is not None and not runtime_owner_transferred:
+                    runtime_owner_lease.release()
                 return _err(rid, 5000, f"resume failed: {e}")
             session = _sessions.get(sid) or {}
     finally:
+        if runtime_build_guard is not None:
+            runtime_build_guard.__exit__(None, None, None)
         # Every return that does NOT reach the transfer above abandons this
         # handle — session-not-found, both "resume failed" paths, the live-session
         # fast path (the hot one: reconnects re-resume live chats through it), the
@@ -1187,6 +1251,7 @@ def _(rid, params: dict) -> dict:
     without closing siblings.
     """
     current = str(params.get("current_session_id") or "")
+    transport = current_transport() or _stdio_transport
     try:
         with _sessions_lock:
             snapshot = list(_sessions.items())
@@ -1208,11 +1273,21 @@ def _(rid, params: dict) -> dict:
     # Keep the natural creation/insertion order from ``_sessions``.  The
     # frontend marks the focused session with ``current``; it should not jump to
     # the top just because the user switched to it.
-    rows = [
-        _session_live_item(sid, session, current)
-        for sid, session in snapshot
-        if not session.get("_finalized")
-    ]
+    rows = []
+    for sid, session in snapshot:
+        if session.get("_finalized"):
+            continue
+        hub = session.get("event_hub")
+        if hub is None and session.get("transport") is _stdio_transport:
+            rows.append(_session_live_item(sid, session, current))
+            continue
+        try:
+            if hub is None:
+                raise PermissionError("transport is not attached")
+            hub.require(transport, "observe")
+        except PermissionError:
+            continue
+        rows.append(_session_live_item(sid, session, current))
     return _ok(rid, {"sessions": rows})
 
 
@@ -1229,13 +1304,36 @@ def _(rid, params: dict) -> dict:
         return err
     assert session is not None
 
+    transport = current_transport() or _stdio_transport
+    hub = session.get("event_hub")
+    if hub is None and session.get("transport") is _stdio_transport:
+        return _ok(
+            rid,
+            _live_session_payload(
+                sid,
+                session,
+                touch=True,
+                transport=None,
+                omit_messages=is_truthy_value(params.get("omit_messages", False)),
+            ),
+        )
+    try:
+        if hub is None:
+            raise PermissionError("transport is not attached")
+        hub.require(transport, "observe")
+    except PermissionError:
+        return _err(rid, 4003, "existing session attachment required")
+
     return _ok(
         rid,
         _live_session_payload(
             sid,
             session,
             touch=True,
-            transport=current_transport() or _stdio_transport,
+            # Activation switches UI focus; it is not an attachment grant.
+            # Preserve the existing mode/capability intersection instead of
+            # applying the payload helper's legacy control-mode default.
+            transport=None,
             omit_messages=is_truthy_value(params.get("omit_messages", False)),
         ),
     )
@@ -3234,6 +3332,7 @@ def _(rid, params: dict) -> dict:
     # unbound, whatever raises inside.
     branch_db = None
     branch_owns_db = False
+    branch_runtime_owner_lease = None
     try:
         # Bind the branched AGENT to the parent's profile, mirroring
         # session.create/resume: home override so config/skills/memory resolve
@@ -3263,6 +3362,9 @@ def _(rid, params: dict) -> dict:
             set_secret_scope(build_profile_secret_scope(Path(parent_home)))
             if parent_home
             else None
+        )
+        branch_runtime_owner_lease = _claim_local_runtime_owner(
+            new_key, Path(parent_home or _hermes_home)
         )
         try:
             tokens = _set_session_context(new_key)
@@ -3301,9 +3403,23 @@ def _(rid, params: dict) -> dict:
                 reset_hermes_home_override(home_token)
         if new_sid in _sessions:
             _sessions[new_sid]["active_session_lease"] = lease
+            _sessions[new_sid]["runtime_owner_lease"] = branch_runtime_owner_lease
     except Exception as e:
-        if lease is not None:
-            lease.release()
+        partial = _sessions.get(new_sid)
+        discarded = (
+            _pop_session_if_current(new_sid, partial) if partial is not None else None
+        )
+        if discarded is not None:
+            if lease is not None:
+                discarded.setdefault("active_session_lease", lease)
+            if branch_runtime_owner_lease is not None:
+                discarded.setdefault("runtime_owner_lease", branch_runtime_owner_lease)
+            _teardown_popped_session(discarded, end_reason="branch_init_failed")
+        else:
+            if lease is not None:
+                lease.release()
+            if branch_runtime_owner_lease is not None:
+                branch_runtime_owner_lease.release()
         return _err(rid, 5000, f"agent init failed on branch: {e}")
     finally:
         if branch_owns_db and branch_db is not None:
@@ -3561,9 +3677,27 @@ def _(rid, params: dict) -> dict:
     text = (params.get("text") or "").strip()
     if not text:
         return _err(rid, 4002, "text is required")
+    client_message_id = params.get("client_message_id")
+    if not isinstance(client_message_id, str) or not client_message_id.strip():
+        client_message_id = None
+    else:
+        client_message_id = client_message_id.strip()[:256]
+    client_identity = _client_message_identity(client_message_id)
     session, err = _sess_nowait(params, rid)
     if err:
         return err
+    with session["history_lock"]:
+        if _client_message_id_is_accepted(
+            session, client_message_id, client_identity
+        ):
+            return _ok(
+                rid,
+                {
+                    "status": "duplicate",
+                    "duplicate": True,
+                    "client_message_id": client_message_id,
+                },
+            )
     agent = session.get("agent")
     if agent is None or not hasattr(agent, "steer"):
         return _err(rid, 4010, "agent does not support steer")
@@ -3577,6 +3711,9 @@ def _(rid, params: dict) -> dict:
         # rebuilds the transcript from the inflight snapshot and the steered
         # text has no user bubble — the "my message vanished on reload" loss.
         with session["history_lock"]:
+            _remember_accepted_client_message_id(
+                session, client_message_id, client_identity
+            )
             _record_inflight_correction(session, text)
             # #84417: steer does not cancel the live original, but a server
             # queue self-copy of that original must still not re-fire after
@@ -3592,19 +3729,51 @@ def _(rid, params: dict) -> dict:
     text = (params.get("text") or "").strip()
     if not text:
         return _err(rid, 4002, "text is required")
+    client_message_id = params.get("client_message_id")
+    if not isinstance(client_message_id, str) or not client_message_id.strip():
+        client_message_id = None
+    else:
+        client_message_id = client_message_id.strip()[:256]
+    client_identity = _client_message_identity(client_message_id)
     session, err = _sess_nowait(params, rid)
     if err:
         return err
-    agent = session.get("agent")
-    # Turn-build window: a fresh turn flips running=True and kicks off an async
-    # agent build, so session["agent"] is briefly None. That is not an
-    # unsupported runtime — queue the correction server-side so it reaches the
-    # model as the next turn, instead of a misleading 4010 the client silently
-    # swallows into a lost follow-up.
-    if agent is None and session.get("running"):
-        _enqueue_prompt(session, text, current_transport() or _stdio_transport)
-        session["last_active"] = time.time()
-        return _ok(rid, {"status": "queued", "text": text})
+    queue_transport = current_transport() or _stdio_transport
+    with session["history_lock"]:
+        if _client_message_id_is_accepted(
+            session, client_message_id, client_identity
+        ):
+            return _ok(
+                rid,
+                {
+                    "status": "duplicate",
+                    "duplicate": True,
+                    "client_message_id": client_message_id,
+                },
+            )
+        agent = session.get("agent")
+        # Turn-build window: a fresh turn flips running=True and kicks off an async
+        # agent build, so session["agent"] is briefly None. That is not an
+        # unsupported runtime — queue the correction server-side so it reaches the
+        # model as the next turn, instead of a misleading 4010 the client silently
+        # swallows into a lost follow-up.
+        if agent is None and session.get("running"):
+            admitted = _enqueue_prompt(
+                session,
+                text,
+                queue_transport,
+                origin_client_id=_legacy_client_id_for_transport(queue_transport),
+                request_id=str(rid),
+                client_message_id=client_message_id,
+                client_identity=client_identity,
+            )
+            if not admitted:
+                return _err(rid, -32002, "busy queue capacity exceeded")
+            _remember_accepted_client_message_id(
+                session, client_message_id, client_identity
+            )
+            session["last_active"] = time.time()
+            return _ok(rid, {"status": "queued", "text": text})
     if (
         agent is None
         or getattr(agent, "_supports_active_turn_redirect", False) is not True
@@ -3617,6 +3786,9 @@ def _(rid, params: dict) -> dict:
         return _err(rid, 5000, f"redirect failed: {exc}")
     if accepted:
         with session["history_lock"]:
+            _remember_accepted_client_message_id(
+                session, client_message_id, client_identity
+            )
             _record_inflight_correction(session, text)
             # #84417: purge server-queue self-duplicates of the live original
             # so post-turn drain cannot restart the pre-correction prompt.
@@ -3637,6 +3809,156 @@ def _(rid, params: dict) -> dict:
     return _ok(rid, {"cols": session["cols"]})
 
 
+@method("client.attach")
+def _(rid, params: dict) -> dict:
+    transport = current_transport() or _stdio_transport
+    protocol_version = params.get("protocol_version", 1)
+    if isinstance(protocol_version, bool) or protocol_version != 1:
+        return _err(rid, -32602, "unsupported protocol_version")
+    surface = params.get("surface", "legacy")
+    if not isinstance(surface, str) or not re.fullmatch(
+        r"[A-Za-z0-9][A-Za-z0-9._:-]{0,63}", surface
+    ):
+        return _err(rid, -32602, "surface must be 1-64 safe identifier characters")
+
+    supported = frozenset({"session.observe", "session.control", "session.replay"})
+    requested = params.get("capabilities")
+    if requested is None:
+        accepted = supported
+    elif (
+        not isinstance(requested, list)
+        or len(requested) > 32
+        or any(
+            not isinstance(item, str) or not item or len(item) > 64
+            for item in requested
+        )
+    ):
+        return _err(rid, -32602, "capabilities must be a list of up to 32 identifiers")
+    else:
+        accepted = supported.intersection(requested)
+
+    from tui_gateway.session_events import ATTACHMENT_MODES
+
+    attachment_capabilities = (
+        ATTACHMENT_MODES["control"]
+        if "session.control" in accepted
+        else ATTACHMENT_MODES["observe"].intersection(
+            {"observe"}
+            if accepted.intersection({"session.observe", "session.replay"})
+            else set()
+        )
+    )
+    negotiated = (1, surface, accepted)
+    existing_negotiated = getattr(transport, "client_negotiation", None)
+    if existing_negotiated is not None and existing_negotiated != negotiated:
+        return _err(rid, 4003, "connection negotiation is already bound")
+    try:
+        client_id, idempotent = _bind_client_identity(
+            transport, params.get("client_id")
+        )
+    except ValueError as exc:
+        return _err(rid, -32602, str(exc))
+    except PermissionError as exc:
+        return _err(rid, 4003, str(exc))
+    except RuntimeError as exc:
+        return _err(rid, 5030, str(exc))
+    transport.client_negotiation = negotiated
+    transport.negotiated_capabilities = frozenset(attachment_capabilities)
+    return _ok(
+        rid,
+        {
+            "protocol_version": 1,
+            "client_id": client_id,
+            "connection_id": str(getattr(transport, "connection_id", "")),
+            "surface": surface,
+            "capabilities": sorted(accepted),
+            "idempotent": idempotent,
+        },
+    )
+
+
+@method("session.attach")
+def _(rid, params: dict) -> dict:
+    sid = str(params.get("session_id") or "")
+    session = _sessions.get(sid)
+    if session is None:
+        return _err(rid, 4007, "session not live")
+    transport = current_transport() or _stdio_transport
+    client_id = getattr(transport, "client_id", None)
+    if not client_id:
+        return _err(rid, 4003, "client.attach required")
+    since = params.get("last_seen_seq", 0)
+    if isinstance(since, bool) or not isinstance(since, int) or since < 0:
+        return _err(rid, -32602, "last_seen_seq must be a non-negative integer")
+    try:
+        hub = _attach_current_transport(
+            sid, session, params.get("mode", "observe"), transport=transport
+        )
+    except ValueError as exc:
+        return _err(rid, -32602, str(exc))
+    snapshot = next(
+        item for item in hub.snapshots() if item["client_id"] == str(client_id)
+    )
+    from tui_gateway import event_replay
+
+    events = event_replay.events_since(sid, since)
+    truncated = event_replay.is_truncated(sid, since)
+    epoch = event_replay.replay_epoch()
+    return _ok(
+        rid,
+        {
+            **snapshot,
+            "session_id": sid,
+            "events": events,
+            "latest_seq": event_replay.latest_seq(sid),
+            "truncated": truncated,
+            "epoch": epoch,
+            "replay_epoch": epoch,
+            "replay": {"events": events, "truncated": truncated},
+        },
+    )
+
+
+@method("session.detach")
+def _(rid, params: dict) -> dict:
+    sid = str(params.get("session_id") or "")
+    session = _sessions.get(sid)
+    if session is None:
+        return _err(rid, 4007, "session not live")
+    transport = current_transport() or _stdio_transport
+    hub = session.get("event_hub")
+    try:
+        if hub is None:
+            raise PermissionError("transport is not attached")
+        hub.require(transport, "observe")
+    except PermissionError:
+        return _err(rid, 4003, "session observe permission required")
+    return _ok(
+        rid,
+        {
+            "session_id": sid,
+            "detached": _detach_transport_from_session(sid, session, transport),
+        },
+    )
+
+
+@method("session.attachments")
+def _(rid, params: dict) -> dict:
+    sid = str(params.get("session_id") or "")
+    session = _sessions.get(sid)
+    if session is None:
+        return _err(rid, 4007, "session not live")
+    transport = current_transport() or _stdio_transport
+    hub = session.get("event_hub")
+    try:
+        if hub is None:
+            raise PermissionError("transport is not attached")
+        hub.require(transport, "prompt.submit")
+    except PermissionError:
+        return _err(rid, 4003, "session control permission required")
+    return _ok(rid, {"session_id": sid, "attachments": hub.snapshots()})
+
+
 @method("session.events.since")
 def _(rid, params: dict) -> dict:
     """Replay recorded events for a session newer than the client's last-seen seq.
@@ -3648,8 +3970,24 @@ def _(rid, params: dict) -> dict:
     the client knows to refetch history instead of silently accepting a gap.
     """
     sid = str(params.get("session_id") or "")
+    session = _sessions.get(sid)
+    if session is None:
+        return _err(rid, 4007, "session not live")
+    hub = session.get("event_hub")
+    transport = current_transport() or _stdio_transport
     try:
-        last_seen = int(params.get("last_seen", 0))
+        if hub is None:
+            raise PermissionError("transport is not attached")
+        hub.require(transport, "observe")
+    except PermissionError:
+        # Do not reveal whether replay exists or any attachment metadata.
+        return _err(rid, 4003, "session observe permission required")
+    try:
+        last_seen = int(
+            params.get(
+                "last_seen", params.get("last_seen_seq", params.get("since_seq", 0))
+            )
+        )
     except (TypeError, ValueError):
         return _err(rid, -32602, "invalid params: last_seen must be an integer")
     from tui_gateway import event_replay
@@ -3666,6 +4004,66 @@ def _(rid, params: dict) -> dict:
         # and reset watermarks on mismatch.
         "epoch": event_replay.replay_epoch(),
     })
+
+
+@method("session.presentation.snapshot")
+def _(rid, params: dict) -> dict:
+    """Return bounded authoritative state for a truncated presentation replay."""
+    sid = str(params.get("session_id") or "")
+    session = _sessions.get(sid)
+    if session is None:
+        return _err(rid, 4007, "session not live")
+    hub = session.get("event_hub")
+    transport = current_transport() or _stdio_transport
+    try:
+        if hub is None:
+            raise PermissionError("transport is not attached")
+        hub.require(transport, "observe")
+    except PermissionError:
+        return _err(rid, 4003, "session observe permission required")
+
+    history_lock = session.get("history_lock")
+    if history_lock is None:
+        history = list(session.get("history") or [])
+    else:
+        with history_lock:
+            history = list(session.get("history") or [])
+    messages = _history_to_messages(history)
+    latest_assistant = None
+    reconcilable = True
+    if messages and messages[-1].get("role") == "assistant":
+        text = messages[-1].get("text")
+        if isinstance(text, str) and text:
+            from tui_gateway import event_replay
+
+            completion = next(
+                (
+                    event
+                    for event in reversed(event_replay.events_since(sid, 0))
+                    if event.get("type") == "message.complete"
+                    and isinstance(event.get("payload"), dict)
+                    and event["payload"].get("text") == text
+                ),
+                None,
+            )
+            completion_seq = completion.get("seq") if completion is not None else None
+            if isinstance(completion_seq, int) and not isinstance(completion_seq, bool):
+                latest_assistant = {
+                    key: messages[-1][key]
+                    for key in ("text", "timestamp", "row_id")
+                    if key in messages[-1]
+                }
+                latest_assistant["completion_seq"] = completion_seq
+            else:
+                reconcilable = False
+    return _ok(
+        rid,
+        {
+            "session_id": sid,
+            "reconcilable": reconcilable,
+            "latest_assistant": latest_assistant,
+        },
+    )
 
 
 @method("session.events.stats")

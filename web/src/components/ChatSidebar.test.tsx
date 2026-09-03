@@ -16,6 +16,7 @@ const apiMocks = vi.hoisted(() => ({
 const gatewayMocks = vi.hoisted(() => {
   const handlers = new Map<string, (event: unknown) => void>();
   return {
+    options: [] as Array<{ onDurableResyncRequired?: (request: unknown) => void }>,
     close: vi.fn(),
     connect: vi.fn(async () => undefined),
     handlers,
@@ -45,6 +46,9 @@ vi.mock("@/lib/dashboard-auth-reload", () => ({
 }));
 vi.mock("@/lib/gatewayClient", () => ({
   GatewayClient: class {
+    constructor(options?: { onDurableResyncRequired?: (request: unknown) => void }) {
+      gatewayMocks.options.push(options ?? {});
+    }
     close = gatewayMocks.close;
     connect = gatewayMocks.connect;
     on = gatewayMocks.on;
@@ -115,6 +119,7 @@ async function render(ui: ReactNode) {
 beforeEach(() => {
   FakeWebSocket.instances = [];
   vi.clearAllMocks();
+  gatewayMocks.options.length = 0;
   apiMocks.buildWsUrl.mockReset();
   apiMocks.buildWsUrl.mockResolvedValue(
     "ws://localhost/api/events?channel=chat-1",
@@ -130,6 +135,24 @@ afterEach(async () => {
 });
 
 describe("ChatSidebar event socket", () => {
+  it("rebuilds the sidecar when durable replay is incomplete", async () => {
+    const { ChatSidebar } = await import("./ChatSidebar");
+
+    await render(<ChatSidebar channel="chat-1" />);
+    expect(gatewayMocks.options).toHaveLength(1);
+    expect(gatewayMocks.options[0].onDurableResyncRequired).toEqual(expect.any(Function));
+
+    await act(async () => {
+      gatewayMocks.options[0].onDurableResyncRequired?.({
+        reason: "replay_truncated",
+        session_id: "sidecar-1",
+      });
+    });
+
+    expect(gatewayMocks.options).toHaveLength(2);
+    expect(gatewayMocks.close).toHaveBeenCalled();
+  });
+
   it("routes loopback 4401 closes through stale-token recovery", async () => {
     const { ChatSidebar } = await import("./ChatSidebar");
 

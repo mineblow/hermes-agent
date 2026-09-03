@@ -295,6 +295,52 @@ def _(rid, params: dict) -> dict:
     # client renders it as a bubble. Whitelisted to "hidden" — display_kind
     # is a DB-only sidecar and this RPC must not mint arbitrary kinds.
     display_kind = "hidden" if params.get("display_kind") == "hidden" else None
+    raw_display_metadata = params.get("display_metadata")
+    display_metadata = (
+        dict(raw_display_metadata) if isinstance(raw_display_metadata, dict) else None
+    )
+    client_message_id = params.get("client_message_id")
+    if not isinstance(client_message_id, str) or not client_message_id.strip():
+        client_message_id = None
+    else:
+        client_message_id = client_message_id.strip()[:256]
+    client_identity = _client_message_identity(client_message_id)
+    raw_display_text = params.get("display_text")
+    display_text = (
+        sanitize_user_prompt_text(raw_display_text)
+        if isinstance(raw_display_text, str)
+        else None
+    )
+    submitted_at = params.get("submitted_at")
+    if not isinstance(submitted_at, (int, float)) or isinstance(submitted_at, bool):
+        submitted_at = None
+    elif not 0 < submitted_at <= 4_102_444_800:
+        # Reject NaN/infinity and implausible dates before JSON event encoding.
+        submitted_at = None
+    attachment_refs = params.get("attachment_refs")
+    if isinstance(attachment_refs, list):
+        attachment_refs = [
+            ref[:4096]
+            for ref in attachment_refs[:128]
+            if isinstance(ref, str) and ref
+        ]
+    else:
+        attachment_refs = None
+    raw_image_paths = params.get("image_paths")
+    if raw_image_paths is None:
+        explicit_image_paths = None
+    elif (
+        isinstance(raw_image_paths, list)
+        and len(raw_image_paths) <= 32
+        and all(isinstance(path, str) and path.strip() for path in raw_image_paths)
+    ):
+        explicit_image_paths = list(raw_image_paths)
+    else:
+        return _err(
+            rid,
+            -32602,
+            "invalid params: image_paths must be a bounded string list",
+        )
     # Typed bare stop phrase while backend voice mode is active ends the
     # voice chat instead of sending "stop" to the agent — the typed twin of
     # the spoken stop phrase (PR #73106), applied at the ONE server-side
@@ -337,6 +383,18 @@ def _(rid, params: dict) -> dict:
         return err
     if (limit_message := _ensure_active_session_slot(sid, session)) is not None:
         return _err(rid, 4090, limit_message)
+    with session["history_lock"]:
+        if _client_message_id_is_accepted(
+            session, client_message_id, client_identity
+        ):
+            return _ok(
+                rid,
+                {
+                    "status": "duplicate",
+                    "duplicate": True,
+                    "client_message_id": client_message_id,
+                },
+            )
     # Which desktop window this message was typed into. Rewritten on every
     # submit, because one session can be driven from the app window and the HUD
     # in turn: a stale "hud" would tell the model the user is still floating
@@ -376,6 +434,16 @@ def _(rid, params: dict) -> dict:
         busy_response = _handle_busy_submit(
             rid, sid, session, text, busy_transport,
             queued=bool(params.get("queued")),
+            busy_policy=params.get("busy_policy"),
+            origin_client_id=_legacy_client_id_for_transport(busy_transport),
+            display_kind=display_kind,
+            display_metadata=display_metadata,
+            client_message_id=client_message_id,
+            client_identity=client_identity,
+            display_text=display_text,
+            submitted_at=submitted_at,
+            attachment_refs=attachment_refs,
+            image_paths=explicit_image_paths,
         )
         if busy_response is not None:
             return busy_response
@@ -809,14 +877,46 @@ def _(rid, params: dict) -> dict:
                             )
             session["history"] = truncated
             session["history_version"] = int(session.get("history_version", 0)) + 1
+        if _client_message_id_is_accepted(
+            session, client_message_id, client_identity
+        ):
+            return _ok(
+                rid,
+                {
+                    "status": "duplicate",
+                    "duplicate": True,
+                    "client_message_id": client_message_id,
+                },
+            )
+        _remember_accepted_client_message_id(
+            session, client_message_id, client_identity
+        )
         session["running"] = True
         session["_turn_cancel_requested"] = False
         session["last_active"] = time.time()
-        _start_inflight_turn(session, text)
+        _start_inflight_turn(
+            session,
+            text,
+            origin_client_id=_legacy_client_id_for_transport(
+                t or session.get("transport")
+            ),
+            request_id=str(rid),
+        )
 
     if turn_isolation:
         isolated_response = _submit_prompt_to_compute_host(
-            rid, sid, session, text, display_kind=display_kind
+            rid,
+            sid,
+            session,
+            text,
+            image_paths=explicit_image_paths,
+            display_kind=display_kind,
+            display_metadata=display_metadata,
+            client_message_id=client_message_id,
+            client_identity=client_identity,
+            display_text=display_text,
+            submitted_at=submitted_at,
+            attachment_refs=attachment_refs,
         )
         if not isolated_response.get("error"):
             if survivor_user_row_ids is not None and requested_rebind_ids is None:
@@ -847,6 +947,9 @@ def _(rid, params: dict) -> dict:
         from hermes_state import is_disk_full_error
 
         with session["history_lock"]:
+            _forget_accepted_client_message_id(
+                session, client_message_id, client_identity
+            )
             session["running"] = False
             session["last_active"] = time.time()
             _clear_inflight_turn(session)
@@ -908,7 +1011,20 @@ def _(rid, params: dict) -> dict:
                     },
                 )
                 return
-        _run_prompt_submit(rid, sid, session, text, display_kind=display_kind)
+        _run_prompt_submit(
+            rid,
+            sid,
+            session,
+            text,
+            image_paths=explicit_image_paths,
+            display_kind=display_kind,
+            display_metadata=display_metadata,
+            client_message_id=client_message_id,
+            client_identity=client_identity,
+            display_text=display_text,
+            submitted_at=submitted_at,
+            attachment_refs=attachment_refs,
+        )
 
     run_thread = threading.Thread(target=run_after_agent_ready, daemon=True)
     # Keep a handle so session.interrupt can tell a live turn from a stuck
@@ -1664,6 +1780,9 @@ def _approval_respond_session_fallback(params: dict):
 
 @method("approval.respond")
 def _(rid, params: dict) -> dict:
+    choice = params.get("choice", "deny")
+    if choice not in {"once", "session", "always", "deny"}:
+        return _err(rid, 4002, "choice must be once, session, always, or deny")
     session, err = _sess(params, rid)
     if err:
         # Session-not-found (4001) only: the client may hold a stale live
@@ -1675,20 +1794,54 @@ def _(rid, params: dict) -> dict:
         session = _approval_respond_session_fallback(params)
         if session is None:
             return err
+    request_id = str(params.get("request_id") or "").strip()
+    if not request_id:
+        return _err(rid, 4002, "request_id is required for approval responses")
     try:
         from tools.approval import resolve_gateway_approval
 
-        return _ok(
-            rid,
-            {
-                "resolved": resolve_gateway_approval(
+        outcome_key = (str(session["session_key"]), request_id)
+        should_emit = False
+        with _approval_resolution_lock:
+            previous_choice = (
+                _approval_resolution_outcomes.get(outcome_key) if request_id else None
+            )
+            if previous_choice is not None:
+                resolved = 0
+                status = "already_resolved"
+                selected_choice = previous_choice
+            else:
+                resolved = resolve_gateway_approval(
                     session["session_key"],
-                    params.get("choice", "deny"),
+                    choice,
                     resolve_all=params.get("all", False),
-                    request_id=params.get("request_id"),
+                    request_id=request_id or None,
                 )
-            },
-        )
+                status = "resolved" if resolved else "expired"
+                selected_choice = choice
+                if resolved and request_id:
+                    _approval_resolution_outcomes[outcome_key] = choice
+                    while (
+                        len(_approval_resolution_outcomes)
+                        > _APPROVAL_RESOLUTION_OUTCOMES_MAX
+                    ):
+                        _approval_resolution_outcomes.pop(
+                            next(iter(_approval_resolution_outcomes))
+                        )
+                    should_emit = True
+        payload = {
+            "request_id": request_id or None,
+            "choice": selected_choice,
+            "status": status,
+            "resolved": resolved,
+        }
+        if should_emit:
+            _emit(
+                "approval.resolved",
+                str(params.get("session_id") or ""),
+                payload,
+            )
+        return _ok(rid, payload)
     except Exception as e:
         return _err(rid, 5004, str(e))
 

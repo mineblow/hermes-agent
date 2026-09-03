@@ -1,3 +1,5 @@
+import { randomUUID } from 'node:crypto'
+
 import type { GatewayClient } from '../gatewayClient.js'
 import type { InputDetectDropResponse, PromptSubmitResponse } from '../gatewayTypes.js'
 import type { Msg } from '../types.js'
@@ -6,6 +8,22 @@ import { turnController } from './turnController.js'
 import { getUiState, patchUiState } from './uiStore.js'
 
 const SESSION_BUSY_RE = /session busy|waiting for model response/i
+const MAX_LOCAL_MESSAGE_IDS = 2000
+const localMessageIds = new Set<string>()
+
+export const isLocalClientMessageId = (id: string) => localMessageIds.has(id)
+
+const rememberLocalMessageId = (id: string) => {
+  localMessageIds.add(id)
+
+  if (localMessageIds.size > MAX_LOCAL_MESSAGE_IDS) {
+    const oldest = localMessageIds.values().next().value
+
+    if (oldest) {
+      localMessageIds.delete(oldest)
+    }
+  }
+}
 
 export const isSessionBusyError = (e: unknown) => e instanceof Error && SESSION_BUSY_RE.test(e.message)
 
@@ -69,9 +87,14 @@ export function submitPrompt(
 
     turnController.clearStatusTimer()
     deps.setLastUserMsg(text)
+    const clientMessageId = randomUUID()
+    const displayedText = displayOverride || displayText
+    const submittedAt = Date.now() / 1000
+
+    rememberLocalMessageId(clientMessageId)
 
     if (show) {
-      deps.appendMessage({ role: 'user', text: displayOverride || displayText })
+      deps.appendMessage({ createdAt: submittedAt, messageId: clientMessageId, role: 'user', text: displayedText })
     }
 
     patchUiState({ busy: true, status: 'running…' })
@@ -79,7 +102,13 @@ export function submitPrompt(
     turnController.interrupted = false
 
     deps.gw
-      .request<PromptSubmitResponse>('prompt.submit', { session_id: liveSid, text: submitText })
+      .request<PromptSubmitResponse>('prompt.submit', {
+        client_message_id: clientMessageId,
+        display_text: displayedText,
+        session_id: liveSid,
+        submitted_at: submittedAt,
+        text: submitText
+      })
       .then(r => {
         // The gateway consumed a typed voice stop phrase server-side (voice
         // chat ended, no turn started) — release the busy latch; the

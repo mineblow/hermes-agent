@@ -123,6 +123,12 @@ class PlatformEntry:
     # "builtin" or "plugin"
     source: str = "plugin"
 
+    # Canonical live-session execution is runner-owned. Registry adapters are
+    # presentation transports attached through the common bridge and must not
+    # create a second runtime owner.
+    live_runtime_presentation_via_runner: bool = True
+    starts_live_runtime: bool = False
+
     # Name of the plugin manifest that registered this entry (empty for
     # built-ins).  Used by ``hermes gateway setup`` to auto-enable the
     # owning plugin when the user configures its platform.

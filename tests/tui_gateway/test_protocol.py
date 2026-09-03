@@ -409,15 +409,17 @@ def test_clarify_batch_resolves_when_all_questions_locked(capture):
     assert json.loads(box["answer"]) == {"answers": {"q0": "alpha", "q1": "beta"}}
 
 
-def test_clarify_batch_answer_update_overwrites_before_completion(server):
+def test_clarify_batch_first_locked_answer_wins(server):
     thread, box, rid = _drain_batch_block(server, ["q0", "q1"])
 
-    server.handle_request({
-        "id": "a1", "method": "clarify.respond",
+    first = server.handle_request({
+        "id": "a1",
+        "method": "clarify.respond",
         "params": {"request_id": rid, "question_id": "q0", "answer": "first"},
     })
-    server.handle_request({
-        "id": "a2", "method": "clarify.respond",
+    second = server.handle_request({
+        "id": "a2",
+        "method": "clarify.respond",
         "params": {"request_id": rid, "question_id": "q0", "answer": "changed"},
     })
     server.handle_request({
@@ -425,8 +427,116 @@ def test_clarify_batch_answer_update_overwrites_before_completion(server):
         "params": {"request_id": rid, "question_id": "q1", "answer": "done"},
     })
 
+    assert first["result"]["status"] == "ok"
+    assert second["result"]["status"] == "already_resolved"
     thread.join(timeout=5)
-    assert json.loads(box["answer"])["answers"]["q0"] == "changed"
+    assert json.loads(box["answer"])["answers"]["q0"] == "first"
+
+
+def test_clarify_first_response_wins_before_waiter_cleanup(server):
+    request_id = "clarify-race"
+    event = threading.Event()
+    with server._prompt_lock:
+        server._pending[request_id] = ("missing-live-session", event)
+    try:
+        first = server.handle_request({
+            "id": "first",
+            "method": "clarify.respond",
+            "params": {"request_id": request_id, "answer": "alpha"},
+        })
+        second = server.handle_request({
+            "id": "second",
+            "method": "clarify.respond",
+            "params": {"request_id": request_id, "answer": "beta"},
+        })
+
+        assert first["result"]["status"] == "ok"
+        assert second["result"]["status"] == "already_resolved"
+        assert server._answers[request_id] == "alpha"
+    finally:
+        with server._prompt_lock:
+            server._pending.pop(request_id, None)
+            server._answers.pop(request_id, None)
+
+
+def test_clarify_winner_emits_one_resolution_event(server, monkeypatch):
+    request_id = "clarify-resolution-event"
+    event = threading.Event()
+    emitted = []
+    monkeypatch.setattr(
+        server,
+        "_emit",
+        lambda event_type, sid, payload=None, **_kwargs: (
+            emitted.append((event_type, sid, payload)) or True
+        ),
+    )
+    with server._prompt_lock:
+        server._pending[request_id] = ("clarify-event-sid", event)
+    try:
+        first = server.handle_request({
+            "id": "winner",
+            "method": "clarify.respond",
+            "params": {"request_id": request_id, "answer": "winner"},
+        })
+        duplicate = server.handle_request({
+            "id": "duplicate",
+            "method": "clarify.respond",
+            "params": {"request_id": request_id, "answer": "loser"},
+        })
+
+        assert first["result"]["status"] == "ok"
+        assert duplicate["result"]["status"] == "already_resolved"
+        assert emitted == [
+            (
+                "clarify.resolved",
+                "clarify-event-sid",
+                {
+                    "request_id": request_id,
+                    "question_id": None,
+                    "status": "resolved",
+                },
+            )
+        ]
+    finally:
+        with server._prompt_lock:
+            server._pending.pop(request_id, None)
+            server._answers.pop(request_id, None)
+
+
+def test_clarify_duplicate_after_waiter_cleanup_is_already_resolved(server):
+    payload = {}
+    box = {}
+
+    def wait_for_answer():
+        box["answer"] = server._block(
+            "clarify.request",
+            "clarify-cleanup-sid",
+            payload,
+            timeout=2,
+        )
+
+    thread = threading.Thread(target=wait_for_answer)
+    thread.start()
+    deadline = time.time() + 2
+    while "request_id" not in payload and time.time() < deadline:
+        time.sleep(0.01)
+    request_id = payload["request_id"]
+
+    first = server.handle_request({
+        "id": "first-cleanup",
+        "method": "clarify.respond",
+        "params": {"request_id": request_id, "answer": "authoritative"},
+    })
+    thread.join(timeout=5)
+    duplicate = server.handle_request({
+        "id": "duplicate-cleanup",
+        "method": "clarify.respond",
+        "params": {"request_id": request_id, "answer": "changed"},
+    })
+
+    assert first["result"]["status"] == "ok"
+    assert box["answer"] == "authoritative"
+    assert duplicate["result"]["status"] == "already_resolved"
 
 
 def test_clarify_batch_empty_answer_is_a_locked_skip(server):
@@ -614,7 +724,12 @@ def test_approval_response_correlates_request_id(server, monkeypatch):
         }
     )
 
-    assert response["result"] == {"resolved": 1}
+    assert response["result"] == {
+        "resolved": 1,
+        "status": "resolved",
+        "request_id": "req-1",
+        "choice": "once",
+    }
     assert calls == [("agent-1", "once", {"resolve_all": False, "request_id": "req-1"})]
 
 
@@ -649,7 +764,12 @@ def test_approval_respond_falls_back_to_request_id_lookup(server, monkeypatch):
         }
     )
 
-    assert response["result"] == {"resolved": 1}
+    assert response["result"] == {
+        "resolved": 1,
+        "status": "resolved",
+        "request_id": "req-91684",
+        "choice": "once",
+    }
     assert calls == [
         ("agent-live", "once", {"resolve_all": False, "request_id": "req-91684"})
     ]
@@ -677,7 +797,12 @@ def test_approval_respond_falls_back_to_stored_session_id(server, monkeypatch):
         }
     )
 
-    assert response["result"] == {"resolved": 1}
+    assert response["result"] == {
+        "resolved": 1,
+        "status": "resolved",
+        "request_id": None,
+        "choice": "deny",
+    }
     assert calls == [
         ("stored-91684", "deny", {"resolve_all": False, "request_id": None})
     ]

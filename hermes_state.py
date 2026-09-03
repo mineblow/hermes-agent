@@ -7946,6 +7946,10 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
         with self._read_ctx() as conn:
             return self._session_turn_lease_key_on_conn(conn, session_id)
 
+    def session_runtime_key(self, session_id: str) -> str:
+        """Return the canonical durable key shared by compression segments."""
+        return self._session_turn_lease_key(session_id)
+
     def try_acquire_session_turn_lease(
         self,
         session_id: str,

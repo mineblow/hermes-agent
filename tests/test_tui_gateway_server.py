@@ -17,6 +17,7 @@ from hermes_cli.active_sessions import active_session_registry_snapshot
 from hermes_cli.browser_connect import ChromeDebugLaunch
 from tools import async_delegation as ad
 from tui_gateway import server
+from tui_gateway.session_events import AttachmentMode
 from tui_gateway.transport import bind_transport, reset_transport
 
 
@@ -35,6 +36,1336 @@ def _dispatch_sync(req: dict, transport=None) -> dict | None:
         return server.handle_request(req)
     finally:
         reset_transport(token)
+
+
+class _LifecycleTransport:
+    """Thread-safe transport used by focused live-session attachment tests."""
+
+    def __init__(self, client_id: str | None):
+        self.client_id = client_id
+        self.connection_id = f"connection-{id(self):x}"
+        self.auth_identity = None
+        self.frames: list[dict] = []
+        self._lock = threading.Lock()
+        self._condition = threading.Condition(self._lock)
+
+    def write(self, obj: dict) -> bool:
+        with self._condition:
+            self.frames.append(obj)
+            self._condition.notify_all()
+        return True
+
+    def close(self) -> None:
+        pass
+
+    def event_types(self) -> list[str]:
+        with self._lock:
+            return [
+                frame.get("params", {}).get("type")
+                for frame in self.frames
+                if frame.get("method") == "event"
+            ]
+
+    def wait_for_event(self, event_type: str) -> dict:
+        with self._condition:
+            assert self._condition.wait_for(
+                lambda: event_type in [
+                    frame.get("params", {}).get("type")
+                    for frame in self.frames
+                    if frame.get("method") == "event"
+                ],
+                timeout=5,
+            ), f"transport did not receive {event_type}"
+            return next(
+                frame
+                for frame in self.frames
+                if frame.get("method") == "event"
+                and frame.get("params", {}).get("type") == event_type
+            )
+
+
+@pytest.mark.parametrize(
+    "event_type",
+    [
+        "message.delta",
+        "message.interim",
+        "reasoning.delta",
+        "thinking.delta",
+        "tool.start",
+        "tool.complete",
+        "agent.terminal.output",
+        "terminal.close",
+        "subagent.start",
+        "subagent.tool",
+        "subagent.complete",
+        "error",
+        "session.usage",
+        "message.complete",
+    ],
+)
+def test_live_event_families_use_one_ordered_multi_client_publisher(event_type):
+    sid = f"event-family-{event_type}"
+    session = _session()
+    left = _LifecycleTransport("event-family-left")
+    right = _LifecycleTransport("event-family-right")
+    hub = server._ensure_session_event_hub(sid, session)
+    hub.attach(left, client_id=left.client_id, mode=AttachmentMode.CONTROL)
+    hub.attach(right, client_id=right.client_id, mode=AttachmentMode.OBSERVE)
+    server._sessions[sid] = session
+    try:
+        server._emit(event_type, sid, {"family": event_type})
+        left_frame = left.wait_for_event(event_type)
+        right_frame = right.wait_for_event(event_type)
+
+        assert left_frame == right_frame
+        assert left_frame["params"]["payload"] == {"family": event_type}
+        assert left_frame["params"]["seq"] > 0
+    finally:
+        server._sessions.pop(sid, None)
+        hub.close()
+
+
+def test_clarification_barrier_fans_out_but_only_controller_can_release_it():
+    sid = "clarification-barrier"
+    session = _session()
+    controller = _LifecycleTransport("clarification-controller")
+    observer = _LifecycleTransport("clarification-observer")
+    hub = server._ensure_session_event_hub(sid, session)
+    hub.attach(controller, client_id=controller.client_id, mode=AttachmentMode.CONTROL)
+    hub.attach(observer, client_id=observer.client_id, mode=AttachmentMode.OBSERVE)
+    server._sessions[sid] = session
+    other_sid = "different-live-session"
+    other_session = _session()
+    other_controller = _LifecycleTransport("different-session-controller")
+    other_hub = server._ensure_session_event_hub(other_sid, other_session)
+    other_hub.attach(
+        other_controller,
+        client_id=other_controller.client_id,
+        mode=AttachmentMode.CONTROL,
+    )
+    server._sessions[other_sid] = other_session
+    result: list[str] = []
+    worker = threading.Thread(
+        target=lambda: result.append(
+            server._block(
+                "clarify.request",
+                sid,
+                {"question": "Deploy?", "choices": ["yes", "no"]},
+                timeout=5,
+            )
+        ),
+        daemon=True,
+    )
+    try:
+        worker.start()
+        request = controller.wait_for_event("clarify.request")
+        request_id = request["params"]["payload"]["request_id"]
+        assert "clarify.request" not in observer.event_types()
+
+        denied = _dispatch_sync(
+            {
+                "id": "observer-answer",
+                "method": "clarify.respond",
+                "params": {"request_id": request_id, "answer": "yes"},
+            },
+            observer,
+        )
+        assert denied is not None and "error" in denied
+        assert worker.is_alive()
+
+        cross_session = _dispatch_sync(
+            {
+                "id": "cross-session-answer",
+                "method": "clarify.respond",
+                "params": {
+                    "session_id": other_sid,
+                    "request_id": request_id,
+                    "answer": "yes",
+                },
+            },
+            other_controller,
+        )
+        assert cross_session is not None and "error" in cross_session
+        assert worker.is_alive()
+
+        accepted = _dispatch_sync(
+            {
+                "id": "controller-answer",
+                "method": "clarify.respond",
+                "params": {"request_id": request_id, "answer": "yes"},
+            },
+            controller,
+        )
+        assert accepted is not None and accepted["result"]["status"] == "ok"
+        worker.join(timeout=5)
+        assert not worker.is_alive()
+        assert result == ["yes"]
+    finally:
+        server._sessions.pop(other_sid, None)
+        other_hub.close()
+        server._sessions.pop(sid, None)
+        hub.close()
+
+
+def test_orphaned_clarification_fails_closed_before_response_mutation():
+    request_id = "orphaned-clarification"
+    event = threading.Event()
+    attacker_sid = "attacker-live-session"
+    attacker_session = _session()
+    attacker = _LifecycleTransport("attacker-controller")
+    attacker_hub = server._ensure_session_event_hub(attacker_sid, attacker_session)
+    attacker_hub.attach(
+        attacker,
+        client_id=attacker.client_id,
+        mode=AttachmentMode.CONTROL,
+    )
+    server._sessions[attacker_sid] = attacker_session
+    with server._prompt_lock:
+        server._pending[request_id] = ("missing-owner-session", event)
+    try:
+        denied = _dispatch_sync(
+            {
+                "id": "orphaned-answer",
+                "method": "clarify.respond",
+                "params": {"request_id": request_id, "answer": "yes"},
+            },
+            attacker,
+        )
+        assert denied is not None and "error" in denied
+        assert denied["error"]["code"] == 4009
+        assert not event.is_set()
+        assert request_id not in server._answers
+    finally:
+        with server._prompt_lock:
+            server._pending.pop(request_id, None)
+            server._answers.pop(request_id, None)
+        server._sessions.pop(attacker_sid, None)
+        attacker_hub.close()
+
+
+def test_clarification_resolution_does_not_wait_for_observer_delivery(monkeypatch):
+    request_id = "clarification-delivery"
+    event = threading.Event()
+    sid = "clarification-delivery-session"
+    session = _session()
+    controller = _LifecycleTransport("clarification-delivery-controller")
+    hub = server._ensure_session_event_hub(sid, session)
+    hub.attach(controller, client_id=controller.client_id, mode=AttachmentMode.CONTROL)
+    server._sessions[sid] = session
+    emissions = []
+    with server._prompt_lock:
+        server._pending[request_id] = (sid, event)
+    monkeypatch.setattr(
+        server,
+        "_emit",
+        lambda *args, **kwargs: emissions.append((args, kwargs)) or False,
+    )
+    try:
+        response = _dispatch_sync(
+            {
+                "id": "clarification-delivery-response",
+                "method": "clarify.respond",
+                "params": {"request_id": request_id, "answer": "yes"},
+            },
+            controller,
+        )
+
+        assert response["result"]["status"] == "ok"
+        assert event.is_set()
+        assert server._answers[request_id] == "yes"
+        assert emissions == [
+            (
+                (
+                    "clarify.resolved",
+                    sid,
+                    {
+                        "request_id": request_id,
+                        "question_id": None,
+                        "status": "resolved",
+                    },
+                ),
+                {},
+            )
+        ]
+    finally:
+        with server._prompt_lock:
+            server._pending.pop(request_id, None)
+            server._answers.pop(request_id, None)
+        server._sessions.pop(sid, None)
+        hub.close()
+
+
+def test_clarification_revalidates_owner_atomically_before_mutation(monkeypatch):
+    request_id = "clarification-owner-race"
+    event = threading.Event()
+    owner_sid = "clarification-race-owner"
+    owner_session = _session()
+    controller = _LifecycleTransport("clarification-race-controller")
+    owner_hub = server._ensure_session_event_hub(owner_sid, owner_session)
+    owner_hub.attach(
+        controller,
+        client_id=controller.client_id,
+        mode=AttachmentMode.CONTROL,
+    )
+    server._sessions[owner_sid] = owner_session
+    with server._prompt_lock:
+        server._pending[request_id] = (owner_sid, event)
+
+    original_authorize = server._authorize_session_rpc
+
+    def authorize_then_remove_owner(rid, method_name, params):
+        result = original_authorize(rid, method_name, params)
+        with server._sessions_lock:
+            server._sessions.pop(owner_sid, None)
+        return result
+
+    monkeypatch.setattr(server, "_authorize_session_rpc", authorize_then_remove_owner)
+    try:
+        denied = _dispatch_sync(
+            {
+                "id": "racing-answer",
+                "method": "clarify.respond",
+                "params": {"request_id": request_id, "answer": "yes"},
+            },
+            controller,
+        )
+        assert denied is not None and "error" in denied
+        assert denied["error"]["code"] == 4009
+        assert not event.is_set()
+        assert request_id not in server._answers
+    finally:
+        with server._prompt_lock:
+            server._pending.pop(request_id, None)
+            server._answers.pop(request_id, None)
+        server._sessions.pop(owner_sid, None)
+        owner_hub.close()
+
+
+def test_approval_request_fans_out_but_only_controller_can_resolve(
+    monkeypatch,
+):
+    from tools import approval
+
+    sid = "approval-barrier"
+    session = _session(session_key="durable-approval-session")
+    controller = _LifecycleTransport("approval-controller")
+    observer = _LifecycleTransport("approval-observer")
+    hub = server._ensure_session_event_hub(sid, session)
+    hub.attach(controller, client_id=controller.client_id, mode=AttachmentMode.CONTROL)
+    hub.attach(observer, client_id=observer.client_id, mode=AttachmentMode.OBSERVE)
+    server._sessions[sid] = session
+    resolutions: list[tuple[str, str, dict]] = []
+    monkeypatch.setattr(
+        approval,
+        "resolve_gateway_approval",
+        lambda key, choice, **kwargs: resolutions.append((key, choice, kwargs)) or 1,
+    )
+    try:
+        server._emit(
+            "approval.request",
+            sid,
+            {"request_id": "approval-request-1", "command": "deploy"},
+        )
+        request = controller.wait_for_event("approval.request")
+        assert request["params"]["payload"]["request_id"] == "approval-request-1"
+        assert "approval.request" not in observer.event_types()
+
+        params = {
+            "session_id": sid,
+            "request_id": "approval-request-1",
+            "choice": "once",
+        }
+        denied = _dispatch_sync(
+            {"id": "observer-approval", "method": "approval.respond", "params": params},
+            observer,
+        )
+        assert denied is not None and "error" in denied
+        assert resolutions == []
+
+        accepted = _dispatch_sync(
+            {
+                "id": "controller-approval",
+                "method": "approval.respond",
+                "params": params,
+            },
+            controller,
+        )
+        assert accepted is not None and accepted["result"]["status"] == "resolved"
+        assert resolutions == [
+            (
+                "durable-approval-session",
+                "once",
+                {"resolve_all": False, "request_id": "approval-request-1"},
+            )
+        ]
+    finally:
+        server._sessions.pop(sid, None)
+        hub.close()
+
+
+def _wait_for_event(transport: _LifecycleTransport, event_type: str) -> None:
+    deadline = time.time() + 1.0
+    while event_type not in transport.event_types() and time.time() < deadline:
+        time.sleep(0.01)
+    assert event_type in transport.event_types()
+
+
+def test_session_create_implicitly_attaches_legacy_transport_as_control(
+    monkeypatch, tmp_path
+):
+    transport = _LifecycleTransport("legacy-window")
+    monkeypatch.setattr(server, "_completion_cwd", lambda params=None: str(tmp_path))
+    monkeypatch.setattr(server, "_schedule_session_cap_enforcement", lambda: None)
+
+    response = _dispatch_sync(
+        {"id": "create", "method": "session.create", "params": {}},
+        transport,
+    )
+    sid = response["result"]["session_id"]
+    session = server._sessions[sid]
+    try:
+        hub = session["event_hub"]
+        assert hub.count() == 1
+        assert hub.has_transport(transport)
+        assert hub.snapshots() == [
+            {
+                "client_id": "legacy-window",
+                "mode": "control",
+                "capabilities": sorted({
+                    "observe",
+                    "prompt.submit",
+                    "session.steer",
+                    "session.interrupt",
+                    "approval.respond",
+                    "clarify.respond",
+                    "ui.respond",
+                }),
+            }
+        ]
+        # Untouched code may still read this compatibility alias.
+        assert session["transport"] is transport
+    finally:
+        server._sessions.pop(sid, None)
+        server._teardown_session(session)
+
+
+def test_live_unpersisted_resume_adds_observer_without_replacing_runtime(
+    monkeypatch, tmp_path
+):
+    class EmptyDB:
+        def get_session(self, _target):
+            return None
+
+        def get_session_by_title(self, _target):
+            return None
+
+    first = _LifecycleTransport("window-a")
+    second = _LifecycleTransport("window-b")
+    monkeypatch.setattr(server, "_completion_cwd", lambda params=None: str(tmp_path))
+    monkeypatch.setattr(server, "_schedule_session_cap_enforcement", lambda: None)
+    monkeypatch.setattr(server, "_get_db", lambda: EmptyDB())
+
+    created = _dispatch_sync(
+        {"id": "create", "method": "session.create", "params": {}}, first
+    )
+    sid = created["result"]["session_id"]
+    session = server._sessions[sid]
+    agent_marker = session["agent_ready"]
+    hub = session["event_hub"]
+    params = {
+        "session_id": created["result"]["stored_session_id"],
+        "attachment_mode": "observe",
+    }
+    try:
+        resumed = _dispatch_sync(
+            {"id": "resume-1", "method": "session.resume", "params": params}, second
+        )
+        repeated = _dispatch_sync(
+            {"id": "resume-2", "method": "session.resume", "params": params}, second
+        )
+
+        assert resumed["result"]["session_id"] == sid
+        assert repeated["result"]["session_id"] == sid
+        assert server._sessions[sid] is session
+        assert session["agent_ready"] is agent_marker
+        assert session["event_hub"] is hub
+        assert hub.count() == 2
+        assert {item["client_id"]: item["mode"] for item in hub.snapshots()} == {
+            "window-a": "control",
+            "window-b": "observe",
+        }
+        # Compatibility remains last-attached while ownership lives in the hub.
+        assert session["transport"] is second
+
+        server._emit("lifecycle.probe", sid, {"ok": True})
+        _wait_for_event(first, "lifecycle.probe")
+        _wait_for_event(second, "lifecycle.probe")
+    finally:
+        server._sessions.pop(sid, None)
+        server._teardown_session(session)
+
+
+def test_init_and_deferred_runtime_records_get_one_implicit_hub(monkeypatch, tmp_path):
+    init_transport = _LifecycleTransport("compute-host")
+    deferred_transport = _LifecycleTransport("lazy-window")
+    monkeypatch.setattr(server, "_get_db", lambda: None)
+    monkeypatch.setattr(server, "_register_session_cwd", lambda _session: None)
+    monkeypatch.setattr(server, "_wire_callbacks", lambda _sid: None)
+    monkeypatch.setattr(server, "_start_notification_poller", lambda *_args: None)
+    monkeypatch.setattr(server, "_notify_session_boundary", lambda *_args: None)
+    monkeypatch.setattr(server, "_schedule_mcp_late_refresh", lambda *_args: None)
+    monkeypatch.setattr(server, "_session_info", lambda *_args: {})
+    agent = types.SimpleNamespace()
+
+    token = bind_transport(init_transport)
+    try:
+        server._init_session("init-sid", "init-key", agent, [], cwd=str(tmp_path))
+    finally:
+        reset_transport(token)
+    initialized = server._sessions["init-sid"]
+
+    token = bind_transport(deferred_transport)
+    try:
+        deferred = server._deferred_session_record(
+            "lazy-sid",
+            "lazy-key",
+            cols=80,
+            cwd=str(tmp_path),
+            history=[],
+            lease=None,
+            lazy=True,
+        )
+    finally:
+        reset_transport(token)
+
+    try:
+        assert initialized["event_hub"].count() == 1
+        assert initialized["event_hub"].has_transport(init_transport)
+        assert initialized["transport"] is init_transport
+        assert deferred["event_hub"].count() == 1
+        assert deferred["event_hub"].has_transport(deferred_transport)
+        assert deferred["transport"] is deferred_transport
+    finally:
+        server._sessions.pop("init-sid", None)
+        server._teardown_session(initialized)
+        server._teardown_session(deferred)
+
+
+def test_session_events_since_requires_attached_observer():
+    from tui_gateway import event_replay
+
+    owner = _LifecycleTransport("owner")
+    stranger = _LifecycleTransport("stranger")
+    session = {
+        "history_lock": threading.Lock(),
+        "transport": owner,
+    }
+    hub = server._attach_current_transport(
+        "private-sid", session, "observe", transport=owner
+    )
+    server._sessions["private-sid"] = session
+    try:
+        server._emit("message.delta", "private-sid", {"text": "TOP_SECRET"})
+        _wait_for_event(owner, "message.delta")
+
+        denied = _dispatch_sync(
+            {
+                "id": "denied",
+                "method": "session.events.since",
+                "params": {"session_id": "private-sid", "last_seen_seq": 0},
+            },
+            stranger,
+        )
+        assert denied["error"]["code"] == 4003
+        assert "TOP_SECRET" not in json.dumps(denied)
+
+        allowed = _dispatch_sync(
+            {
+                "id": "allowed",
+                "method": "session.events.since",
+                "params": {"session_id": "private-sid", "last_seen_seq": 0},
+            },
+            owner,
+        )
+        assert allowed["result"]["events"][0]["payload"]["text"] == "TOP_SECRET"
+        assert hub.require(owner, "observe") is None
+    finally:
+        server._sessions.pop("private-sid", None)
+        server._teardown_session(session)
+        event_replay.release_session("private-sid")
+
+
+def test_presentation_snapshot_is_bounded_and_observer_authorized():
+    from tui_gateway import event_replay
+
+    owner = _LifecycleTransport("owner")
+    stranger = _LifecycleTransport("stranger")
+    session = {
+        "history_lock": threading.Lock(),
+        "history": [
+            {"role": "user", "content": "secret prompt"},
+            {"role": "assistant", "content": "authoritative final", "_row_id": 7},
+        ],
+        "transport": owner,
+    }
+    server._attach_current_transport(
+        "snapshot-sid", session, "observe", transport=owner
+    )
+    server._sessions["snapshot-sid"] = session
+    try:
+        server._emit(
+            "message.complete",
+            "snapshot-sid",
+            {"text": "authoritative final"},
+        )
+        _wait_for_event(owner, "message.complete")
+        denied = _dispatch_sync(
+            {
+                "id": "denied",
+                "method": "session.presentation.snapshot",
+                "params": {"session_id": "snapshot-sid"},
+            },
+            stranger,
+        )
+        assert denied["error"]["code"] == 4003
+        assert "authoritative final" not in json.dumps(denied)
+
+        allowed = _dispatch_sync(
+            {
+                "id": "allowed",
+                "method": "session.presentation.snapshot",
+                "params": {"session_id": "snapshot-sid"},
+            },
+            owner,
+        )
+        assert allowed["result"] == {
+            "session_id": "snapshot-sid",
+            "reconcilable": True,
+            "latest_assistant": {
+                "text": "authoritative final",
+                "row_id": 7,
+                "completion_seq": 1,
+            },
+        }
+    finally:
+        server._sessions.pop("snapshot-sid", None)
+        server._teardown_session(session)
+        event_replay.release_session("snapshot-sid")
+
+
+def test_client_attach_is_idempotent_and_connection_bound():
+    transport = _LifecycleTransport(None)
+
+    first = _dispatch_sync(
+        {
+            "id": "identity-1",
+            "method": "client.attach",
+            "params": {"client_id": "desktop-window-7"},
+        },
+        transport,
+    )
+    repeated = _dispatch_sync(
+        {
+            "id": "identity-2",
+            "method": "client.attach",
+            "params": {"client_id": "desktop-window-7"},
+        },
+        transport,
+    )
+    rebound = _dispatch_sync(
+        {
+            "id": "identity-3",
+            "method": "client.attach",
+            "params": {"client_id": "different-window"},
+        },
+        transport,
+    )
+
+    assert first["result"]["client_id"] == "desktop-window-7"
+    assert first["result"]["connection_id"] == transport.connection_id
+    assert first["result"]["idempotent"] is False
+    assert repeated["result"]["idempotent"] is True
+    assert rebound["error"]["code"] == 4003
+    assert transport.client_id == "desktop-window-7"
+
+
+def test_client_principal_registry_evicts_only_inactive_lru(monkeypatch):
+    active_transport = _LifecycleTransport(None)
+    active_transport.auth_identity = {"sub": "principal-a"}
+    inactive_transport = _LifecycleTransport(None)
+    inactive_transport.auth_identity = {"sub": "principal-a"}
+    newcomer = _LifecycleTransport(None)
+    newcomer.auth_identity = {"sub": "principal-a"}
+    attacker = _LifecycleTransport(None)
+    attacker.auth_identity = {"sub": "principal-b"}
+    session = {"history_lock": threading.Lock(), "transport": active_transport}
+    with server._client_identity_lock:
+        saved = dict(server._client_principals)
+        server._client_principals.clear()
+    monkeypatch.setattr(server, "_CLIENT_IDENTITIES_MAX", 2)
+    try:
+        server._bind_client_identity(active_transport, "active-client")
+        server._bind_client_identity(inactive_transport, "inactive-client")
+        server._attach_current_transport(
+            "principal-registry-sid",
+            session,
+            "control",
+            transport=active_transport,
+        )
+        server._sessions["principal-registry-sid"] = session
+
+        server._bind_client_identity(newcomer, "new-client")
+
+        with server._client_identity_lock:
+            assert set(server._client_principals) == {
+                "active-client",
+                "new-client",
+            }
+        with pytest.raises(PermissionError, match="another principal"):
+            server._bind_client_identity(attacker, "active-client")
+    finally:
+        server._sessions.pop("principal-registry-sid", None)
+        server._teardown_session(session)
+        with server._client_identity_lock:
+            server._client_principals.clear()
+            server._client_principals.update(saved)
+
+
+def test_client_capability_negotiation_intersects_session_mode():
+    owner = _LifecycleTransport("capability-owner")
+    negotiated = _LifecycleTransport(None)
+    session = {"history_lock": threading.Lock(), "transport": owner}
+    server._attach_current_transport(
+        "negotiated-sid", session, "control", transport=owner
+    )
+    server._sessions["negotiated-sid"] = session
+    try:
+        identity = _dispatch_sync(
+            {
+                "id": "negotiate-client",
+                "method": "client.attach",
+                "params": {
+                    "client_id": "negotiated-client",
+                    "capabilities": ["session.observe", "session.replay", "made.up"],
+                },
+            },
+            negotiated,
+        )
+        attached = _dispatch_sync(
+            {
+                "id": "negotiate-session",
+                "method": "session.attach",
+                "params": {"session_id": "negotiated-sid", "mode": "control"},
+            },
+            negotiated,
+        )
+
+        assert identity["result"]["capabilities"] == [
+            "session.observe",
+            "session.replay",
+        ]
+        assert attached["result"]["capabilities"] == ["observe"]
+        with pytest.raises(PermissionError):
+            session["event_hub"].require(negotiated, "prompt.submit")
+        assert session["event_hub"].require(negotiated, "observe") is None
+    finally:
+        server._sessions.pop("negotiated-sid", None)
+        server._teardown_session(session)
+
+
+def test_explicit_attach_list_and_detach_are_transport_scoped(monkeypatch, tmp_path):
+    controller = _LifecycleTransport("controller")
+    observer = _LifecycleTransport(None)
+    stranger = _LifecycleTransport(None)
+    monkeypatch.setattr(server, "_completion_cwd", lambda params=None: str(tmp_path))
+    monkeypatch.setattr(server, "_schedule_session_cap_enforcement", lambda: None)
+    created = _dispatch_sync(
+        {"id": "create-explicit", "method": "session.create", "params": {}}, controller
+    )
+    sid = created["result"]["session_id"]
+    session = server._sessions[sid]
+    try:
+        _dispatch_sync(
+            {
+                "id": "client-observer",
+                "method": "client.attach",
+                "params": {"client_id": "observer-window"},
+            },
+            observer,
+        )
+        attached = _dispatch_sync(
+            {
+                "id": "attach-observer",
+                "method": "session.attach",
+                "params": {"session_id": sid, "mode": "observe"},
+            },
+            observer,
+        )
+        observer_list = _dispatch_sync(
+            {
+                "id": "list-observer",
+                "method": "session.attachments",
+                "params": {"session_id": sid},
+            },
+            observer,
+        )
+        listed = _dispatch_sync(
+            {
+                "id": "list-controller",
+                "method": "session.attachments",
+                "params": {"session_id": sid},
+            },
+            controller,
+        )
+        denied = _dispatch_sync(
+            {
+                "id": "list-stranger",
+                "method": "session.attachments",
+                "params": {"session_id": sid},
+            },
+            stranger,
+        )
+        detached = _dispatch_sync(
+            {
+                "id": "detach-observer",
+                "method": "session.detach",
+                "params": {"session_id": sid},
+            },
+            observer,
+        )
+
+        assert attached["result"]["mode"] == "observe"
+        assert attached["result"]["replay"] == {
+            "events": attached["result"]["events"],
+            "truncated": attached["result"]["truncated"],
+        }
+        assert attached["result"]["replay_epoch"] == attached["result"]["epoch"]
+        assert observer_list["error"]["code"] == 4003
+        assert {row["client_id"] for row in listed["result"]["attachments"]} == {
+            "controller",
+            "observer-window",
+        }
+        assert denied["error"]["code"] == 4003
+        assert detached["result"]["detached"] is True
+        assert session["event_hub"].count() == 1
+        assert session["event_hub"].has_transport(controller)
+    finally:
+        server._sessions.pop(sid, None)
+        server._teardown_session(session)
+
+
+def test_explicit_last_attachment_detach_starts_orphan_policy(monkeypatch):
+    controller = _LifecycleTransport("explicit-last-controller")
+    session = {"history_lock": threading.Lock(), "transport": controller}
+    server._attach_current_transport(
+        "explicit-last-sid", session, "control", transport=controller
+    )
+    server._sessions["explicit-last-sid"] = session
+    scheduled = []
+    monkeypatch.setattr(
+        server, "_schedule_ws_orphan_reap", lambda sid: scheduled.append(sid)
+    )
+    try:
+        response = _dispatch_sync(
+            {
+                "id": "explicit-last-detach",
+                "method": "session.detach",
+                "params": {"session_id": "explicit-last-sid"},
+            },
+            controller,
+        )
+        assert response["result"]["detached"] is True
+        assert session["event_hub"].count() == 0
+        assert session["transport"] is server._detached_ws_transport
+        assert scheduled == ["explicit-last-sid"]
+    finally:
+        server._sessions.pop("explicit-last-sid", None)
+        server._teardown_session(session)
+
+
+@pytest.mark.parametrize("watermark", ["not-an-integer", -1, True])
+def test_session_attach_rejects_invalid_replay_watermark(watermark):
+    owner = _LifecycleTransport("watermark-owner")
+    client = _LifecycleTransport(None)
+    session = {"history_lock": threading.Lock(), "transport": owner}
+    server._attach_current_transport(
+        "watermark-sid", session, "control", transport=owner
+    )
+    server._sessions["watermark-sid"] = session
+    try:
+        _dispatch_sync(
+            {
+                "id": "watermark-client",
+                "method": "client.attach",
+                "params": {"client_id": "watermark-client"},
+            },
+            client,
+        )
+        response = _dispatch_sync(
+            {
+                "id": "watermark-attach",
+                "method": "session.attach",
+                "params": {
+                    "session_id": "watermark-sid",
+                    "mode": "observe",
+                    "last_seen_seq": watermark,
+                },
+            },
+            client,
+        )
+        assert response["error"]["code"] == -32602
+    finally:
+        server._sessions.pop("watermark-sid", None)
+        server._teardown_session(session)
+
+
+@pytest.mark.parametrize(
+    ("rpc_method", "capability"),
+    [
+        ("prompt.submit", "prompt.submit"),
+        ("session.steer", "session.steer"),
+        ("session.redirect", "session.steer"),
+        ("session.interrupt", "session.interrupt"),
+        ("approval.respond", "approval.respond"),
+        ("clarify.respond", "clarify.respond"),
+        ("terminal.read.respond", "ui.respond"),
+        ("preview.read.respond", "ui.respond"),
+        ("preview.act.respond", "ui.respond"),
+        ("window.read.respond", "ui.respond"),
+        ("tour.respond", "ui.respond"),
+        ("mcp.setup.respond", "ui.respond"),
+        ("sudo.respond", "ui.respond"),
+        ("secret.respond", "ui.respond"),
+        ("session.close", "session.steer"),
+        ("session.undo", "session.steer"),
+        ("session.branch", "session.steer"),
+        ("prompt.background", "session.steer"),
+        ("image.attach", "session.steer"),
+        ("image.attach_bytes", "session.steer"),
+        ("pdf.attach", "session.steer"),
+        ("file.attach", "session.steer"),
+        ("image.detach", "session.steer"),
+    ],
+)
+def test_dispatch_enforces_attachment_capability_before_handler(rpc_method, capability):
+    observer = _LifecycleTransport(f"observer-{rpc_method}")
+    controller = _LifecycleTransport(f"controller-{rpc_method}")
+    session = {"history_lock": threading.Lock(), "transport": controller}
+    hub = server._attach_current_transport(
+        "capability-sid", session, "control", transport=controller
+    )
+    hub.attach(
+        observer,
+        client_id=observer.client_id,
+        mode=AttachmentMode.OBSERVE,
+    )
+    server._sessions["capability-sid"] = session
+    calls = []
+    original = server._methods[rpc_method]
+    server._methods[rpc_method] = lambda rid, params: (
+        calls.append((rid, params, capability)) or server._ok(rid, {"called": True})
+    )
+    try:
+        denied = _dispatch_sync(
+            {
+                "id": "denied-capability",
+                "method": rpc_method,
+                "params": {"session_id": "capability-sid"},
+            },
+            observer,
+        )
+        assert denied["error"]["code"] == 4003
+        assert calls == []
+
+        allowed = _dispatch_sync(
+            {
+                "id": "allowed-capability",
+                "method": rpc_method,
+                "params": {"session_id": "capability-sid"},
+            },
+            controller,
+        )
+        assert allowed["result"]["called"] is True
+        assert len(calls) == 1
+    finally:
+        server._methods[rpc_method] = original
+        server._sessions.pop("capability-sid", None)
+        server._teardown_session(session)
+
+
+def test_explicit_canonical_interrupt_overrides_local_busy_policy(monkeypatch):
+    session = {
+        "history_lock": threading.Lock(),
+        "running": True,
+        "agent": object(),
+        "accepted_client_message_ids": ["message-1"],
+    }
+    interrupted = []
+    monkeypatch.setattr(server, "_load_busy_input_mode", lambda: "queue")
+    monkeypatch.setattr(
+        server,
+        "_interrupt_busy_session",
+        lambda sid, current, agent: interrupted.append((sid, current, agent)),
+    )
+
+    response = server._handle_busy_submit(
+        "request-1",
+        "sid",
+        session,
+        "replacement",
+        None,
+        busy_policy="interrupt",
+        client_message_id="message-1",
+    )
+
+    assert response["result"]["status"] == "queued"
+    assert session["queued_prompt"]["text"] == "replacement"
+    assert interrupted == [("sid", session, session["agent"])]
+
+
+def test_explicit_canonical_reject_does_not_queue_or_consume_identity():
+    session = {
+        "history_lock": threading.Lock(),
+        "running": True,
+        "agent": object(),
+        "accepted_client_message_ids": ["message-1"],
+    }
+
+    response = server._handle_busy_submit(
+        "request-1",
+        "sid",
+        session,
+        "replacement",
+        None,
+        busy_policy="reject",
+        client_message_id="message-1",
+    )
+
+    assert response["error"]["message"] == "session busy"
+    assert "queued_prompt" not in session
+    assert session["accepted_client_message_ids"] == []
+
+
+def test_busy_queue_preserves_durable_user_metadata_and_message_identity(monkeypatch):
+    session = {
+        "history_lock": threading.Lock(),
+        "running": False,
+        "inflight_turn": {"user": "repeat me"},
+    }
+    metadata = {
+        "display_kind": "hidden",
+        "display_metadata": {"platform": "discord", "user_id": "user-1"},
+        "display_text": "Repeat me",
+        "submitted_at": 1_725_000_000.5,
+        "attachment_refs": ["attachment://one"],
+    }
+
+    server._enqueue_prompt(
+        session,
+        "repeat me",
+        None,
+        ["/tmp/image-one.png"],
+        origin_client_id="client-a",
+        request_id="request-a",
+        client_message_id="message-a",
+        **metadata,
+    )
+    server._enqueue_prompt(
+        session,
+        "repeat me",
+        None,
+        ["/tmp/image-one.png"],
+        origin_client_id="client-a",
+        request_id="request-b",
+        client_message_id="message-b",
+        **metadata,
+    )
+    # A transport retry is idempotent by stable message identity.
+    server._enqueue_prompt(
+        session,
+        "repeat me",
+        None,
+        ["/tmp/image-one.png"],
+        origin_client_id="client-a",
+        request_id="request-b-retry",
+        client_message_id="message-b",
+        **metadata,
+    )
+
+    assert session["queued_prompt"]["client_message_id"] == "message-a"
+    assert [entry["client_message_id"] for entry in session["queued_prompts"]] == [
+        "message-b"
+    ]
+
+    captured = []
+    monkeypatch.setattr(server, "_session_uses_compute_host", lambda _session: False)
+    monkeypatch.setattr(
+        server,
+        "_run_prompt_submit",
+        lambda *args, **kwargs: captured.append((args, kwargs)),
+    )
+
+    assert server._drain_queued_prompt("drain", "sid", session) is True
+    kwargs = captured[0][1]
+    assert kwargs["client_message_id"] == "message-a"
+    assert kwargs["display_kind"] == "hidden"
+    assert kwargs["display_metadata"] == {
+        "platform": "discord",
+        "user_id": "user-1",
+    }
+    assert kwargs["display_text"] == "Repeat me"
+    assert kwargs["submitted_at"] == 1_725_000_000.5
+    assert kwargs["attachment_refs"] == ["attachment://one"]
+    assert kwargs["image_paths"] == ["/tmp/image-one.png"]
+
+
+def test_accepted_client_message_identity_hydrates_from_durable_history():
+    session = {
+        "history": [
+            {
+                "role": "user",
+                "content": "hello",
+                "_db_persisted": True,
+                "display_metadata": {"client_message_id": "durable-message-1"},
+            }
+        ]
+    }
+
+    assert server._client_message_id_is_accepted(
+        session, "durable-message-1"
+    ) is True
+    assert session["accepted_client_message_ids"] == ["durable-message-1"]
+    assert server._client_message_id_is_accepted(session, "new-message") is False
+
+
+def test_mutating_rpc_ingress_is_serialized_per_live_runtime():
+    first_controller = _LifecycleTransport("serialized-first")
+    second_controller = _LifecycleTransport("serialized-second")
+    session = {"history_lock": threading.Lock(), "transport": first_controller}
+    hub = server._attach_current_transport(
+        "serialized-sid", session, "control", transport=first_controller
+    )
+    hub.attach(
+        second_controller,
+        client_id=second_controller.client_id,
+        mode=AttachmentMode.CONTROL,
+    )
+    server._sessions["serialized-sid"] = session
+    first_entered = threading.Event()
+    release_first = threading.Event()
+    second_entered = threading.Event()
+    call_order = []
+    original = server._methods["session.steer"]
+
+    def handler(rid, params):
+        call_order.append(rid)
+        if rid == "first-control":
+            first_entered.set()
+            assert release_first.wait(timeout=3)
+        else:
+            second_entered.set()
+        return server._ok(rid, {"called": True})
+
+    server._methods["session.steer"] = handler
+    first_result = {}
+    second_result = {}
+
+    def invoke(target, rid, result):
+        result["response"] = _dispatch_sync(
+            {
+                "id": rid,
+                "method": "session.steer",
+                "params": {"session_id": "serialized-sid"},
+            },
+            target,
+        )
+
+    first_thread = threading.Thread(
+        target=invoke,
+        args=(first_controller, "first-control", first_result),
+    )
+    second_thread = threading.Thread(
+        target=invoke,
+        args=(second_controller, "second-control", second_result),
+    )
+    try:
+        first_thread.start()
+        assert first_entered.wait(timeout=3)
+        second_thread.start()
+        assert not second_entered.wait(timeout=0.2)
+        release_first.set()
+        first_thread.join(timeout=3)
+        second_thread.join(timeout=3)
+        assert call_order == ["first-control", "second-control"]
+        assert first_result["response"]["result"]["called"] is True
+        assert second_result["response"]["result"]["called"] is True
+    finally:
+        release_first.set()
+        first_thread.join(timeout=3)
+        second_thread.join(timeout=3)
+        server._methods["session.steer"] = original
+        server._sessions.pop("serialized-sid", None)
+        server._teardown_session(session)
+
+
+def test_approval_response_reports_atomic_winner_and_duplicate(monkeypatch):
+    controller = _LifecycleTransport("approval-race-controller")
+    session = {
+        "history_lock": threading.Lock(),
+        "transport": controller,
+        "session_key": "approval-race-key",
+    }
+    server._attach_current_transport(
+        "approval-race-sid", session, "control", transport=controller
+    )
+    server._sessions["approval-race-sid"] = session
+    outcomes = iter((1, 0))
+    emitted = []
+    monkeypatch.setattr(
+        "tools.approval.resolve_gateway_approval",
+        lambda *args, **kwargs: next(outcomes),
+    )
+    monkeypatch.setattr(
+        server,
+        "_emit",
+        lambda *args, **kwargs: emitted.append(args) or True,
+    )
+    try:
+        request = {
+            "method": "approval.respond",
+            "params": {
+                "session_id": "approval-race-sid",
+                "request_id": "approval-request-1",
+                "choice": "once",
+            },
+        }
+        first = _dispatch_sync({"id": "approval-first", **request}, controller)
+        second = _dispatch_sync({"id": "approval-second", **request}, controller)
+
+        assert first["result"]["status"] == "resolved"
+        assert second["result"]["status"] == "already_resolved"
+        assert first["result"]["choice"] == second["result"]["choice"] == "once"
+        assert [args[0] for args in emitted] == ["approval.resolved"]
+    finally:
+        server._sessions.pop("approval-race-sid", None)
+        server._teardown_session(session)
+
+
+def test_approval_resolution_success_does_not_wait_for_observer_delivery(monkeypatch):
+    controller = _LifecycleTransport("approval-delivery-controller")
+    session = {
+        "history_lock": threading.Lock(),
+        "transport": controller,
+        "session_key": "approval-delivery-key",
+    }
+    server._attach_current_transport(
+        "approval-delivery-sid", session, "control", transport=controller
+    )
+    server._sessions["approval-delivery-sid"] = session
+    emissions = []
+    monkeypatch.setattr("tools.approval.resolve_gateway_approval", lambda *_a, **_k: 1)
+    monkeypatch.setattr(
+        server,
+        "_emit",
+        lambda *args, **kwargs: emissions.append((args, kwargs)) or False,
+    )
+    try:
+        response = _dispatch_sync(
+            {
+                "id": "approval-delivery",
+                "method": "approval.respond",
+                "params": {
+                    "session_id": "approval-delivery-sid",
+                    "request_id": "approval-delivery-request",
+                    "choice": "once",
+                },
+            },
+            controller,
+        )
+
+        assert response["result"]["status"] == "resolved"
+        assert emissions[0][1].get("wait_for_delivery") is not True
+    finally:
+        server._sessions.pop("approval-delivery-sid", None)
+        server._teardown_session(session)
+
+
+def test_approval_respond_requires_request_id_for_live_session(monkeypatch):
+    controller = _LifecycleTransport("approval-id-controller")
+    session = {
+        "history_lock": threading.Lock(),
+        "transport": controller,
+        "session_key": "approval-id-key",
+    }
+    server._attach_current_transport(
+        "approval-id-sid", session, "control", transport=controller
+    )
+    server._sessions["approval-id-sid"] = session
+    resolved = []
+    monkeypatch.setattr(
+        "tools.approval.resolve_gateway_approval",
+        lambda *args, **kwargs: resolved.append((args, kwargs)) or 1,
+    )
+    try:
+        response = _dispatch_sync(
+            {
+                "id": "missing-approval-id",
+                "method": "approval.respond",
+                "params": {
+                    "session_id": "approval-id-sid",
+                    "choice": "once",
+                },
+            },
+            controller,
+        )
+
+        assert response["error"]["code"] == 4002
+        assert "request_id" in response["error"]["message"]
+        assert resolved == []
+    finally:
+        server._sessions.pop("approval-id-sid", None)
+        server._teardown_session(session)
+
+
+def test_approval_respond_rejects_choice_outside_protocol_allowlist():
+    controller = _LifecycleTransport("approval-choice-controller")
+    session = {
+        "history_lock": threading.Lock(),
+        "transport": controller,
+        "session_key": "approval-choice-key",
+    }
+    server._attach_current_transport(
+        "approval-choice-sid", session, "control", transport=controller
+    )
+    server._sessions["approval-choice-sid"] = session
+    try:
+        response = _dispatch_sync(
+            {
+                "id": "invalid-approval-choice",
+                "method": "approval.respond",
+                "params": {
+                    "session_id": "approval-choice-sid",
+                    "choice": "yes",
+                },
+            },
+            controller,
+        )
+        assert response["error"]["code"] == 4002
+        assert "once, session, always, or deny" in response["error"]["message"]
+    finally:
+        server._sessions.pop("approval-choice-sid", None)
+        server._teardown_session(session)
+
+
+def test_teardown_closes_session_event_hub():
+    transport = _LifecycleTransport("closing-window")
+    session = {"transport": transport}
+    hub = server._attach_current_transport("close-sid", session, "control")
+
+    server._teardown_session(session)
+
+    assert hub.count() == 0
+    assert hub.publish({"jsonrpc": "2.0", "method": "event", "params": {}}) is False
 
 
 @pytest.fixture(autouse=True)
@@ -1091,6 +2422,157 @@ def test_write_json_drops_detached_ws_frames(monkeypatch):
         assert out.parts == []
     finally:
         server._sessions.pop("detached-sid", None)
+
+
+def test_write_json_fans_out_one_stamped_order_to_all_session_attachments():
+    from tui_gateway import event_replay
+    from tui_gateway.session_events import AttachmentMode, SessionEventHub
+
+    class _RecordingTransport:
+        def __init__(self):
+            self.frames = []
+            self.condition = threading.Condition()
+
+        def write(self, frame):
+            with self.condition:
+                self.frames.append(frame)
+                self.condition.notify_all()
+            return True
+
+        def wait_for_count(self, count):
+            with self.condition:
+                assert self.condition.wait_for(
+                    lambda: len(self.frames) >= count,
+                    timeout=5,
+                )
+
+    sid = "multi-client-order"
+    event_replay.reset_replay_state()
+    hub = SessionEventHub()
+    left = _RecordingTransport()
+    right = _RecordingTransport()
+    hub.attach(left, client_id="left", mode=AttachmentMode.CONTROL)
+    hub.attach(right, client_id="right", mode=AttachmentMode.OBSERVE)
+    server._sessions[sid] = {"event_hub": hub, "transport": left}
+    start = threading.Barrier(3)
+
+    def _publish(source):
+        start.wait(timeout=5)
+        for index in range(20):
+            assert server.write_json({
+                "jsonrpc": "2.0",
+                "method": "event",
+                "params": {
+                    "type": "message.delta",
+                    "session_id": sid,
+                    "payload": {"source": source, "index": index},
+                },
+            })
+
+    try:
+        workers = [
+            threading.Thread(target=_publish, args=(source,)) for source in ("a", "b")
+        ]
+        for worker in workers:
+            worker.start()
+        start.wait(timeout=5)
+        for worker in workers:
+            worker.join(timeout=5)
+            assert not worker.is_alive()
+
+        left.wait_for_count(40)
+        right.wait_for_count(40)
+
+        assert left.frames == right.frames
+        assert [frame["params"]["seq"] for frame in left.frames] == list(range(1, 41))
+        assert {frame["params"]["epoch"] for frame in left.frames} == {
+            event_replay.replay_epoch()
+        }
+        replayed = event_replay.events_since(sid, 0)
+        assert [event["seq"] for event in replayed] == list(range(1, 41))
+        assert {event["epoch"] for event in replayed} == {event_replay.replay_epoch()}
+    finally:
+        hub.close()
+        server._sessions.pop(sid, None)
+        event_replay.reset_replay_state()
+
+
+def test_write_json_keeps_legacy_delivery_in_replay_sequence_order():
+    from tui_gateway import event_replay
+
+    class _LegacyRaceTransport:
+        def __init__(self):
+            self.first_entered = threading.Event()
+            self.release_first = threading.Event()
+            self.frames: list[dict] = []
+            self.lock = threading.Lock()
+
+        def write(self, obj):
+            seq = obj["params"]["seq"]
+            if seq == 1:
+                self.first_entered.set()
+                assert self.release_first.wait(timeout=5)
+            with self.lock:
+                self.frames.append(json.loads(json.dumps(obj)))
+            return True
+
+    sid = "legacy-ordered-sid"
+    transport = _LegacyRaceTransport()
+    event_replay.reset_replay_state()
+    server._sessions[sid] = {"transport": transport}
+
+    def publish(index):
+        server.write_json({
+            "jsonrpc": "2.0",
+            "method": "event",
+            "params": {
+                "type": "message.delta",
+                "session_id": sid,
+                "payload": {"index": index},
+            },
+        })
+
+    first = threading.Thread(target=publish, args=(1,))
+    second = threading.Thread(target=publish, args=(2,))
+    try:
+        first.start()
+        assert transport.first_entered.wait(timeout=5)
+        second.start()
+        # Give the competing publisher an opportunity to overtake the blocked
+        # first writer. The production lock must keep it behind seq=1.
+        second.join(timeout=0.1)
+        transport.release_first.set()
+        first.join(timeout=5)
+        second.join(timeout=5)
+
+        assert not first.is_alive()
+        assert not second.is_alive()
+        assert [frame["params"]["seq"] for frame in transport.frames] == [1, 2]
+        assert [event["seq"] for event in event_replay.events_since(sid, 0)] == [1, 2]
+    finally:
+        transport.release_first.set()
+        first.join(timeout=5)
+        second.join(timeout=5)
+        server._sessions.pop(sid, None)
+        event_replay.reset_replay_state()
+
+
+def test_teardown_popped_session_releases_replay_state(monkeypatch):
+    from tui_gateway import event_replay
+
+    sid = "finished-runtime"
+    event_replay.reset_replay_state()
+    frame = {
+        "jsonrpc": "2.0",
+        "method": "event",
+        "params": {"type": "session.info", "session_id": sid, "payload": {}},
+    }
+    event_replay._stamp_event(frame)
+    monkeypatch.setattr(server, "_teardown_session", lambda *_args, **_kwargs: None)
+
+    assert server._teardown_popped_session({"_sid": sid}) is True
+    assert event_replay.latest_seq(sid) == 0
+    assert event_replay.events_since(sid, 0) == []
 
 
 def test_usage_ticker_emits_wrapped_usage_payload(monkeypatch):
@@ -3687,6 +5169,168 @@ def test_session_resume_follows_compression_tip(monkeypatch, tmp_path):
     assert "post-compression reply" in texts
 
 
+def test_concurrent_eager_resumes_build_one_runtime_per_canonical_root(monkeypatch):
+    target = "continuation-tip"
+    canonical_root = "compression-root"
+    build_started = threading.Event()
+    release_build = threading.Event()
+    build_calls = []
+
+    class FakeDB:
+        def get_session(self, session_id):
+            return {"id": session_id}
+
+        def get_session_by_title(self, _target):
+            return None
+
+        def reopen_session(self, _target):
+            pass
+
+        def get_resume_conversations(self, _target):
+            history = [{"role": "user", "content": "hello"}]
+            return history, history
+
+        def get_ancestor_display_prefix(self, _target):
+            return []
+
+        def session_runtime_key(self, _target):
+            return canonical_root
+
+    class Lease:
+        def release(self):
+            pass
+
+    def fake_make_agent(*_args, **_kwargs):
+        build_calls.append(object())
+        build_started.set()
+        assert release_build.wait(timeout=2)
+        return types.SimpleNamespace(model="test", provider="test")
+
+    def fake_init_session(sid, key, agent, _history, **_kwargs):
+        server._sessions[sid] = {
+            "agent": agent,
+            "session_key": key,
+            "created_at": time.time(),
+            "cwd": "",
+        }
+
+    monkeypatch.setattr(server, "_get_db", lambda: FakeDB())
+    monkeypatch.setattr(server, "_enable_gateway_prompts", lambda: None)
+    monkeypatch.setattr(server, "_set_session_context", lambda _target: [])
+    monkeypatch.setattr(server, "_clear_session_context", lambda _tokens: None)
+    monkeypatch.setattr(server, "_claim_local_runtime_owner", lambda *_args: Lease())
+    monkeypatch.setattr(server, "_make_agent", fake_make_agent)
+    monkeypatch.setattr(server, "_init_session", fake_init_session)
+    monkeypatch.setattr(
+        server,
+        "_session_info",
+        lambda _agent, *_args: {"model": "test", "tools": {}, "skills": {}},
+    )
+    monkeypatch.setattr(server, "_maybe_schedule_auto_continue", lambda *_args: None)
+    monkeypatch.setattr(
+        server,
+        "_live_session_payload",
+        lambda sid, _session, **_kwargs: {
+            "session_id": sid,
+            "message_count": 0,
+            "messages": [],
+        },
+    )
+
+    responses = []
+
+    def resume(request_id):
+        responses.append(
+            server._methods["session.resume"](
+                request_id,
+                {"session_id": target, "eager_build": True},
+            )
+        )
+
+    first = threading.Thread(target=resume, args=("r1",))
+    second = threading.Thread(target=resume, args=("r2",))
+    try:
+        first.start()
+        assert build_started.wait(timeout=1)
+        second.start()
+        time.sleep(0.05)
+        assert len(build_calls) == 1
+        release_build.set()
+        first.join(timeout=2)
+        second.join(timeout=2)
+
+        assert not first.is_alive()
+        assert not second.is_alive()
+        assert len(build_calls) == 1
+        assert len(responses) == 2
+        assert len({response["result"]["session_id"] for response in responses}) == 1
+    finally:
+        release_build.set()
+        first.join(timeout=1)
+        second.join(timeout=1)
+        server._sessions.clear()
+
+
+@pytest.mark.parametrize("failure_stage", ["make_agent", "init_session"])
+def test_eager_resume_failure_releases_runtime_owner_lease(monkeypatch, failure_stage):
+    target = "failed-resume"
+    released = []
+
+    class FakeDB:
+        def get_session(self, session_id):
+            return {"id": session_id, "message_count": 1}
+
+        def get_session_by_title(self, _target):
+            return None
+
+        def reopen_session(self, _target):
+            pass
+
+        def get_resume_conversations(self, _target):
+            history = [{"role": "user", "content": "hello"}]
+            return history, history
+
+        def get_ancestor_display_prefix(self, _target):
+            return []
+
+        def session_runtime_key(self, _target):
+            return "failed-root"
+
+    class RuntimeOwnerLease:
+        def release(self):
+            released.append(True)
+            return True
+
+    def fake_make_agent(*_args, **_kwargs):
+        if failure_stage == "make_agent":
+            raise RuntimeError("make failed")
+        return types.SimpleNamespace(model="test", provider="test")
+
+    def fake_init_session(*_args, **_kwargs):
+        if failure_stage == "init_session":
+            raise RuntimeError("init failed")
+
+    monkeypatch.setattr(server, "_sessions", {})
+    monkeypatch.setattr(server, "_get_db", lambda: FakeDB())
+    monkeypatch.setattr(server, "_enable_gateway_prompts", lambda: None)
+    monkeypatch.setattr(server, "_set_session_context", lambda _target: [])
+    monkeypatch.setattr(server, "_clear_session_context", lambda _tokens: None)
+    monkeypatch.setattr(
+        server, "_claim_local_runtime_owner", lambda *_args: RuntimeOwnerLease()
+    )
+    monkeypatch.setattr(server, "_make_agent", fake_make_agent)
+    monkeypatch.setattr(server, "_init_session", fake_init_session)
+
+    response = server._methods["session.resume"](
+        "resume-failure",
+        {"session_id": target, "eager_build": True},
+    )
+
+    assert response["error"]["code"] == 5000
+    assert released == [True]
+    assert server._sessions == {}
+
+
 def test_session_resume_passes_stored_runtime_to_agent(monkeypatch):
     captured = {}
 
@@ -4499,6 +6143,7 @@ def _session(agent=None, **extra):
         "slash_worker": None,
         "show_reasoning": False,
         "tool_progress_mode": "all",
+        "transport": server._stdio_transport,
         **extra,
     }
 
@@ -5148,6 +6793,163 @@ def test_finalize_session_closes_slash_worker(monkeypatch):
     server._finalize_session(session)
     server._teardown_session(session)
     assert closed["count"] == 1
+
+
+def test_steer_authority_accepts_non_alias_controller_attachment():
+    controller = _LifecycleTransport("steer-controller")
+    observer = _LifecycleTransport("steer-observer")
+    session = {"history_lock": threading.Lock(), "transport": controller}
+    server._attach_current_transport(
+        "steer-authority-sid", session, "control", transport=controller
+    )
+    server._attach_current_transport(
+        "steer-authority-sid", session, "observe", transport=observer
+    )
+    server._sessions["steer-authority-sid"] = session
+    transport_token = bind_transport(controller)
+    runtime_token = server._current_runtime_session_record.set(session)
+    try:
+        assert server._current_session_steer_authority("steer-authority-sid") == (
+            controller,
+            session,
+        )
+    finally:
+        server._current_runtime_session_record.reset(runtime_token)
+        reset_transport(transport_token)
+        server._sessions.pop("steer-authority-sid", None)
+        server._teardown_session(session)
+
+
+def test_claim_parked_runtime_uses_zero_attachment_count():
+    stale_transport = _LifecycleTransport("stale-alias")
+    stale = {
+        "history_lock": threading.Lock(),
+        "transport": stale_transport,
+        "session_key": "parked-session-key",
+    }
+    server._ensure_session_event_hub("parked-old-sid", stale)
+    server._sessions["parked-old-sid"] = stale
+    try:
+        claimed = server._claim_parked_runtimes(
+            "parked-session-key", keep_sid="parked-new-sid"
+        )
+        assert claimed == [("parked-old-sid", stale)]
+        assert "parked-old-sid" not in server._sessions
+    finally:
+        server._sessions.pop("parked-old-sid", None)
+        server._teardown_session(stale)
+
+
+def test_live_attachment_overrides_stale_detached_transport_alias(monkeypatch):
+    transport = _LifecycleTransport("live-alias-override")
+    session = {
+        "history_lock": threading.Lock(),
+        "transport": server._detached_ws_transport,
+        "running": False,
+        "last_active": 0.0,
+        "created_at": 0.0,
+    }
+    monkeypatch.setattr(server, "_session_has_active_delegations", lambda *args: False)
+    monkeypatch.setattr(server, "_SESSION_TTL_S", 1)
+    hub = server._ensure_session_event_hub("alias-override-sid", session)
+    hub.attach(
+        transport,
+        client_id=transport.client_id,
+        mode=AttachmentMode.CONTROL,
+    )
+    try:
+        assert server._ws_session_is_detached(session) is False
+        assert server._ws_session_is_orphaned(session) is False
+        assert (
+            server._session_is_evictable("alias-override-sid", session, time.time())
+            is False
+        )
+        assert server._session_is_lru_evictable("alias-override-sid", session) is False
+    finally:
+        server._teardown_session(session)
+
+
+def test_failed_final_attachment_starts_orphan_policy(monkeypatch):
+    class FailingTransport(_LifecycleTransport):
+        def write(self, obj: dict) -> bool:
+            return False
+
+    transport = FailingTransport("failed-final")
+    session = {"history_lock": threading.Lock(), "transport": transport}
+    hub = server._attach_current_transport(
+        "failed-final-sid", session, "control", transport=transport
+    )
+    server._sessions["failed-final-sid"] = session
+    scheduled = []
+    monkeypatch.setattr(
+        server, "_schedule_ws_orphan_reap", lambda sid: scheduled.append(sid)
+    )
+    try:
+        server._emit("status.update", "failed-final-sid", {"status": "running"})
+        deadline = time.time() + 2
+        while hub.count() and time.time() < deadline:
+            time.sleep(0.01)
+        assert hub.count() == 0
+        assert session["transport"] is server._detached_ws_transport
+        assert scheduled == ["failed-final-sid"]
+    finally:
+        server._sessions.pop("failed-final-sid", None)
+        server._teardown_session(session)
+
+
+def test_last_attachment_disconnect_schedules_orphan_once(monkeypatch):
+    transport = _LifecycleTransport("disconnect-last")
+    session = {"history_lock": threading.Lock(), "transport": transport}
+    server._attach_current_transport(
+        "disconnect-last-sid", session, "control", transport=transport
+    )
+    server._sessions["disconnect-last-sid"] = session
+    scheduled = []
+    monkeypatch.setattr(
+        server, "_schedule_ws_orphan_reap", lambda sid: scheduled.append(sid)
+    )
+    try:
+        assert server._close_sessions_for_transport(transport) == (0, 1)
+        assert session["event_hub"].count() == 0
+        assert session["transport"] is server._detached_ws_transport
+        assert scheduled == ["disconnect-last-sid"]
+    finally:
+        server._sessions.pop("disconnect-last-sid", None)
+        server._teardown_session(session)
+
+
+def test_disconnect_non_alias_attachment_is_removed_without_orphaning(monkeypatch):
+    first = _LifecycleTransport("disconnect-first")
+    survivor = _LifecycleTransport("disconnect-survivor")
+    session = {
+        "history_lock": threading.Lock(),
+        "transport": first,
+        "running": True,
+        "queued_prompt": {"text": "preserve"},
+    }
+    hub = server._attach_current_transport(
+        "disconnect-sid", session, "control", transport=first
+    )
+    server._attach_current_transport(
+        "disconnect-sid", session, "control", transport=survivor
+    )
+    server._sessions["disconnect-sid"] = session
+    scheduled = []
+    monkeypatch.setattr(
+        server, "_schedule_ws_orphan_reap", lambda sid: scheduled.append(sid)
+    )
+    try:
+        assert session["transport"] is survivor
+        assert server._close_sessions_for_transport(first) == (0, 0)
+        assert hub.count() == 1
+        assert not hub.has_transport(first)
+        assert hub.has_transport(survivor)
+        assert session["running"] is True
+        assert session["queued_prompt"] == {"text": "preserve"}
+        assert scheduled == []
+    finally:
+        server._sessions.pop("disconnect-sid", None)
+        server._teardown_session(session)
 
 
 def test_close_transport_rebinds_session_to_remaining_viewer(monkeypatch):
@@ -6992,12 +8794,14 @@ def _configure_immediate_prompt_run(
     monkeypatch, tmp_path, *, immediate_threads=True
 ):
     class _ImmediateThread:
-        def __init__(self, target=None, daemon=None, **_kwargs):
+        def __init__(self, target=None, args=(), kwargs=None, daemon=None, **_kwargs):
             self._target = target
+            self._args = args
+            self._kwargs = kwargs or {}
 
         def start(self):
-            if self._target is not None:
-                self._target()
+            if self._target is not None and self._target.__name__ != "_write_events":
+                self._target(*self._args, **self._kwargs)
 
         def is_alive(self):
             return False
@@ -7447,6 +9251,30 @@ def test_run_prompt_submit_prefers_origin_ui_session_id(monkeypatch, tmp_path):
         assert created == [], "session.create should not persist an empty DB row"
     finally:
         server._sessions.pop(sid, None)
+
+
+def test_session_create_rejects_invalid_attachment_mode_before_claiming_or_inserting(
+    monkeypatch,
+):
+    claimed: list[str] = []
+    before = set(server._sessions)
+
+    monkeypatch.setattr(
+        server,
+        "_claim_local_runtime_owner",
+        lambda key, _home: claimed.append(key),
+    )
+    monkeypatch.setattr(server, "_schedule_agent_build", lambda *_args, **_kwargs: None)
+
+    with pytest.raises(ValueError, match="invalid attachment mode"):
+        server.handle_request({
+            "id": "invalid-mode",
+            "method": "session.create",
+            "params": {"attachment_mode": "admin"},
+        })
+
+    assert claimed == []
+    assert set(server._sessions) == before
 
 
 def test_ensure_session_db_row_persists_explicit_cwd(monkeypatch, tmp_path):
@@ -13793,18 +15621,25 @@ def test_session_create_close_race_does_not_orphan_worker(monkeypatch):
     )
     monkeypatch.setattr(_approval, "load_permanent_allowlist", lambda: None)
 
-    # Start: session.create spawns _build thread, returns synchronously
-    resp = server.handle_request(
+    # Start: session.create spawns _build thread, returns synchronously. Keep
+    # one real transport bound across create/close so the live session grants
+    # and later verifies controller capability at the network boundary.
+    transport = _LifecycleTransport("create-close-race-controller")
+    resp = _dispatch_sync(
         {
             "id": "1",
             "method": "session.create",
             "params": {"cols": 80},
-        }
+        },
+        transport,
     )
     assert resp.get("result"), f"got error: {resp.get('error')}"
     sid = resp["result"]["session_id"]
     own_key = resp["result"]["stored_session_id"]
-    assert build_entered.wait(timeout=1.0), "deferred build did not start"
+    # Parallel CI can delay the deferred timer/thread beyond one second even
+    # though the production race remains valid; match the fake build's own
+    # three-second scheduling budget.
+    assert build_entered.wait(timeout=3.0), "deferred build did not start"
 
     # Wait until the (deferred) build thread has actually entered
     # _make_agent — otherwise session.close pops _sessions[sid] before
@@ -13815,12 +15650,13 @@ def test_session_create_close_race_does_not_orphan_worker(monkeypatch):
     # Build thread is blocked in _slow_make_agent.  Close the session
     # NOW — this pops _sessions[sid] before _build can install the
     # worker/notify.
-    close_resp = server.handle_request(
+    close_resp = _dispatch_sync(
         {
             "id": "2",
             "method": "session.close",
             "params": {"session_id": sid},
-        }
+        },
+        transport,
     )
     assert close_resp.get("result", {}).get("closed") is True
 
@@ -14171,7 +16007,7 @@ def test_session_delete_fails_closed_when_active_snapshot_raises(monkeypatch):
 
     assert "error" in resp
     assert resp["error"]["code"] == 5036
-    assert "enumerate active sessions" in resp["error"]["message"]
+    assert "live session authority" in resp["error"]["message"]
 
 
 def test_session_delete_returns_4007_when_missing(monkeypatch):
@@ -15206,6 +17042,10 @@ def test_model_options_preserves_canonical_custom_row_after_agent_init(monkeypat
         "hermes_cli.auth.is_provider_explicitly_configured",
         lambda _slug: False,
     )
+    monkeypatch.setattr(
+        "hermes_cli.inventory._anthropic_oauth_credentials_present",
+        lambda: False,
+    )
     monkeypatch.setattr("hermes_cli.inventory._apply_pricing", lambda *_args, **_kwargs: None)
     monkeypatch.setattr("hermes_cli.inventory._apply_capabilities", lambda *_args, **_kwargs: None)
 
@@ -15373,6 +17213,150 @@ def test_prompt_submit_wires_live_title_rename_callback(monkeypatch):
         "session.title",
         {"session_id": "session-key", "title": "Founding of Rome"},
     ) in emitted
+
+
+def test_prompt_submit_fans_out_user_row_before_assistant_events(monkeypatch):
+    """A second attached client sees the durable user row without the 2s watcher."""
+    emitted: list[tuple[str, dict]] = []
+
+    class _Agent:
+        model = "gpt-5.6-sol"
+        provider = "openai-codex"
+        base_url = "https://chatgpt.example.test/backend-api/codex"
+        api_key = object()
+        api_mode = "codex_responses"
+
+        def run_conversation(
+            self,
+            prompt,
+            conversation_history=None,
+            stream_callback=None,
+            persist_user_display_metadata=None,
+            **_kwargs,
+        ):
+            self.persist_user_display_metadata = persist_user_display_metadata
+            callback = getattr(self, "_on_user_message_persisted", None)
+            assert callable(callback), "gateway did not install a durable-user-row hook"
+            callback()
+            stream_callback("reply")
+            return {
+                "final_response": "reply",
+                "messages": [
+                    {"role": "user", "content": prompt},
+                    {"role": "assistant", "content": "reply"},
+                ],
+            }
+
+    server._sessions["sid"] = _session(agent=_Agent())
+    monkeypatch.setattr(server.threading, "Thread", _ImmediateThread)
+    monkeypatch.setattr(
+        server,
+        "_emit",
+        lambda kind, sid, payload=None, **kw: emitted.append((kind, payload or {})),
+    )
+    monkeypatch.setattr(server, "make_stream_renderer", lambda cols: None)
+    monkeypatch.setattr(server, "render_message", lambda raw, cols: None)
+    monkeypatch.setattr(server, "_get_db", lambda: None)
+
+    server.handle_request({
+        "id": "1",
+        "method": "prompt.submit",
+        "params": {
+            "session_id": "sid",
+            "text": "expanded model-facing prompt",
+            "display_text": "hello from pc 1",
+            "client_message_id": "user-pc1-123",
+            "submitted_at": 1234.5,
+            "display_metadata": {"platform": "discord", "user_id": "user-1"},
+        },
+    })
+
+    event_names = [event for event, _payload in emitted]
+    assert "message.user" in event_names
+    assert "sessions.changed" in event_names
+    assert event_names.index("message.user") < event_names.index("sessions.changed")
+    assert event_names.index("sessions.changed") < event_names.index("message.delta")
+    assert emitted[event_names.index("message.user")][1] == {
+        "message_id": "user-pc1-123",
+        "text": "hello from pc 1",
+        "timestamp": 1234.5,
+        "display_metadata": {"platform": "discord", "user_id": "user-1"},
+    }
+    assert server._sessions["sid"]["agent"]._on_user_message_persisted is None
+    assert server._sessions["sid"]["agent"].persist_user_display_metadata == {
+        "platform": "discord",
+        "user_id": "user-1",
+        "client_message_id": "user-pc1-123",
+        "client_identity": "gateway-owner",
+    }
+
+
+def test_prompt_submit_forwards_user_event_metadata_to_isolated_host(monkeypatch):
+    """The production turn-isolation path must not drop peer-fanout metadata."""
+    captured = {}
+    server._sessions["sid"] = _session(agent=None)
+    monkeypatch.setattr(server.threading, "Thread", _ImmediateThread)
+    monkeypatch.setattr(server, "_session_uses_compute_host", lambda *_args: True)
+    monkeypatch.setattr(
+        server,
+        "_submit_prompt_to_compute_host",
+        lambda rid, sid, session, text, **kwargs: (
+            captured.update(text=text, **kwargs)
+            or server._ok(rid, {"status": "streaming"})
+        ),
+    )
+
+    server.handle_request({
+        "id": "1",
+        "method": "prompt.submit",
+        "params": {
+            "session_id": "sid",
+            "text": "expanded model-facing prompt",
+            "display_text": "hello from pc 1",
+            "client_message_id": "user-pc1-123",
+            "submitted_at": 1234.5,
+            "attachment_refs": ["attachment://one"],
+            "image_paths": ["/tmp/image-one.png"],
+            "display_metadata": {"platform": "discord", "user_id": "user-1"},
+        },
+    })
+
+    assert captured == {
+        "text": "expanded model-facing prompt",
+        "display_kind": None,
+        "display_metadata": {"platform": "discord", "user_id": "user-1"},
+        "client_message_id": "user-pc1-123",
+        "client_identity": ("gateway-owner", "user-pc1-123"),
+        "display_text": "hello from pc 1",
+        "submitted_at": 1234.5,
+        "attachment_refs": ["attachment://one"],
+        "image_paths": ["/tmp/image-one.png"],
+    }
+
+
+def test_compute_host_turn_frame_carries_user_event_metadata():
+    frame = server._compute_host_turn_frame(
+        "r1",
+        "sid",
+        _session(),
+        "expanded model-facing prompt",
+        image_paths=["/tmp/image-one.png"],
+        client_message_id="user-pc1-123",
+        display_text="hello from pc 1",
+        submitted_at=1234.5,
+        attachment_refs=["attachment://one"],
+        display_metadata={"platform": "discord", "user_id": "user-1"},
+    )
+
+    assert frame["client_message_id"] == "user-pc1-123"
+    assert frame["display_text"] == "hello from pc 1"
+    assert frame["submitted_at"] == 1234.5
+    assert frame["attachment_refs"] == ["attachment://one"]
+    assert frame["attached_images"] == ["/tmp/image-one.png"]
+    assert frame["display_metadata"] == {
+        "platform": "discord",
+        "user_id": "user-1",
+    }
 
 
 def test_prompt_submit_surfaces_backend_error_as_visible_text(monkeypatch):

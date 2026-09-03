@@ -9,7 +9,8 @@ import {
   type PetChangeMeta,
   setChangeEventsAvailable
 } from '@/store/live-sync'
-import { dropSessionState, unbindTileRuntime } from '@/store/session-states'
+import { $activeSessionId, setActiveSessionId } from '@/store/session'
+import { dropSessionState, rebindRuntimeSession, unbindTileRuntime } from '@/store/session-states'
 // Leaf import (not the `@/themes` barrel) to avoid pulling the ThemeProvider
 // module graph into the gateway event hot path.
 import { ingestBackendSkin } from '@/themes/backend-sync'
@@ -65,6 +66,51 @@ export function handleLifecycleEvent(ctx: GatewayEventContext): boolean {
       } else {
         notifySessionsChanged()
       }
+    }
+
+    return true
+  }
+
+  if (event.type === 'session.runtime_recovered') {
+    const recovery = payload as typeof payload & {
+      durable_session_id?: string
+      new_session_id?: string
+      old_session_id?: string
+    }
+
+    const oldRuntimeId = String(recovery?.old_session_id ?? '')
+    const newRuntimeId = String(recovery?.new_session_id ?? event.session_id ?? '')
+
+    if (oldRuntimeId && newRuntimeId) {
+      const cached = deps.sessionStateByRuntimeIdRef.current.get(oldRuntimeId)
+
+      deps.sessionStateByRuntimeIdRef.current.delete(oldRuntimeId)
+
+      if (cached) {
+        deps.sessionStateByRuntimeIdRef.current.set(newRuntimeId, cached)
+      }
+
+      rebindRuntimeSession(oldRuntimeId, newRuntimeId)
+
+      if ($activeSessionId.get() === oldRuntimeId || deps.activeSessionIdRef.current === oldRuntimeId) {
+        setActiveSessionId(newRuntimeId)
+        deps.activeSessionIdRef.current = newRuntimeId
+      }
+    }
+
+    return true
+  }
+
+  if (event.type === 'session.durable_resync_required') {
+    const resync = payload as typeof payload & { durable_session_id?: string; session_id?: string }
+    const runtimeSessionId = String(resync?.session_id ?? event.session_id ?? '') || null
+    const durableSessionId = String(resync?.durable_session_id ?? '') || null
+
+    // Recovery presentation needs both identities. Passing an absent durable id
+    // merely schedules a hydrate that immediately no-ops, hiding an upstream
+    // replay-contract defect instead of leaving it observable and retryable.
+    if (durableSessionId && runtimeSessionId) {
+      void deps.hydrateFromStoredSession(3, durableSessionId, runtimeSessionId)
     }
 
     return true

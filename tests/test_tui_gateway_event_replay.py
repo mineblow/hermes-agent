@@ -38,6 +38,7 @@ def test_stamp_adds_monotonic_seq_per_session():
     event_replay._stamp_event(f2)
 
     assert f1["params"]["seq"] == 1
+    assert f1["params"]["epoch"] == event_replay.replay_epoch()
     assert f2["params"]["seq"] == 2  # per-session counter, unaffected by s2
     assert other["params"]["seq"] == 1
 
@@ -84,6 +85,27 @@ def test_events_since_returns_client_dispatchable_event_objects():
     assert "params" not in event
 
 
+def test_events_since_returns_defensive_copies():
+    frame = _frame("s1")
+    frame["params"]["payload"] = {"items": [1]}
+    event_replay._stamp_event(frame)
+
+    first = events_since("s1", 0)
+    first[0]["payload"]["items"].append(2)
+    first[0]["type"] = "mutated"
+
+    second = events_since("s1", 0)
+    assert second == [
+        {
+            "type": "message.delta",
+            "session_id": "s1",
+            "payload": {"items": [1]},
+            "seq": 1,
+            "epoch": event_replay.replay_epoch(),
+        }
+    ]
+
+
 def test_unknown_session_returns_empty():
     assert events_since("nope", 0) == []
     assert latest_seq("nope") == 0
@@ -108,6 +130,70 @@ def test_session_count_bounded_with_fifo_eviction():
     assert stats["sessions"] == event_replay._REPLAY_SESSIONS_MAX
     assert events_since("s0", 0) == []  # oldest session fully evicted
     assert latest_seq(f"s{event_replay._REPLAY_SESSIONS_MAX + 9}") == 1
+
+
+def test_sequence_metadata_is_bounded_by_epoch_rollover():
+    initial_epoch = event_replay.replay_epoch()
+    for index in range(event_replay._REPLAY_SESSIONS_MAX + 1):
+        event_replay._stamp_event(_frame(f"rollover-{index}"))
+
+    stats = replay_stats()
+    assert stats["sequence_sessions"] <= event_replay._REPLAY_SESSIONS_MAX
+    assert event_replay.replay_epoch() != initial_epoch
+    assert all(
+        event["epoch"] == event_replay.replay_epoch()
+        for buffer in event_replay._replay_buffers.values()
+        for _seq, event in buffer
+    )
+
+
+def test_evicted_session_without_new_events_is_separated_by_epoch_rollover():
+    initial_epoch = event_replay.replay_epoch()
+    event_replay._stamp_event(_frame("old-live"))
+    for index in range(event_replay._REPLAY_SESSIONS_MAX):
+        event_replay._stamp_event(_frame(f"new-{index}"))
+
+    assert events_since("old-live", 0) == []
+    assert latest_seq("old-live") == 0
+    assert event_replay.replay_epoch() != initial_epoch
+    assert event_replay.is_truncated("old-live", 0) is False
+
+
+def test_sequence_restart_after_eviction_always_changes_epoch():
+    first = _frame("old-live")
+    event_replay._stamp_event(first)
+    assert first["params"]["seq"] == 1
+    first_epoch = first["params"]["epoch"]
+
+    for index in range(event_replay._REPLAY_SESSIONS_MAX):
+        event_replay._stamp_event(_frame(f"new-{index}"))
+
+    assert events_since("old-live", 0) == []
+    resumed = _frame("old-live")
+    event_replay._stamp_event(resumed)
+
+    assert resumed["params"]["seq"] == 1
+    assert resumed["params"]["epoch"] != first_epoch
+    assert [event["seq"] for event in events_since("old-live", 0)] == [1]
+
+
+def test_release_session_reclaims_counter_and_buffer_state():
+    frame = _frame("finished")
+    event_replay._stamp_event(frame)
+    assert latest_seq("finished") == 1
+    initial_epoch = event_replay.replay_epoch()
+
+    event_replay.release_session("finished")
+
+    assert latest_seq("finished") == 0
+    assert events_since("finished", 0) == []
+    assert event_replay.is_truncated("finished", 0) is False
+    assert event_replay.replay_epoch() != initial_epoch
+
+    replacement = _frame("finished")
+    event_replay._stamp_event(replacement)
+    assert replacement["params"]["seq"] == 1
+    assert replacement["params"]["epoch"] != initial_epoch
 
 
 def test_concurrent_stamping_never_drops_or_duplicates_seq():
