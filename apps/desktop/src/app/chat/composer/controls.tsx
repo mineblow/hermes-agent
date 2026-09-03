@@ -5,7 +5,18 @@ import { Codicon } from '@/components/ui/codicon'
 import { Tip, TipKeybindLabel } from '@/components/ui/tooltip'
 import { useI18n } from '@/i18n'
 import { triggerHaptic } from '@/lib/haptics'
-import { AudioLines, Ear, EarOff, iconSize, Layers3, Loader2, Square, Volume2, VolumeX } from '@/lib/icons'
+import {
+  AudioLines,
+  Ear,
+  EarOff,
+  iconSize,
+  Layers3,
+  Loader2,
+  Square,
+  SteeringWheel,
+  Volume2,
+  VolumeX
+} from '@/lib/icons'
 import { cn } from '@/lib/utils'
 import { $hudMode, closeHud, resetHudLayout } from '@/store/hud'
 import { $wakeWord, toggleWakeWord } from '@/store/wake-word'
@@ -73,10 +84,15 @@ export function ComposerControls({
   }
 
   const showVoicePrimary = !busy && !hasComposerPayload
-  // Steer is just send: a payload keeps the Send affordance mid-turn. Stop
-  // only when the composer is empty and a turn is running.
-  const showStop = busy && !hasComposerPayload
-  const showQueueButton = busyAction !== 'stop' && hasComposerPayload
+  const primaryAction = busy ? busyAction : 'send'
+  const showStop = primaryAction === 'stop'
+  const showSteer = primaryAction === 'steer'
+  const showQueuePrimary = primaryAction === 'queue'
+  // Queue is the secondary alternative while steering is available. When the
+  // turn can only queue (compaction/blocking prompt/attachment), Queue itself
+  // is the primary action and must not be duplicated beside itself.
+  const showQueueButton = showSteer && hasComposerPayload
+  const primaryLabel = showStop ? c.stop : showSteer ? c.steer : showQueuePrimary ? c.queueMessage : c.send
   // The HUD is a Spotlight bar a few hundred pixels wide, so the four separate
   // voice toggles fold into one menu there and leave the row to the input. A
   // narrow tile hits the same wall from the other direction and folds for the
@@ -145,21 +161,24 @@ export function ComposerControls({
       ) : (
         <Tip
           label={
-            showStop ? (
-              <TipKeybindLabel actionId="composer.send" text={c.stop} />
-            ) : (
-              <TipKeybindLabel actionId="composer.send" text={c.send} />
-            )
+            <TipKeybindLabel
+              actionId={showSteer ? 'composer.steer' : showQueuePrimary ? 'composer.queue' : 'composer.send'}
+              text={primaryLabel}
+            />
           }
         >
           <Button
-            aria-label={showStop ? c.stop : c.send}
+            aria-label={primaryLabel}
             className={PRIMARY_ICON_BTN}
             disabled={disabled || !canSubmit}
             type="submit"
           >
             {showStop ? (
               <span className="block size-2.5 rounded-[0.1875rem] bg-current" />
+            ) : showSteer ? (
+              <SteeringWheel className={iconSize.sm} />
+            ) : showQueuePrimary ? (
+              <Layers3 className={iconSize.sm} />
             ) : (
               <Codicon name="arrow-up" size="0.875rem" />
             )}

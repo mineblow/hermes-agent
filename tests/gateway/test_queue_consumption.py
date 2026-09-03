@@ -219,4 +219,65 @@ class TestBusyInputModeQueueFifo:
         ]
         assert runner._queue_depth(session_key, adapter=adapter) == len(texts)
 
+    def test_rejects_followup_when_pending_count_is_full(self):
+        runner, adapter = self._make_runner_and_adapter()
+        runner._BUSY_QUEUE_MAX_PENDING = 2
+        session_key = "telegram:user:full"
+
+        first = self._text_event("first")
+        second = self._text_event("second")
+        rejected = self._text_event("rejected")
+
+        assert runner._queue_or_replace_pending_event(session_key, first) == "queued"
+        assert runner._queue_or_replace_pending_event(session_key, second) == "queued"
+        assert runner._queue_or_replace_pending_event(session_key, rejected) == "full"
+        assert adapter._pending_messages[session_key] is first
+        assert runner._queued_events[session_key] == [second]
+
+    def test_media_merge_respects_aggregate_utf8_byte_budget(self):
+        runner, adapter = self._make_runner_and_adapter()
+        session_key = "telegram:user:media-bytes"
+
+        first = self._text_event("é")
+        first.message_type = MessageType.PHOTO
+        first.media_urls = ["img-a"]
+        first.media_types = ["image/png"]
+        # The fitting merge adds a 2-byte caption separator and a 4-byte emoji.
+        runner._BUSY_QUEUE_MAX_BYTES = runner._pending_event_payload_bytes(first) + 6
+        assert runner._queue_or_replace_pending_event(session_key, first) == "queued"
+
+        fitting = self._text_event("🙂")
+        fitting.message_type = MessageType.PHOTO
+        assert runner._queue_or_replace_pending_event(session_key, fitting) == "queued"
+        assert adapter._pending_messages[session_key].text == "é\n\n🙂"
+
+        oversized = self._text_event("")
+        oversized.message_type = MessageType.PHOTO
+        oversized.media_urls = ["x"]
+        oversized.media_types = ["z"]
+        assert runner._queue_or_replace_pending_event(session_key, oversized) == "full"
+        assert adapter._pending_messages[session_key].media_urls == ["img-a"]
+        assert adapter._pending_messages[session_key].media_types == ["image/png"]
+
+    def test_free_form_metadata_counts_toward_byte_budget(self):
+        runner, adapter = self._make_runner_and_adapter()
+        session_key = "telegram:user:metadata-bytes"
+        first = self._text_event("first")
+        runner._BUSY_QUEUE_MAX_BYTES = runner._pending_event_payload_bytes(first) + 8
+        assert runner._queue_or_replace_pending_event(session_key, first) == "queued"
+
+        rejected = self._text_event("x")
+        rejected.metadata = {"nested": {"caption": "🙂" * 10}}
+        assert runner._queue_or_replace_pending_event(session_key, rejected) == "full"
+        assert adapter._pending_messages[session_key] is first
+        assert runner._queued_events.get(session_key, []) == []
+
+    def test_rejects_when_source_has_no_adapter(self):
+        runner, _adapter = self._make_runner_and_adapter()
+        runner.adapters = {}
+
+        assert runner._queue_or_replace_pending_event(
+            "telegram:user:no-adapter", self._text_event("hello")
+        ) == "rejected"
+
 

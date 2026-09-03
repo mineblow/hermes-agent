@@ -30,6 +30,7 @@ import logging
 import socket
 import threading
 import time
+import uuid
 from typing import Any
 
 from tui_gateway import server
@@ -133,6 +134,10 @@ class WSTransport:
         self._ws = ws
         self._loop = loop
         self._peer = peer
+        # Server-minted connection identity is authorization metadata, not a
+        # value supplied by RPC params, network address, or user-agent.
+        self.connection_id = uuid.uuid4().hex
+        self.client_id: str | None = None
         #: Server-verified identity carried from the WS-upgrade credential
         #: (dashboard ticket / internal credential) — stamped by
         #: ``hermes_cli.web_server._ws_auth_reason`` onto the WS object and
@@ -416,27 +421,45 @@ async def handle_ws(
         # (#60800). The skin payload is small (a dict of strings/arrays),
         # so the to_thread overhead is negligible.
         skin_payload = await asyncio.to_thread(server.resolve_skin)
-        ready_ok = await transport.write_async(
-            {
-                "jsonrpc": "2.0",
-                "method": "event",
-                "params": {
-                    "type": "gateway.ready",
-                    # change_events: this backend broadcasts pet.changed /
-                    # cron.changed / sessions.changed, so clients can demote
-                    # their legacy polls to slow backstops.
-                    "payload": {
-                        "skin": skin_payload,
-                        "change_events": True,
-                        "heartbeat": True,
-                        # Replay-contract process identity: lets reconnecting
-                        # clients detect a backend restart and reset their
-                        # per-session seq watermarks (see event_replay).
-                        "replay_epoch": replay_epoch(),
+        ready_ok = await transport.write_async({
+            "jsonrpc": "2.0",
+            "method": "event",
+            "params": {
+                "type": "gateway.ready",
+                # change_events: this backend broadcasts pet.changed /
+                # cron.changed / sessions.changed, so clients can demote
+                # their legacy polls to slow backstops.
+                "payload": {
+                    "skin": skin_payload,
+                    "change_events": True,
+                    "heartbeat": True,
+                    # Replay-contract process identity: lets reconnecting
+                    # clients detect a backend restart and reset their
+                    # per-session seq watermarks (see event_replay).
+                    "replay_epoch": replay_epoch(),
+                    "connection_id": transport.connection_id,
+                    "runtime_host_id": server._backend_id_for_this_process(),
+                    "multi_client_sessions": 1,
+                    "capabilities": [
+                        "client.attach",
+                        "session.attach",
+                        "session.detach",
+                        "session.attachments",
+                    ],
+                    "multi_client": {
+                        "protocol_version": 1,
+                        "attachment_modes": ["observe", "control"],
+                        "methods": [
+                            "client.attach",
+                            "session.attach",
+                            "session.detach",
+                            "session.attachments",
+                            "session.events.since",
+                        ],
                     },
                 },
             }
-        )
+        })
         if ready_ok:
             # Live-apply skins Hermes activates mid-conversation.
             server._ensure_skin_watcher()
@@ -580,6 +603,12 @@ async def handle_ws(
         detached_sessions = 0
         if transport is not None:
             server.unregister_live_transport(transport)
+            try:
+                await asyncio.to_thread(
+                    server.detach_runtime_proxy_transport, transport
+                )
+            except Exception:
+                _log.exception("ws runtime-proxy detach failed peer=%s", peer)
 
             # Owner-safely park browser controllers this transport registered.
             # A reconnect with the same stable identity may deliver a terminal

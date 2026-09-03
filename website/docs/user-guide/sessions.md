@@ -10,6 +10,11 @@ import useBaseUrl from '@docusaurus/useBaseUrl';
 
 Hermes Agent automatically saves every conversation as a session. Sessions enable conversation resume, cross-session search, and full conversation history management.
 
+When a supported persistent frontend resumes a session that already has a live
+canonical runtime, it attaches to that runtime instead of starting a second
+agent. See [Multi-Client Live Sessions](features/multi-client-live-sessions.md)
+for cross-surface behavior, ordering, recovery, and authorization.
+
 ## How Sessions Work
 
 Every conversation — whether from the CLI, Telegram, Discord, Slack, WhatsApp, Signal, Matrix, Teams, or any other messaging platform — is stored as a session with full message history. Sessions are tracked in:

@@ -3128,6 +3128,13 @@ class BasePlatformAdapter(ABC):
     - Handling media
     """
 
+    # Canonical live-session execution belongs to GatewayRunner and its runtime
+    # bridge. Adapters are presentation transports only: they receive the shared
+    # ordered stream through GatewayStreamConsumer and must never create a
+    # second runtime owner.
+    LIVE_RUNTIME_PRESENTATION_VIA_RUNNER: bool = True
+    STARTS_LIVE_RUNTIME: bool = False
+
     # Whether this platform renders triple-backtick fenced code blocks (i.e.
     # ``format_message`` translates/preserves markdown fences into a real code
     # block).  Capability flag for markdown-aware presentation choices.
@@ -3568,10 +3575,12 @@ class BasePlatformAdapter(ABC):
             if event.text:
                 sink.on_delta(event.text)
         elif isinstance(event, MessageStop):
-            # An intermediate stop (text → tool → text) is a segment break;
-            # the terminal stop is signalled by the gateway via finish(),
-            # not here, so we only break segments on non-final stops.
-            if not event.final:
+            # Local agent callbacks finalize explicitly after run_conversation.
+            # Canonical runtime completion carries authoritative final text and
+            # therefore owns finalization at this presentation boundary.
+            if event.final and event.text is not None:
+                sink.finish(final_text=event.text)
+            elif not event.final:
                 sink.on_segment_break()
         elif isinstance(event, Commentary):
             if event.text:

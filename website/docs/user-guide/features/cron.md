@@ -8,6 +8,11 @@ description: "Schedule automated tasks with natural language, manage them with o
 
 Schedule tasks to run automatically with natural language or cron expressions. Hermes exposes cron management through a single `cronjob` tool with action-style operations instead of separate schedule/list/remove tools.
 
+Cron is a producer, not an attached live-session client. Delivery mirroring or
+thread seeding can prepare a destination for later human continuation, but the
+scheduler does not become a presentation member. See the
+[live-session surface classification](/reference/live-session-surface-classification).
+
 ## What cron can do now
 
 Cron jobs can:

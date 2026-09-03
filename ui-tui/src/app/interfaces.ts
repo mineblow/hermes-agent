@@ -8,6 +8,7 @@ import type {
   BillingMutationResponse,
   BillingStateResponse,
   SessionCloseResponse,
+  SessionResumeResponse,
   SubscriptionPreviewResponse,
   SubscriptionStateResponse,
   SubscriptionUpgradeResponse
@@ -486,7 +487,7 @@ export interface GatewayEventHandlerContext {
     // respawn resumes that session instead of forging a fresh one.
     recoverSidRef?: MutableRefObject<null | string>
     resetSession: () => void
-    resumeById: (id: string) => void
+    resumeById: (id: string) => Promise<null | SessionResumeResponse>
     setCatalog: StateSetter<null | SlashCatalog>
   }
   submission: {

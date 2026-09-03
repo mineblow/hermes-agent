@@ -8,6 +8,15 @@ description: "Browser-based administration panel for managing configuration, API
 
 The web dashboard is a browser-based UI for managing your Hermes Agent installation. Instead of editing YAML files or running CLI commands, you can configure settings, manage API keys, and monitor sessions from a clean web interface.
 
+The dashboard's Chat tab can resume and participate in the same canonical live
+runtime as the terminal, Desktop, and authorized messaging clients. See
+[Multi-Client Live Sessions](multi-client-live-sessions.md).
+
+The Chat terminal is a real TUI hosted over a PTY, so its replay behavior comes
+from the TUI attachment client. The separate structured-events sidebar uses a
+best-effort `/api/events` feed: it reconnects after transient drops but has no
+durable cursor and does not replay events missed while disconnected.
+
 :::tip
 Hosted-mode auth uses Nous Portal OAuth; if you also want the dashboard to talk to a real backend, `hermes setup --portal` wires up the model and tool gateway too. See [Nous Portal](/integrations/nous-portal).
 :::

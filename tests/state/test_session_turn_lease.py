@@ -130,8 +130,8 @@ def test_turn_lease_walks_compression_child_that_inherited_fork_markers(tmp_path
         model_config={"_branched_from": "original-parent"},
     )
 
-    assert db._session_turn_lease_key("delegate-continuation") == "delegate"
-    assert db._session_turn_lease_key("branch-continuation") == "branch"
+    assert db.session_runtime_key("delegate-continuation") == "delegate"
+    assert db.session_runtime_key("branch-continuation") == "branch"
 
     delegate_holder = f"pid={os.getpid()}:turn=delegate"
     assert db.try_acquire_session_turn_lease(

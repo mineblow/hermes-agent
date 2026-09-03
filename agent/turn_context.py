@@ -834,8 +834,8 @@ def build_turn_context(
     # build strips both fields from every outgoing copy.
     if persist_user_display_kind:
         user_msg["display_kind"] = persist_user_display_kind
-        if persist_user_display_metadata:
-            user_msg["display_metadata"] = persist_user_display_metadata
+    if persist_user_display_metadata:
+        user_msg["display_metadata"] = persist_user_display_metadata
 
     # Stamp the platform-side message id (e.g. the Discord/Telegram message id)
     # as metadata on the user turn so it survives the early crash-resilience
@@ -1670,6 +1670,26 @@ def build_turn_context(
         else:
             with persist_lock:
                 _ensure_and_persist()
+        # A normal return is not sufficient proof of durability: the lower DB
+        # helpers deliberately swallow some creation/append failures so the
+        # turn can recover later. The intrinsic marker is stamped only after a
+        # successful row append (or when a loaded row is materialized), making
+        # it the authoritative commit signal for this exact user-message dict.
+        _turn_user_is_durable = (
+            0 <= current_turn_user_idx < len(messages)
+            and isinstance(messages[current_turn_user_idx], dict)
+            and messages[current_turn_user_idx].get("_db_persisted") is True
+        )
+        _on_user_message_persisted = getattr(agent, "_on_user_message_persisted", None)
+        if _turn_user_is_durable and callable(_on_user_message_persisted):
+            try:
+                _on_user_message_persisted()
+            except Exception:
+                logger.debug(
+                    "User-message persistence notification failed for session=%s",
+                    agent.session_id or "none",
+                    exc_info=True,
+                )
     except Exception:
         logger.warning(
             "Early turn-start session persistence failed for session=%s",

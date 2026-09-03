@@ -109,6 +109,24 @@ class FakeWebSocket {
       if (willOpen) {
         this.readyState = FakeWebSocket.OPEN
         this.emit('open', {})
+        this.emit('message', {
+          data: JSON.stringify({
+            jsonrpc: '2.0',
+            method: 'event',
+            params: {
+              type: 'gateway.ready',
+              payload: {
+                connection_id: 'fake-connection',
+                multi_client: {
+                  attachment_modes: ['observe', 'control'],
+                  methods: ['client.attach', 'session.attach'],
+                  protocol_version: 1
+                },
+                replay_epoch: 'fake-epoch'
+              }
+            }
+          })
+        })
       } else {
         this.readyState = FakeWebSocket.CLOSED
         this.emit('error', {})
@@ -141,6 +159,25 @@ class FakeWebSocket {
     try {
       frame = JSON.parse(data) as { id?: unknown; method?: string }
     } catch {
+      return
+    }
+
+    if (frame.method === 'client.attach') {
+      this.emit('message', {
+        data: JSON.stringify({
+          jsonrpc: '2.0',
+          id: frame.id,
+          result: {
+            capabilities: ['session.observe', 'session.control', 'session.replay'],
+            client_id: 'desktop:test',
+            connection_id: 'fake-connection',
+            idempotent: false,
+            protocol_version: 1,
+            surface: 'desktop'
+          }
+        })
+      })
+
       return
     }
 

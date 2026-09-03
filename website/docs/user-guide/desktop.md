@@ -10,6 +10,10 @@ The Hermes desktop app is a native app built around the **same** agent you get f
 
 It runs on **macOS, Windows, and Linux**.
 
+Desktop can participate in the same active canonical conversation as the CLI,
+TUI, dashboard, and authorized messaging clients. See
+[Multi-Client Live Sessions](./features/multi-client-live-sessions.md).
+
 :::tip Which interface is which?
 Hermes has several front ends that all talk to the same agent:
 

@@ -168,6 +168,7 @@ class PersistentState:
     hygiene_failure_streak: int = 0
 
 
+
 @dataclass
 class SessionState:
     """All per-session gateway state, grouped by lifecycle scope."""
@@ -175,6 +176,9 @@ class SessionState:
     turn: TurnState = field(default_factory=TurnState)
     conversation: ConversationState = field(default_factory=ConversationState)
     persistent: PersistentState = field(default_factory=PersistentState)
+    # Independent lifecycle: survives turns and conversation rotation, but is
+    # explicitly replaced on durable-root changes and detached on shutdown.
+    live_runtime_attachments: Dict[str, Any] = field(default_factory=dict)
 
 
 # ---------------------------------------------------------------------------

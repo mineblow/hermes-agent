@@ -75,6 +75,11 @@ With the platform enabled, Hermes serves:
 
 Inbound tasks are injected into a **live gateway session** — the same agent, memory, and tools that serve your other channels — and the final reply is returned to the caller as the task result. Conversations are keyed by the A2A `contextId`, so a peer can hold a multi-turn exchange.
 
+A2A remains task-scoped producer/request-response automation, not a persistent
+presentation client: reusing `contextId` does not subscribe the peer to unrelated
+events in that gateway conversation. See the
+[live-session surface classification](/reference/live-session-surface-classification).
+
 Interoperability is verified against the official Python `a2a-sdk` (card resolution, `SendMessage`, streaming).
 
 ## Security model

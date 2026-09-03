@@ -2,6 +2,10 @@ import { useStore } from '@nanostores/react'
 import { type MutableRefObject, useCallback, useEffect, useRef } from 'react'
 
 import { graftRefreshedTailOntoBackfill } from '@/app/chat/transcript-backfill'
+import {
+  preserveLocalPendingTurnMessages,
+  reconcileResumeMessages
+} from '@/app/session/hooks/use-session-actions/utils'
 import { getLatestSessionMessages, type ProfileScope } from '@/hermes'
 import { preserveLocalAssistantErrors, sealOpenToolParts, toChatMessages } from '@/lib/chat-messages'
 import { createClientSessionState } from '@/lib/chat-runtime'
@@ -53,6 +57,7 @@ export function resolveActiveTranscriptSession(storedSessionId: string): ActiveT
 export interface ActiveTranscriptRefreshDeps {
   activeSessionIdRef: MutableRefObject<string | null>
   busyRef: MutableRefObject<boolean>
+  getSessionState: (sessionId: string) => ClientSessionState | undefined
   requestSequenceRef: MutableRefObject<number>
   selectedStoredSessionIdRef: MutableRefObject<string | null>
   resolveSession: (storedSessionId: string) => ActiveTranscriptSession | null | undefined
@@ -189,7 +194,10 @@ export async function reconcileTileTranscripts({
         state => ({
           ...state,
           messages: preserveLocalAssistantErrors(
-            graftRefreshedTailOntoBackfill(messages, state.messages),
+            preserveLocalPendingTurnMessages(
+              reconcileResumeMessages(graftRefreshedTailOntoBackfill(messages, state.messages), state.messages),
+              state.messages
+            ),
             state.messages
           )
         }),
@@ -205,6 +213,7 @@ export async function reconcileTileTranscripts({
 export async function reconcileActiveTranscript({
   activeSessionIdRef,
   busyRef,
+  getSessionState,
   requestSequenceRef,
   resolveSession,
   selectedStoredSessionIdRef,
@@ -226,6 +235,7 @@ export async function reconcileActiveTranscript({
 
   const requestId = requestSequenceRef.current + 1
   requestSequenceRef.current = requestId
+  const baselineMessages = getSessionState(runtimeSessionId)?.messages
 
   try {
     const profileScope: ProfileScope = stored.ownerRoute
@@ -241,7 +251,8 @@ export async function reconcileActiveTranscript({
       requestId !== requestSequenceRef.current ||
       busyRef.current ||
       selectedStoredSessionIdRef.current !== storedSessionId ||
-      activeSessionIdRef.current !== runtimeSessionId
+      activeSessionIdRef.current !== runtimeSessionId ||
+      getSessionState(runtimeSessionId)?.messages !== baselineMessages
     ) {
       return
     }
@@ -272,7 +283,13 @@ export async function reconcileActiveTranscript({
         // The refresh re-reads only the newest tail page; graft it onto any
         // older pages "Show earlier" already backfilled instead of clobbering
         // them (see transcript-backfill).
-        messages: preserveLocalAssistantErrors(graftRefreshedTailOntoBackfill(messages, state.messages), state.messages)
+        messages: preserveLocalAssistantErrors(
+          preserveLocalPendingTurnMessages(
+            reconcileResumeMessages(graftRefreshedTailOntoBackfill(messages, state.messages), state.messages),
+            state.messages
+          ),
+          state.messages
+        )
       }),
       storedSessionId
     )

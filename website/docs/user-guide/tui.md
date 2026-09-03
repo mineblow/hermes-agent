@@ -8,6 +8,10 @@ description: "Launch the modern terminal UI for Hermes — mouse-friendly, rich 
 
 The TUI is the modern front-end for Hermes — a terminal UI backed by the same Python runtime as the [Classic CLI](cli.md). Same agent, same sessions, same slash commands; a cleaner, more responsive surface for interacting with them.
 
+Resuming an already-live session attaches the TUI to its canonical runtime, so
+authorized peer input and runtime events stay ordered across surfaces. See
+[Multi-Client Live Sessions](features/multi-client-live-sessions.md).
+
 It's the recommended way to run Hermes interactively.
 
 ## Launch

@@ -756,6 +756,12 @@ export function useSubmitPrompt(deps: SubmitPromptDeps) {
         const submitParams = (targetId: string) => ({
           session_id: targetId,
           text,
+          // Lets every attached client insert the durable user row immediately,
+          // while the sender reconciles the event against its optimistic bubble.
+          client_message_id: optimisticId,
+          display_text: bubbleText,
+          submitted_at: submittedAt,
+          ...(attachmentRefs.length && { attachment_refs: attachmentRefs }),
           ...(interrupted && { interrupted }),
           // Off-screen widget intent: the gateway types the persisted user
           // row display_kind=hidden so no client renders it as a bubble.

@@ -9014,7 +9014,10 @@ def _define_discord_view_classes() -> None:
                 logger.error("Failed to resolve gateway approval from button: %s", exc)
                 count = 0
 
-            if not count:
+            if count and ":interaction:" in self.session_key:
+                color = discord.Color.dark_grey()
+                label = "Response submitted; awaiting active runtime confirmation"
+            elif not count:
                 color = discord.Color.dark_grey()
                 label = "⌛ Approval expired — command was not run (already timed out or resolved elsewhere)"
 

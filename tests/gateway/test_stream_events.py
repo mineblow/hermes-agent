@@ -18,6 +18,8 @@ from gateway.stream_events import (
     LongToolHint,
     MessageChunk,
     MessageStop,
+    InteractionRequest,
+    PeerUserMessage,
     ToolCallChunk,
     ToolCallFinished,
 )
@@ -38,6 +40,7 @@ class _FakeSink:
         self.deltas = []
         self.commentary = []
         self.segment_breaks = 0
+        self.finished = []
 
     def on_delta(self, text):
         self.deltas.append(text)
@@ -47,6 +50,9 @@ class _FakeSink:
 
     def on_segment_break(self):
         self.segment_breaks += 1
+
+    def finish(self, final_text=None):
+        self.finished.append(final_text)
 
 
 # ── Message events → sink ────────────────────────────────────────────────────
@@ -65,6 +71,15 @@ def test_intermediate_message_stop_breaks_segment_but_final_does_not():
     d.dispatch(MessageStop(final=False))
     d.dispatch(MessageStop(final=True))
     assert sink.segment_breaks == 1  # only the non-final stop breaks
+
+
+def test_canonical_final_stop_finishes_with_authoritative_text():
+    sink = _FakeSink()
+    d = GatewayEventDispatcher(_base_adapter(), sink)
+
+    d.dispatch(MessageStop(final=True, text="authoritative final"))
+
+    assert sink.finished == ["authoritative final"]
 
 
 def test_commentary_flows_to_sink():
@@ -101,5 +116,32 @@ def test_new_mode_dedups_same_tool():
 
 
 # ── Control events → gateway-owned hooks ─────────────────────────────────────
+
+
+def test_peer_user_and_interaction_events_use_gateway_owned_hooks():
+    peer_events = []
+    interactions = []
+    d = GatewayEventDispatcher(
+        _base_adapter(),
+        _FakeSink(),
+        on_peer_user=peer_events.append,
+        on_interaction=interactions.append,
+    )
+    peer = PeerUserMessage(
+        message_id="peer-1",
+        text="hello",
+        timestamp=1.0,
+    )
+    interaction = InteractionRequest(
+        request_id="approval-1",
+        interaction_type="approval",
+        payload={"tool": "terminal"},
+    )
+
+    d.dispatch(peer)
+    d.dispatch(interaction)
+
+    assert peer_events == [peer]
+    assert interactions == [interaction]
 
 

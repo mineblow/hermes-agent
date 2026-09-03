@@ -52,6 +52,56 @@ def test_enqueue_preserves_order_after_an_image_turn():
     ]
 
 
+def test_enqueue_rejects_envelopes_past_count_limit(monkeypatch):
+    monkeypatch.setattr(server, "_BUSY_QUEUE_MAX_ENTRIES", 2)
+    monkeypatch.setattr(server, "_BUSY_QUEUE_MAX_PAYLOAD_BYTES", 1_000_000)
+    session = _session()
+
+    assert server._enqueue_prompt(session, "A", "ws-1", image_paths=["a.png"])
+    assert server._enqueue_prompt(session, "B", "ws-1", image_paths=["b.png"])
+    assert not server._enqueue_prompt(
+        session, "C", "ws-1", image_paths=["c.png"]
+    )
+    assert len(server._busy_queue_entries(session)) == 2
+
+
+def test_enqueue_rejects_merged_text_past_utf8_byte_limit(monkeypatch):
+    monkeypatch.setattr(server, "_BUSY_QUEUE_MAX_ENTRIES", 32)
+    session = _session()
+    assert server._enqueue_prompt(session, "éé", "ws-1")
+    original = dict(session["queued_prompt"])
+    monkeypatch.setattr(
+        server,
+        "_BUSY_QUEUE_MAX_PAYLOAD_BYTES",
+        server._busy_queue_payload_bytes(original) + 1,
+    )
+
+    assert not server._enqueue_prompt(session, "é", "ws-1")
+    assert session["queued_prompt"] == original
+
+
+def test_busy_submit_reports_capacity_rejection_and_restores_claimed_images(
+    monkeypatch,
+):
+    monkeypatch.setattr(server, "_BUSY_QUEUE_MAX_ENTRIES", 1)
+    monkeypatch.setattr(server, "_BUSY_QUEUE_MAX_PAYLOAD_BYTES", 1_000_000)
+    session = _session(running=True, attached_images=["new.png"])
+    session["queued_prompt"] = {
+        "text": "already queued",
+        "transport": "ws-1",
+        "image_paths": ["old.png"],
+    }
+
+    response = server._handle_busy_submit(
+        "r1", "sid", session, "next", "ws-1", busy_policy="queue"
+    )
+
+    assert response["error"] == {
+        "code": -32002,
+        "message": "busy queue capacity exceeded",
+    }
+    assert session["attached_images"] == ["new.png"]
+    assert len(server._busy_queue_entries(session)) == 1
 
 
 # ── _handle_busy_submit (policy) ───────────────────────────────────────────
@@ -170,6 +220,79 @@ def test_enqueue_skips_text_duplicate_of_inflight_user():
         "text": "different follow-up",
         "transport": "ws-1",
     }
+
+
+def test_inflight_snapshot_keeps_request_origin():
+    session = _session()
+
+    server._start_inflight_turn(
+        session,
+        "hello",
+        origin_client_id="client-a",
+        request_id="request-a",
+    )
+
+    assert session["inflight_turn"]["origin_client_id"] == "client-a"
+    assert session["inflight_turn"]["request_id"] == "request-a"
+
+
+def test_enqueue_different_clients_preserves_fifo_without_merging():
+    session = _session()
+
+    server._enqueue_prompt(
+        session,
+        "from A",
+        "ws-a",
+        origin_client_id="client-a",
+        request_id="request-a",
+    )
+    server._enqueue_prompt(
+        session,
+        "from B",
+        "ws-b",
+        origin_client_id="client-b",
+        request_id="request-b",
+    )
+
+    assert session["queued_prompt"] == {
+        "text": "from A",
+        "origin_client_id": "client-a",
+        "request_id": "request-a",
+    }
+    assert session["queued_prompts"] == [
+        {
+            "text": "from B",
+            "origin_client_id": "client-b",
+            "request_id": "request-b",
+        }
+    ]
+
+
+def test_enqueue_same_client_can_merge_without_losing_request_origins():
+    session = _session()
+
+    server._enqueue_prompt(
+        session,
+        "first",
+        "ws-a",
+        origin_client_id="client-a",
+        request_id="request-a",
+    )
+    server._enqueue_prompt(
+        session,
+        "second",
+        "ws-a-reconnected",
+        origin_client_id="client-a",
+        request_id="request-b",
+    )
+
+    assert session["queued_prompt"] == {
+        "text": "first\n\nsecond",
+        "origin_client_id": "client-a",
+        "request_id": "request-a",
+        "request_ids": ["request-a", "request-b"],
+    }
+    assert "transport" not in session["queued_prompt"]
 
 
 def test_enqueue_followup_does_not_merge_stale_inflight_self_duplicate():
@@ -559,11 +682,12 @@ def test_busy_submit_claims_attached_image_for_queued_turn(monkeypatch):
     assert redirected == []
     assert not interrupted.wait(0.1)
     assert session["attached_images"] == []
-    assert session["queued_prompt"] == {
-        "text": "is this B?",
-        "image_paths": ["/tmp/b.png"],
-        "transport": None,
-    }
+    queued = session["queued_prompt"]
+    assert queued["text"] == "is this B?"
+    assert queued["image_paths"] == ["/tmp/b.png"]
+    assert queued["request_id"] == "r1"
+    assert queued["origin_client_id"].startswith("legacy-transport-")
+    assert "transport" not in queued
 
 
 def test_busy_image_prompts_keep_b_and_c_attachments_in_submission_order(monkeypatch):
@@ -588,9 +712,12 @@ def test_busy_image_prompts_keep_b_and_c_attachments_in_submission_order(monkeyp
         server._methods["prompt.submit"]("c", {"session_id": "sid", "text": "C"})
 
         assert session["queued_prompt"]["image_paths"] == ["/tmp/b.png"]
-        assert session["queued_prompts"] == [
-            {"text": "C", "image_paths": ["/tmp/c.png"], "transport": None}
-        ]
+        queued_c = session["queued_prompts"][0]
+        assert queued_c["text"] == "C"
+        assert queued_c["image_paths"] == ["/tmp/c.png"]
+        assert queued_c["request_id"] == "c"
+        assert queued_c["origin_client_id"].startswith("legacy-transport-")
+        assert "transport" not in queued_c
 
         session["running"] = False
         assert server._drain_queued_prompt("drain-b", "sid", session) is True
@@ -599,20 +726,20 @@ def test_busy_image_prompts_keep_b_and_c_attachments_in_submission_order(monkeyp
     finally:
         server._sessions.pop("sid", None)
 
-    assert dispatched == [
-        (
-            "drain-b",
-            "sid",
-            "B",
-            {"image_paths": ["/tmp/b.png"], "queued_prompt_generation": 0},
-        ),
-        (
-            "drain-c",
-            "sid",
-            "C",
-            {"image_paths": ["/tmp/c.png"], "queued_prompt_generation": 0},
-        ),
+    assert [(rid, sid, text) for rid, sid, text, _ in dispatched] == [
+        ("drain-b", "sid", "B"),
+        ("drain-c", "sid", "C"),
     ]
+    for (_, _, _, kwargs), image, request_id in zip(
+        dispatched,
+        ("/tmp/b.png", "/tmp/c.png"),
+        ("b", "c"),
+        strict=True,
+    ):
+        assert kwargs["image_paths"] == [image]
+        assert kwargs["queued_prompt_generation"] == 0
+        assert kwargs["request_id"] == request_id
+        assert kwargs["origin_client_id"].startswith("legacy-transport-")
 
 
 # ── _drain_queued_prompt ───────────────────────────────────────────────────
@@ -779,4 +906,3 @@ def test_drain_continues_with_later_queued_prompt_after_dispatch_failure(monkeyp
     assert calls == ["broken", "next"]
     assert session["queued_prompt"] is None
     assert session.get("queued_prompts") is None
-

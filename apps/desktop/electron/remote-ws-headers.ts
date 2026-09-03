@@ -27,11 +27,26 @@ export function createRemoteWsHeaderStore(limit = 100) {
   const headersByUrl = new Map<string, Record<string, string>>()
 
   const remember = (wsUrl: string, headers: Record<string, string> = {}) => {
-    if (!wsUrl || Object.keys(headers).length === 0) {
+    if (!wsUrl) {
       return
     }
 
-    headersByUrl.set(String(wsUrl), headers)
+    let origin: string
+
+    try {
+      const parsed = new URL(String(wsUrl))
+
+      if (parsed.protocol !== 'ws:' && parsed.protocol !== 'wss:') {
+        return
+      }
+
+      parsed.protocol = parsed.protocol === 'wss:' ? 'https:' : 'http:'
+      origin = parsed.origin
+    } catch {
+      return
+    }
+
+    headersByUrl.set(String(wsUrl), { ...headers, Origin: origin })
 
     while (headersByUrl.size > limit) {
       const oldest = headersByUrl.keys().next().value

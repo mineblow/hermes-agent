@@ -126,3 +126,60 @@ def test_compute_host_interrupt_uses_explicit_stop_compatibility(kind):
 
     assert calls == ["hard" if kind == "hard-only" else "legacy"]
     assert emitted[-1]["applied"] is True
+
+
+def test_real_turn_forwards_user_event_metadata_to_gateway_runner(monkeypatch):
+    from tui_gateway import server
+
+    captured = {}
+    session = {
+        "history_lock": threading.RLock(),
+        "history": [],
+        "history_version": 0,
+        "running": False,
+        "session_key": "session-key",
+        "agent": None,
+    }
+    host = ComputeHost(heartbeat_secs=0)
+    host.emit = lambda _frame: None
+    monkeypatch.setattr(host, "_ensure_server_session", lambda _server, _frame: session)
+    monkeypatch.setattr(server, "_start_inflight_turn", lambda *_args: None)
+    monkeypatch.setattr(server, "_ensure_session_db_row", lambda *_args: None)
+    monkeypatch.setattr(server, "_persist_branch_seed", lambda *_args: None)
+    monkeypatch.setattr(server, "_session_info", lambda *_args: {})
+    monkeypatch.setattr(
+        server,
+        "_run_prompt_submit",
+        lambda rid, sid, session, text, **kwargs: captured.update(
+            rid=rid, sid=sid, text=text, **kwargs
+        ),
+    )
+
+    try:
+        host._run_real_turn({
+            "type": "turn.start",
+            "sid": "sid",
+            "request_id": "r1",
+            "session_key": "session-key",
+            "text": "expanded model-facing prompt",
+            "client_message_id": "user-pc1-123",
+            "display_text": "hello from pc 1",
+            "submitted_at": 1234.5,
+            "attachment_refs": ["attachment://one"],
+            "display_metadata": {"platform": "discord", "user_id": "user-1"},
+        })
+    finally:
+        host.close()
+
+    assert captured == {
+        "rid": "r1",
+        "sid": "sid",
+        "text": "expanded model-facing prompt",
+        "display_kind": None,
+        "display_metadata": {"platform": "discord", "user_id": "user-1"},
+        "client_message_id": "user-pc1-123",
+        "client_identity": None,
+        "display_text": "hello from pc 1",
+        "submitted_at": 1234.5,
+        "attachment_refs": ["attachment://one"],
+    }

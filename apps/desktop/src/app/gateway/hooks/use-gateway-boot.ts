@@ -742,7 +742,31 @@ export function useGatewayBoot({
       }
     }
 
-    const gateway = adoptedFromHmr ? survivor!.gateway : new HermesGateway()
+    const sourceProfile = normalizeProfileKey($activeGatewayProfile.get())
+    const gateway = adoptedFromHmr
+      ? survivor!.gateway
+      : new HermesGateway({
+          onDurableResyncRequired: request => {
+            const connectionId = activeGatewayConnectionId()
+            callbacksRef.current.handleGatewayEvent({
+              type: 'session.durable_resync_required',
+              session_id: request.session_id,
+              payload: request,
+              profile: sourceProfile,
+              ...(connectionId ? { connectionId } : {})
+            })
+          },
+          onRuntimeSessionRebound: rebound => {
+            const connectionId = activeGatewayConnectionId()
+            callbacksRef.current.handleGatewayEvent({
+              type: 'session.runtime_recovered',
+              session_id: rebound.new_session_id,
+              payload: rebound,
+              profile: sourceProfile,
+              ...(connectionId ? { connectionId } : {})
+            })
+          }
+        })
 
     callbacksRef.current.onGatewayReady(gateway)
     setPrimaryGateway(gateway, survivor?.profile ?? normalizeProfileKey($activeGatewayProfile.get()))
@@ -834,8 +858,6 @@ export function useGatewayBoot({
         scheduleReconnect()
       }
     })
-
-    const sourceProfile = normalizeProfileKey($activeGatewayProfile.get())
 
     const offEvent = gateway.onEvent(event => {
       const connectionId = activeGatewayConnectionId()

@@ -18,6 +18,7 @@ class FakeWebSocket {
 
   listeners = new Map<string, Array<(event: EventLike) => void>>();
   readyState = 0;
+  sent: string[] = [];
   url: string;
 
   constructor(url: string) {
@@ -47,17 +48,21 @@ class FakeWebSocket {
     );
   }
 
-  send() {}
+  send(frame: string) {
+    this.sent.push(frame);
+  }
 }
 
 type EventLike = {
   code?: number;
+  data?: string;
 };
 
 beforeEach(() => {
   FakeWebSocket.instances = [];
   reloadMocks.maybeReloadForLoopbackWsAuthFailure.mockClear();
   vi.stubGlobal("WebSocket", FakeWebSocket);
+  sessionStorage.clear();
   Object.defineProperty(window, "__HERMES_SESSION_TOKEN__", {
     configurable: true,
     value: "stale-token",
@@ -75,6 +80,16 @@ afterEach(() => {
 });
 
 describe("GatewayClient", () => {
+  it("forwards durable resync recovery to the shared gateway client", () => {
+    const onDurableResyncRequired = vi.fn();
+    const gw = new GatewayClient({ onDurableResyncRequired });
+    const internal = gw as unknown as {
+      options: { onDurableResyncRequired?: (request: unknown) => void };
+    };
+
+    expect(internal.options.onDurableResyncRequired).toBe(onDurableResyncRequired);
+  });
+
   it("treats loopback 4401 closes as stale-token reload candidates", async () => {
     reloadMocks.maybeReloadForLoopbackWsAuthFailure.mockReturnValue(true);
     const gw = new GatewayClient();
@@ -84,6 +99,46 @@ describe("GatewayClient", () => {
     const socket = FakeWebSocket.instances[0];
     socket.readyState = 1;
     socket.emit("open", {});
+    socket.emit("message", {
+      data: JSON.stringify({
+        jsonrpc: "2.0",
+        method: "event",
+        params: {
+          type: "gateway.ready",
+          payload: {
+            connection_id: "connection-1",
+            replay_epoch: "epoch-1",
+            multi_client: {
+              protocol_version: 1,
+              attachment_modes: ["observe", "control"],
+              methods: ["client.attach", "session.attach", "session.events.since"],
+            },
+          },
+        },
+      }),
+    });
+    await vi.waitFor(() => expect(socket.sent).toHaveLength(1));
+    const attach = JSON.parse(socket.sent[0]);
+    expect(attach.method).toBe("client.attach");
+    expect(attach.params).toMatchObject({
+      client_id: expect.stringMatching(/^web:/),
+      protocol_version: 1,
+      surface: "web",
+    });
+    socket.emit("message", {
+      data: JSON.stringify({
+        jsonrpc: "2.0",
+        id: attach.id,
+        result: {
+          capabilities: ["session.observe", "session.control", "session.replay"],
+          client_id: attach.params.client_id,
+          connection_id: "connection-1",
+          idempotent: false,
+          protocol_version: 1,
+          surface: "web",
+        },
+      }),
+    });
     await connectPromise;
 
     socket.emit("close", { code: 4401 });

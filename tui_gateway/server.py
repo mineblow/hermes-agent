@@ -9,8 +9,11 @@ import json
 import logging
 import os
 import queue
+import re
+import socket
 import subprocess
 import sys
+import tempfile
 import threading
 import time
 import uuid
@@ -146,6 +149,12 @@ _methods: dict[str, callable] = {}
 _pending: dict[str, tuple[str, threading.Event]] = {}
 _pending_prompt_payloads: dict[str, tuple[str, dict]] = {}
 _answers: dict[str, str] = {}
+_clarification_outcomes: dict[str, tuple[str, float]] = {}
+_CLARIFICATION_OUTCOMES_MAX = 1024
+_CLARIFICATION_OUTCOME_TTL_S = 300.0
+_approval_resolution_lock = threading.Lock()
+_approval_resolution_outcomes: dict[tuple[str, str], str] = {}
+_APPROVAL_RESOLUTION_OUTCOMES_MAX = 1024
 # Batch clarify accumulators: rid → {"qids": [...], "answers": {qid: answer}}.
 # Written by clarify.respond (per-question lock, update-in-place), read out by
 # _block on resolution/timeout so locked answers survive the deadline.
@@ -153,17 +162,50 @@ _batch_clarify: dict[str, dict] = {}
 _db = None
 _db_error: str | None = None
 _stdout_lock = threading.Lock()
+_legacy_event_publish_lock = threading.RLock()
 _cfg_lock = threading.Lock()
 # Shared profile UI metadata can be updated concurrently by Desktop, mobile,
 # and multiple worker-pool RPCs.  Its compare/check/write transaction needs a
 # dedicated lock rather than the unrelated process-config cache lock.
 _profile_ui_meta_lock = threading.Lock()
 _sessions_lock = threading.RLock()  # reentrant: _close_session_by_id may run under callers that already hold it
+_client_identity_lock = threading.Lock()
+_client_principals: dict[str, tuple[str, float]] = {}
+_CLIENT_IDENTITIES_MAX = 4096
 _prompt_lock = threading.Lock()
 _cfg_cache: dict | None = None
 _cfg_mtime: float | None = None
 _cfg_path = None
 _session_resume_lock = threading.Lock()
+_runtime_build_locks_guard = threading.Lock()
+_runtime_build_locks: dict[str, tuple[threading.Lock, int]] = {}
+
+
+@contextlib.contextmanager
+def _runtime_build_singleflight(key: str):
+    """Serialize construction/publication for one canonical conversation root."""
+
+    normalized = str(key).strip()
+    if not normalized:
+        raise ValueError("runtime build key must be non-empty")
+    with _runtime_build_locks_guard:
+        lock, users = _runtime_build_locks.get(normalized, (threading.Lock(), 0))
+        _runtime_build_locks[normalized] = (lock, users + 1)
+    lock.acquire()
+    try:
+        yield
+    finally:
+        lock.release()
+        with _runtime_build_locks_guard:
+            current = _runtime_build_locks.get(normalized)
+            if current is not None and current[0] is lock:
+                remaining = current[1] - 1
+                if remaining <= 0:
+                    _runtime_build_locks.pop(normalized, None)
+                else:
+                    _runtime_build_locks[normalized] = (lock, remaining)
+
+
 try:
     _slash_timeout = float(os.environ.get("HERMES_TUI_SLASH_TIMEOUT_S") or "45")
 except (ValueError, TypeError):
@@ -1152,6 +1194,11 @@ def _teardown_session(session: dict | None, *, end_reason: str = "tui_close") ->
     _finalize_session(session, end_reason=end_reason)
     _announce_session_reclaimed(session, end_reason)
     try:
+        if hub := session.get("event_hub"):
+            hub.close()
+    except Exception:
+        logger.debug("session event hub close failed", exc_info=True)
+    try:
         from tools.approval import unregister_gateway_notify
 
         if key := session.get("session_key"):
@@ -1164,6 +1211,14 @@ def _teardown_session(session: dict | None, *, end_reason: str = "tui_close") ->
             agent.close()
     except Exception:
         pass
+    runtime_owner_lease = session.get("runtime_owner_lease")
+    if runtime_owner_lease is not None:
+        try:
+            released = runtime_owner_lease.release()
+            if released or getattr(runtime_owner_lease, "released", False):
+                session.pop("runtime_owner_lease", None)
+        except Exception:
+            logger.warning("Failed to release canonical runtime owner", exc_info=True)
     # NOTE: the slash-worker is closed inside _finalize_session (the single
     # _finalized-guarded chokepoint that main folded it into), exactly once.
     # We deliberately do NOT re-close it here — _teardown_session's job beyond
@@ -1205,6 +1260,17 @@ def _pop_session_by_id(sid: str) -> dict | None:
     return session
 
 
+def _pop_session_if_current(sid: str, expected: dict) -> dict | None:
+    """Atomically claim ``expected`` for teardown without popping a replacement."""
+    with _sessions_lock:
+        if _sessions.get(sid) is not expected:
+            return None
+        expected["_closing"] = True
+        _sessions.pop(sid, None)
+    expected["_sid"] = sid
+    return expected
+
+
 def _teardown_popped_session(
     session: dict | None, *, end_reason: str = "tui_close"
 ) -> bool:
@@ -1227,7 +1293,12 @@ def _teardown_popped_session(
                 )
         except Exception:
             logger.debug("failed waiting for session turn thread", exc_info=True)
-    _teardown_session(session, end_reason=end_reason)
+    try:
+        _teardown_session(session, end_reason=end_reason)
+    finally:
+        from tui_gateway.event_replay import release_session
+
+        release_session(str(session.get("_sid") or ""))
     return True
 
 
@@ -1261,12 +1332,13 @@ def _close_session_by_id(
 
 
 def _ws_session_is_detached(session: dict | None) -> bool:
-    """True if a live session is still bound to the disconnected-WS sentinel."""
-    return bool(
-        session
-        and not session.get("_finalized")
-        and session.get("transport") is _detached_ws_transport
-    )
+    """True when a live runtime has no attached clients."""
+    if not session or session.get("_finalized"):
+        return False
+    hub = session.get("event_hub")
+    if hub is not None:
+        return hub.count() == 0
+    return session.get("transport") is _detached_ws_transport
 
 
 def _ws_session_is_orphaned(session: dict | None) -> bool:
@@ -1614,12 +1686,53 @@ def _close_sessions_for_transport(
 
     Returns ``(reaped, detached)`` counts for disconnect-path observability."""
     with _sessions_lock:
-        owned = [(sid, s) for sid, s in _sessions.items() if s.get("transport") is transport]
+        owned = [
+            (sid, session)
+            for sid, session in _sessions.items()
+            if (
+                (
+                    session.get("event_hub") is not None
+                    and session["event_hub"].has_transport(transport)
+                )
+                or (
+                    session.get("event_hub") is None
+                    and session.get("transport") is transport
+                )
+            )
+        ]
     reaped = 0
     detached = 0
     for sid, session in owned:
         claimed_for_teardown = None
         should_schedule_reap = False
+        hub = session.get("event_hub")
+        if hub is not None:
+            # Never wait for a writer shutdown while holding lifecycle locks.
+            # Recheck the session generation before and after detach; reconnect
+            # may replace the attachment concurrently.
+            with _session_resume_lock:
+                with _sessions_lock:
+                    current = _sessions.get(sid)
+                    if current is not session or not hub.has_transport(transport):
+                        continue
+            try:
+                removed = _detach_transport_from_session(
+                    sid, session, transport, end_reason=end_reason
+                )
+            except RuntimeError:
+                logger.warning("session attachment detach timed out sid=%s", sid)
+                removed = not hub.has_transport(transport)
+            if not removed:
+                continue
+            if hub.count() > 0:
+                continue
+            with _sessions_lock:
+                current = _sessions.get(sid)
+                if current is None:
+                    reaped += 1
+                elif current is session and _ws_session_is_detached(current):
+                    detached += 1
+            continue
         # A session.resume fast-path rebinds its live session while holding
         # _session_resume_lock. Take that lock before re-checking the snapshot
         # so a reconnect cannot move the transport between this check and the
@@ -1898,7 +2011,11 @@ def _session_is_evictable(sid: str, session: dict, now: float) -> bool:
     # so their forever-unset agent_ready must not make them immortal.
     if ready is not None and not ready.is_set() and not session.get("lazy"):
         return False
-    if not _transport_is_dead(session.get("transport")):
+    hub = session.get("event_hub")
+    if hub is not None:
+        if hub.count() > 0:
+            return False
+    elif not _transport_is_dead(session.get("transport")):
         return False
     last_active = float(session.get("last_active") or 0.0)
     created_at = float(session.get("created_at") or 0.0)
@@ -1991,6 +2108,9 @@ def _session_is_lru_evictable(sid: str, session: dict) -> bool:
     ready = session.get("agent_ready")
     if ready is not None and not ready.is_set() and not session.get("lazy"):
         return False
+    hub = session.get("event_hub")
+    if hub is not None:
+        return hub.count() == 0
     return _transport_is_dead(session.get("transport"))
 
 
@@ -2588,14 +2708,170 @@ def _default_session_cwd() -> str:
     return _launch_configured_cwd() or os.getenv("TERMINAL_CWD") or os.getcwd()
 
 
-def write_json(obj: dict) -> bool:
+def _legacy_client_id_for_transport(transport: object) -> str:
+    """Return a deterministic attachment id until client negotiation exists."""
+    for attribute in ("client_id", "connection_id"):
+        value = getattr(transport, attribute, None)
+        if value is not None and str(value).strip():
+            return str(value).strip()
+    return f"legacy-transport-{id(transport):x}"
+
+
+def _active_client_ids() -> set[str]:
+    """Snapshot stable client IDs currently attached to any live runtime."""
+    with _sessions_lock:
+        hubs = [
+            session.get("event_hub")
+            for session in _sessions.values()
+            if session.get("event_hub") is not None
+        ]
+    return {str(snapshot["client_id"]) for hub in hubs for snapshot in hub.snapshots()}
+
+
+def _bind_client_identity(transport: object, requested: object) -> tuple[str, bool]:
+    """Bind a validated stable client id to one authenticated connection."""
+    client_id = str(requested or "").strip()
+    if not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._:-]{0,127}", client_id):
+        raise ValueError("client_id must be 1-128 safe identifier characters")
+    existing = getattr(transport, "client_id", None)
+    if existing is not None and str(existing) != client_id:
+        raise PermissionError("connection identity is already bound")
+
+    identity = getattr(transport, "auth_identity", None)
+    if isinstance(identity, dict) and identity:
+        encoded = json.dumps(
+            identity, sort_keys=True, separators=(",", ":"), default=str
+        )
+        principal = "auth:" + hashlib.sha256(encoded.encode("utf-8")).hexdigest()
+    else:
+        # Legacy local/token transports share the gateway owner's trust scope;
+        # the client id still never grants capabilities by itself.
+        principal = "gateway-owner"
+    active_client_ids = _active_client_ids()
+    with _client_identity_lock:
+        record = _client_principals.get(client_id)
+        bound_principal = record[0] if isinstance(record, tuple) else record
+        if bound_principal is not None and bound_principal != principal:
+            raise PermissionError("client_id belongs to another principal")
+        if bound_principal is None:
+            if len(_client_principals) >= _CLIENT_IDENTITIES_MAX:
+                for candidate in list(_client_principals):
+                    if candidate not in active_client_ids:
+                        _client_principals.pop(candidate, None)
+                        break
+            if len(_client_principals) >= _CLIENT_IDENTITIES_MAX:
+                raise RuntimeError("client identity registry is full")
+        else:
+            # Refresh insertion order so the dictionary itself is the LRU queue.
+            _client_principals.pop(client_id, None)
+        _client_principals[client_id] = (principal, time.monotonic())
+        setattr(transport, "client_id", client_id)
+    return client_id, existing == client_id
+
+
+def _ensure_session_event_hub(sid: str, session: dict):
+    """Return the one event hub owned by this live runtime record."""
+    from tui_gateway.session_events import SessionEventHub
+
+    with _sessions_lock:
+        hub = session.get("event_hub")
+        if hub is None:
+            hub = SessionEventHub(
+                on_detach=lambda _transport: _apply_zero_attachment_policy(
+                    sid, session, end_reason="attachment_failure"
+                )
+            )
+            session["event_hub"] = hub
+        return hub
+
+
+def _attach_current_transport(
+    sid: str,
+    session: dict,
+    mode="control",
+    *,
+    transport: Transport | None = None,
+):
+    """Attach the caller while retaining ``transport`` as a compatibility alias."""
+    from tui_gateway.session_events import AttachmentMode
+
+    target = transport or current_transport() or _stdio_transport
+    hub = _ensure_session_event_hub(sid, session)
+    hub.attach(
+        target,
+        client_id=_legacy_client_id_for_transport(target),
+        mode=AttachmentMode.parse(mode),
+        capabilities=getattr(target, "negotiated_capabilities", None),
+    )
+    with _sessions_lock:
+        # Compatibility only: event ownership and fan-out live in event_hub.
+        session["transport"] = target
+        session.pop("_zero_attachment_policy_applied", None)
+        session.setdefault("viewers", {})[target] = time.time()
+    if target is not _detached_ws_transport:
+        _cancel_ws_orphan_reap(sid)
+    return hub
+
+
+def _apply_zero_attachment_policy(
+    sid: str,
+    session: dict,
+    *,
+    end_reason: str,
+) -> None:
+    """Apply orphan/close policy once when a live runtime loses its final client."""
+    hub = session.get("event_hub")
+    claimed_for_teardown = None
+    should_schedule_reap = False
+    with _session_resume_lock:
+        with _sessions_lock:
+            current = _sessions.get(sid)
+            if (
+                current is not session
+                or hub is None
+                or hub.count() > 0
+                or current.get("_zero_attachment_policy_applied")
+            ):
+                return
+            current["_zero_attachment_policy_applied"] = True
+            if current.get("close_on_disconnect"):
+                claimed_for_teardown = _pop_session_by_id(sid)
+            else:
+                current["transport"] = _detached_ws_transport
+                current.pop("_client_gone_interrupt_requested", None)
+                current.pop("_client_gone_interrupt_polls", None)
+                should_schedule_reap = True
+    if claimed_for_teardown is not None:
+        _teardown_popped_session(claimed_for_teardown, end_reason=end_reason)
+    elif should_schedule_reap:
+        _schedule_ws_orphan_reap(sid)
+
+
+def _detach_transport_from_session(
+    sid: str,
+    session: dict,
+    transport: object,
+    *,
+    end_reason: str = "session_detach",
+) -> bool:
+    """Detach one client and apply lifetime policy on the zero-count transition."""
+    hub = session.get("event_hub")
+    if hub is None:
+        return False
+    removed = hub.detach(transport)
+    if removed:
+        _apply_zero_attachment_policy(sid, session, end_reason=end_reason)
+    return removed
+
+
+def write_json(obj: dict, *, wait_for_delivery: bool = False) -> bool:
     """Emit one JSON frame. Routes via the most-specific transport available.
 
     Precedence:
 
-    1. Event frames with a session id → the transport stored on that session,
-       so async events land with the client that owns the session even if
-       the emitting thread has no contextvar binding.
+    1. Event frames with a session id → the session's event hub when present,
+       or its legacy single transport otherwise. The hub stamps and records the
+       event inside the same total-order publication boundary used for fan-out.
     2. Otherwise the transport bound on the current context (set by
        :func:`dispatch` for the lifetime of a request).
     3. Otherwise the module-level stdio transport, matching the historical
@@ -2609,15 +2885,34 @@ def write_json(obj: dict) -> bool:
     if obj.get("method") == "event":
         params = obj.get("params")
         sid = ((params or {}).get("session_id")) if isinstance(params, dict) else ""
-        if sid and (t := (_sessions.get(sid) or {}).get("transport")) is not None:
+        session = _sessions.get(sid) if sid else None
+        if session is not None:
+            from tui_gateway.event_replay import _stamp_event
+
+            hub = session.get("event_hub")
+            if hub is not None:
+                return hub.publish(
+                    obj,
+                    prepare=_stamp_event,
+                    wait_for_delivery=wait_for_delivery,
+                )
+            if (t := session.get("transport")) is not None:
+                # Compatibility path for sessions not migrated to
+                # SessionEventHub yet. Keep replay sequence assignment and
+                # transport delivery in one total order.
+                with _legacy_event_publish_lock:
+                    _stamp_event(obj)
+                    return t.write(obj)
+
+    if obj.get("method") == "event":
+        # Compatibility path for sessions not migrated to SessionEventHub yet.
+        # Keep replay sequence assignment and transport delivery in one total
+        # order so concurrent emitters cannot deliver seq=2 before seq=1.
+        with _legacy_event_publish_lock:
             from tui_gateway.event_replay import _stamp_event
 
             _stamp_event(obj)
-            return t.write(obj)
-
-    from tui_gateway.event_replay import _stamp_event
-
-    _stamp_event(obj)
+            return (current_transport() or _stdio_transport).write(obj)
     return (current_transport() or _stdio_transport).write(obj)
 
 
@@ -2628,8 +2923,17 @@ def _event_frame(event: str, sid: str, payload: dict | None = None) -> dict:
     return {"jsonrpc": "2.0", "method": "event", "params": params}
 
 
-def _emit(event: str, sid: str, payload: dict | None = None):
-    write_json(_event_frame(event, sid, payload))
+def _emit(
+    event: str,
+    sid: str,
+    payload: dict | None = None,
+    *,
+    wait_for_delivery: bool = False,
+) -> bool:
+    return write_json(
+        _event_frame(event, sid, payload),
+        wait_for_delivery=wait_for_delivery,
+    )
 
 
 # Live client transports, one per connected WS peer (maintained by tui_gateway.ws).
@@ -2732,6 +3036,12 @@ def _compute_host_turn_frame(
     image_paths: list[str] | None = None,
     queued_prompt_generation: int | None = None,
     display_kind: str | None = None,
+    display_metadata: dict | None = None,
+    client_message_id: str | None = None,
+    client_identity: tuple[str, str] | None = None,
+    display_text: str | None = None,
+    submitted_at: float | None = None,
+    attachment_refs: list[str] | None = None,
 ) -> dict:
     with session["history_lock"]:
         history = list(session.get("history", []))
@@ -2748,6 +3058,28 @@ def _compute_host_turn_frame(
         "session_key": session.get("session_key") or sid,
         "text": text,
         **({"display_kind": display_kind} if display_kind else {}),
+        **(
+            {"display_metadata": dict(display_metadata)}
+            if display_metadata is not None
+            else {}
+        ),
+        **(
+            {"client_message_id": client_message_id}
+            if client_message_id
+            else {}
+        ),
+        **(
+            {"client_identity": list(client_identity)}
+            if client_identity is not None
+            else {}
+        ),
+        **({"display_text": display_text} if display_text is not None else {}),
+        **({"submitted_at": submitted_at} if submitted_at is not None else {}),
+        **(
+            {"attachment_refs": list(attachment_refs)}
+            if attachment_refs is not None
+            else {}
+        ),
         "history": history,
         "history_version": history_version,
         "cols": int(session.get("cols", 80) or 80),
@@ -2920,6 +3252,12 @@ def _submit_prompt_to_compute_host(
     image_paths: list[str] | None = None,
     queued_prompt_generation: int | None = None,
     display_kind: str | None = None,
+    display_metadata: dict | None = None,
+    client_message_id: str | None = None,
+    client_identity: tuple[str, str] | None = None,
+    display_text: str | None = None,
+    submitted_at: float | None = None,
+    attachment_refs: list[str] | None = None,
 ) -> dict:
     cfg = _load_dashboard_process_isolation_config()
     frame = _compute_host_turn_frame(
@@ -2930,6 +3268,12 @@ def _submit_prompt_to_compute_host(
         image_paths=image_paths,
         queued_prompt_generation=queued_prompt_generation,
         display_kind=display_kind,
+        display_metadata=display_metadata,
+        client_message_id=client_message_id,
+        client_identity=client_identity,
+        display_text=display_text,
+        submitted_at=submitted_at,
+        attachment_refs=attachment_refs,
     )
 
     def _complete(done: dict) -> None:
@@ -3054,49 +3398,52 @@ def _approval_request_payload(data: dict | None) -> dict:
     return payload
 
 
-def _pending_clarify_request_payload(sid: str) -> dict | None:
-    """Read the clarify prompt still blocking a session, if there is one.
-
-    Clarify prompts share `_block()`'s pending registry, so a reconnecting
-    client whose transport was detached when `clarify.request` was emitted
-    would otherwise never see the question — the agent thread stays parked on
-    the Event until timeout. Same replay contract as `pending_approval`: a
-    read-only snapshot, the registry stays authoritative and `clarify.respond`
-    with the embedded request_id resolves it.
-    """
+def _pending_clarify_request_payloads(sid: str) -> list[dict]:
+    """Read every clarify prompt still blocking a session."""
+    snapshots = []
     with _prompt_lock:
         for rid, (owner_sid, _ev) in _pending.items():
             if owner_sid != sid:
                 continue
             event, prompt_payload = _pending_prompt_payloads.get(rid, ("", {}))
-            if event == "clarify.request":
-                snapshot = dict(prompt_payload)
-                # Batch clarify: replay the answers locked so far, so a
-                # reconnecting client restores its per-question ✓ state
-                # instead of presenting every question as unanswered.
-                batch = _batch_clarify.get(rid)
-                if batch is not None and batch["answers"]:
-                    snapshot["answers"] = dict(batch["answers"])
-                return snapshot
+            if event != "clarify.request":
+                continue
+            snapshot = dict(prompt_payload)
+            batch = _batch_clarify.get(rid)
+            if batch is not None and batch["answers"]:
+                snapshot["answers"] = dict(batch["answers"])
+            snapshots.append(snapshot)
     session = _sessions.get(sid)
     if session is not None:
         with session.get("history_lock", threading.Lock()):
             pending = session.get("_compute_host_pending_clarify")
             if isinstance(pending, dict):
-                return dict(pending)
-    return None
+                snapshots.append(dict(pending))
+    return snapshots
+
+
+def _pending_clarify_request_payload(sid: str) -> dict | None:
+    """Read the oldest clarify prompt still blocking a session, if any."""
+    snapshots = _pending_clarify_request_payloads(sid)
+    return snapshots[0] if snapshots else None
+
+
+def _pending_approval_request_payloads(session_key: str) -> list[dict]:
+    """Read all unresolved approvals in a session."""
+    try:
+        from tools.approval import list_gateway_approvals
+
+        approvals = list_gateway_approvals(session_key)
+    except Exception:
+        logger.debug("failed to read pending approvals for %s", session_key, exc_info=True)
+        return []
+    return [_approval_request_payload(approval) for approval in approvals]
 
 
 def _pending_approval_request_payload(session_key: str) -> dict | None:
     """Read the oldest unresolved approval in a session, if there is one."""
-    try:
-        from tools.approval import get_pending_gateway_approval
-
-        approval = get_pending_gateway_approval(session_key)
-    except Exception:
-        logger.debug("failed to read pending approval for %s", session_key, exc_info=True)
-        return None
-    return _approval_request_payload(approval) if approval else None
+    approvals = _pending_approval_request_payloads(session_key)
+    return approvals[0] if approvals else None
 
 
 def _emit_approval_request(sid: str, data: dict | None) -> None:
@@ -3171,6 +3518,186 @@ def method(name: str):
     return dec
 
 
+_SESSION_RPC_CAPABILITIES = {
+    "prompt.submit": "prompt.submit",
+    "session.steer": "session.steer",
+    "session.redirect": "session.steer",
+    "session.interrupt": "session.interrupt",
+    "approval.respond": "approval.respond",
+    "clarify.respond": "clarify.respond",
+    "terminal.read.respond": "ui.respond",
+    "preview.read.respond": "ui.respond",
+    "preview.act.respond": "ui.respond",
+    "window.read.respond": "ui.respond",
+    "tour.respond": "ui.respond",
+    "mcp.setup.respond": "ui.respond",
+    "sudo.respond": "ui.respond",
+    "secret.respond": "ui.respond",
+    # All other mutations of a live shared runtime require controller authority.
+    # Keep this explicit so observer-visible read RPCs remain usable while new
+    # mutators must be classified here before they can cross network ingress.
+    "session.close": "session.steer",
+    "session.cwd.set": "session.steer",
+    "session.workspace.move": "session.steer",
+    "session.delete": "session.steer",
+    "session.title": "session.steer",
+    "session.set_hidden": "session.steer",
+    "session.compress": "session.steer",
+    "session.save": "session.steer",
+    "session.undo": "session.steer",
+    "session.branch": "session.steer",
+    "session.usage": "observe",
+    "session.context_breakdown": "observe",
+    "session.status": "observe",
+    "session.history": "observe",
+    "session.detach": "observe",
+    "session.attachments": "prompt.submit",
+    "session.events.since": "observe",
+    "session.presentation.snapshot": "observe",
+    "config.set": "session.steer",
+    "handoff.request": "session.steer",
+    "message.react": "session.steer",
+    "llm.oneshot": "prompt.submit",
+    "prompt.background": "session.steer",
+    "approval.pending": "observe",
+    "approval.received": "approval.respond",
+    "terminal.resize": "session.steer",
+    "clipboard.paste": "prompt.submit",
+    "preview.restart": "session.steer",
+    "handoff.state": "observe",
+    "handoff.fail": "session.steer",
+    "input.detect_drop": "prompt.submit",
+    "subagent.steer": "session.steer",
+    "process.list": "observe",
+    "process.kill": "session.steer",
+    "slash.exec": "session.steer",
+    "rollback.list": "observe",
+    "rollback.diff": "observe",
+    "rollback.restore": "session.steer",
+    "config.get": "observe",
+    "image.attach": "session.steer",
+    "image.attach_bytes": "session.steer",
+    "pdf.attach": "session.steer",
+    "file.attach": "session.steer",
+    "image.detach": "session.steer",
+}
+
+# These RPCs establish or validate their attachment inside the handler, so the
+# generic live-session gate cannot require membership before invoking them.
+_SELF_AUTHORIZING_SESSION_RPCS = frozenset({
+    "session.activate",
+    "session.attach",
+    "session.resume",
+})
+
+
+def _authorization_session(method_name: str, params: dict) -> dict | None:
+    """Resolve the live runtime whose capability protects one inbound RPC."""
+    # Clarification authority follows the server-owned pending request, never a
+    # caller-selected live session. request_id is a lookup hint; transport
+    # membership in the resolved session remains the authorization boundary.
+    if method_name == "clarify.respond":
+        request_id = str(params.get("request_id") or "")
+        if request_id:
+            with _prompt_lock:
+                pending = _pending.get(request_id)
+            if pending is not None:
+                return _sessions.get(pending[0])
+
+    sid = str(params.get("session_id") or "")
+    session = _sessions.get(sid) if sid else None
+    if session is not None:
+        return session
+
+    durable_key = str(params.get("session_key") or "")
+    if durable_key:
+        with _sessions_lock:
+            for candidate in _sessions.values():
+                if candidate.get("session_key") == durable_key:
+                    return candidate
+
+    # Approval cards may outlive a reminted live sid. Preserve the existing
+    # durable-identity fallback, but authorize against the runtime it resolves.
+    if method_name == "approval.respond":
+        fallback = globals().get("_approval_respond_session_fallback")
+        if callable(fallback):
+            return fallback(params)
+
+    # Clarification/UI response authority is recoverable from the server-owned
+    # pending registry. request_id is merely a lookup hint, never the authority.
+    request_id = str(params.get("request_id") or "")
+    if request_id:
+        with _prompt_lock:
+            pending = _pending.get(request_id)
+        if pending is not None:
+            return _sessions.get(pending[0])
+    return None
+
+
+def _resolve_authorization_session(
+    rid, method_name: str, params: dict
+) -> tuple[dict | None, dict | None]:
+    """Resolve authorization state without letting registry races fail open/crash."""
+    try:
+        return _authorization_session(method_name, params), None
+    except Exception as exc:
+        return None, _err(rid, 5036, f"could not resolve live session authority: {exc}")
+
+
+def _authorize_session_rpc(rid, method_name: str, params: dict) -> dict | None:
+    # Direct in-process dispatch is the trusted stdio/runtime implementation,
+    # not a remote attachment boundary. Network and proxy transports are bound
+    # explicitly and must pass the capability policy below.
+    if current_transport() is None:
+        return None
+    capability = _SESSION_RPC_CAPABILITIES.get(method_name)
+    if capability is None:
+        session, resolution_error = _resolve_authorization_session(
+            rid, method_name, params
+        )
+        if resolution_error is not None:
+            return resolution_error
+        if method_name not in _SELF_AUTHORIZING_SESSION_RPCS and session is not None:
+            # New session RPCs must be deliberately classified before they can
+            # operate on a live shared runtime. Durable/non-live lookups retain
+            # legacy handler behavior because they resolve no live record.
+            return _err(rid, 4003, "live session RPC has no authorization policy")
+        return None
+    if method_name == "clarify.respond":
+        request_id = str(params.get("request_id") or "")
+        if request_id:
+            with _prompt_lock:
+                pending = _pending.get(request_id)
+                owner_available = (
+                    pending is None or pending[0] in _sessions
+                )
+            if (
+                pending is not None
+                and not owner_available
+                and current_transport() is not None
+            ):
+                return _err(rid, 4009, "clarification owner is unavailable")
+    session, resolution_error = _resolve_authorization_session(rid, method_name, params)
+    if resolution_error is not None:
+        return resolution_error
+    if session is None:
+        # Let the handler preserve its established not-found/expired response.
+        return None
+    hub = session.get("event_hub")
+    transport = current_transport()
+    if hub is None and transport is None:
+        # Backward-compatible in-process invocation used by the stdio protocol
+        # harness and embedders. Network dispatch always binds a transport.
+        return None
+    if hub is None or transport is None:
+        return _err(rid, 4003, f"capability required: {capability}")
+    try:
+        hub.require(transport, capability)
+    except PermissionError:
+        return _err(rid, 4003, f"capability required: {capability}")
+    return None
+
+
 def _normalize_request(req: Any) -> tuple[Any, str, dict] | dict:
     """Validate a JSON-RPC request enough for safe local dispatch."""
     if not isinstance(req, dict):
@@ -3199,11 +3726,35 @@ def handle_request(req: dict) -> dict | None:
     fn = _methods.get(method)
     if not fn:
         return _err(rid, -32601, f"unknown method: {method}")
-    token = _current_rpc_method.set(method)
-    try:
-        return fn(rid, params)
-    finally:
-        _current_rpc_method.reset(token)
+
+    def invoke():
+        token = _current_rpc_method.set(method)
+        try:
+            return fn(rid, params)
+        finally:
+            _current_rpc_method.reset(token)
+
+    if method in _SESSION_RPC_CAPABILITIES:
+        session, resolution_error = _resolve_authorization_session(rid, method, params)
+        if resolution_error is not None:
+            return resolution_error
+    else:
+        session = None
+    if session is not None:
+        # The lock is part of the authoritative runtime record, so every
+        # attached transport converges on one control ingress order.
+        with _sessions_lock:
+            control_lock = session.setdefault("control_ingress_lock", threading.RLock())
+        with control_lock:
+            auth_error = _authorize_session_rpc(rid, method, params)
+            if auth_error is not None:
+                return auth_error
+            return invoke()
+
+    auth_error = _authorize_session_rpc(rid, method, params)
+    if auth_error is not None:
+        return auth_error
+    return invoke()
 
 
 def _current_session_steer_authority(
@@ -3222,13 +3773,153 @@ def _current_session_steer_authority(
     expected_session = _current_runtime_session_record.get()
     with _sessions_lock:
         session = _sessions.get(session_id)
-        if (
-            session is None
-            or (expected_session is not None and session is not expected_session)
-            or session.get("transport") is not transport
+        if session is None or (
+            expected_session is not None and session is not expected_session
         ):
             return None, None
+        hub = session.get("event_hub")
+        if hub is not None:
+            try:
+                hub.require(transport, "session.steer")
+            except PermissionError:
+                return None, None
+        elif session.get("transport") is not transport:
+            return None, None
         return transport, session
+
+
+_runtime_proxy_coordinator = None
+_runtime_proxy_coordinator_lock = threading.Lock()
+
+
+def _cross_process_runtime_proxy_supported() -> bool:
+    return (
+        os.name == "posix"
+        and hasattr(socket, "AF_UNIX")
+        and hasattr(socket, "SO_PEERCRED")
+    )
+
+
+def _runtime_proxy_endpoint(endpoint_name: str) -> Path:
+    """Return a Unix-socket path that fits the platform's ``sun_path`` limit."""
+    endpoint = Path(_hermes_home) / "runtime" / f"runtime-proxy-{endpoint_name}.sock"
+    # Linux sockaddr_un.sun_path is 108 bytes including the trailing NUL.
+    # Profile homes nested below long Desktop/E2E sandboxes can exceed it.
+    if len(os.fsencode(endpoint)) < 108:
+        return endpoint
+
+    runtime_root = Path(tempfile.gettempdir()) / f"hermes-runtime-{os.getuid()}"
+    runtime_root.mkdir(mode=0o700, parents=True, exist_ok=True)
+    os.chmod(runtime_root, 0o700)
+    return runtime_root / f"runtime-proxy-{endpoint_name}.sock"
+
+
+def _get_runtime_proxy_coordinator():
+    """Start this process's authenticated canonical-runtime proxy endpoint lazily."""
+    global _runtime_proxy_coordinator
+    with _runtime_proxy_coordinator_lock:
+        if _runtime_proxy_coordinator is not None:
+            return _runtime_proxy_coordinator
+        from tui_gateway.runtime_proxy import RuntimeProxyCoordinator
+
+        endpoint_name = hashlib.sha256(
+            f"{Path(_hermes_home).resolve()}:{_backend_id_for_this_process()}".encode()
+        ).hexdigest()[:24]
+        coordinator = RuntimeProxyCoordinator(
+            registry_home=_hermes_home,
+            endpoint=_runtime_proxy_endpoint(endpoint_name),
+            owner_id=_backend_id_for_this_process(),
+            surface="tui_gateway",
+            dispatch=lambda request, transport: dispatch(request, transport),
+            detach=lambda transport: _close_sessions_for_transport(
+                transport, end_reason="runtime_proxy_disconnect"
+            ),
+        )
+        if not coordinator.start():
+            raise RuntimeError("canonical runtime proxy endpoint failed to start")
+        _runtime_proxy_coordinator = coordinator
+        atexit.register(coordinator.stop)
+        return coordinator
+
+
+def _profile_scoped_runtime_key(conversation_key: str, profile_home: str | Path) -> str:
+    profile = str(Path(profile_home).expanduser().resolve())
+    material = f"{profile}\0{conversation_key}".encode("utf-8")
+    return f"v1:{hashlib.sha256(material).hexdigest()}"
+
+
+def _claim_local_runtime_owner(conversation_key: str, profile_home: str | Path):
+    if _cross_process_runtime_proxy_supported():
+        return _get_runtime_proxy_coordinator().claim_local(
+            conversation_key=conversation_key,
+            profile_home=profile_home,
+        )
+
+    from hermes_cli.live_runtime_owners import claim_runtime_owner
+
+    owner_key = _profile_scoped_runtime_key(conversation_key, profile_home)
+    owner_id = _backend_id_for_this_process()
+    claim = claim_runtime_owner(
+        conversation_key=owner_key,
+        owner_id=owner_id,
+        endpoint=f"process-local:{owner_id}",
+        surface="tui_gateway_process_local",
+        registry_home=_hermes_home,
+        profile_home=profile_home,
+    )
+    if claim.kind != "owned" or claim.lease is None:
+        raise RuntimeError(
+            "canonical runtime is owned by another process; "
+            "authenticated cross-process proxying is unavailable on this platform"
+        )
+    return claim.lease
+
+
+def _prepare_runtime_resume_proxy(req: dict, transport: Transport) -> dict | None:
+    """Claim the compression-root runtime before the resume handler can build it."""
+    if not _cross_process_runtime_proxy_supported():
+        return None
+    params = req.get("params")
+    if not isinstance(params, dict):
+        return None
+    target = str(params.get("session_id") or "").strip()
+    if not target:
+        return None
+    profile = str(params.get("profile") or "").strip() or None
+    db, owns_db = _db_for_profile(profile)
+    if db is None:
+        return None
+    try:
+        found = db.get_session(target)
+        if not found:
+            found = db.get_session_by_title(target)
+            if found:
+                target = str(found["id"])
+        if not found:
+            return None
+        try:
+            target = db.resolve_resume_session_id(target) or target
+        except Exception:
+            pass
+        profile_home = _profile_home(profile) or Path(_hermes_home)
+        conversation_key = db.session_runtime_key(target)
+        return _get_runtime_proxy_coordinator().prepare_resume(
+            conversation_key=conversation_key,
+            request=req,
+            transport=transport,
+            profile_home=profile_home,
+        )
+    finally:
+        if owns_db:
+            with contextlib.suppress(Exception):
+                db.close()
+
+
+def detach_runtime_proxy_transport(transport: Transport) -> None:
+    """Drop remote-owner connections and route mappings for one frontend."""
+    coordinator = _runtime_proxy_coordinator
+    if coordinator is not None:
+        coordinator.detach_transport(transport)
 
 
 def dispatch(req: dict, transport: Optional[Transport] = None) -> dict | None:
@@ -3251,7 +3942,17 @@ def dispatch(req: dict, transport: Optional[Transport] = None) -> dict | None:
             return normalized
 
         _rid, method, _params = normalized
-        if method not in _LONG_HANDLERS:
+        remote_coordinator = _runtime_proxy_coordinator
+        remote_session_id = (
+            _params.get("session_id") if isinstance(_params, dict) else None
+        )
+        has_remote_route = bool(
+            remote_coordinator is not None
+            and isinstance(remote_session_id, str)
+            and remote_session_id
+            and remote_coordinator.has_remote_route(t, remote_session_id)
+        )
+        if method not in _LONG_HANDLERS and not has_remote_route:
             return handle_request(req)
 
         # Snapshot the context so the pool worker sees the bound transport.
@@ -3259,7 +3960,21 @@ def dispatch(req: dict, transport: Optional[Transport] = None) -> dict | None:
 
         def run():
             try:
-                resp = handle_request(req)
+                if has_remote_route:
+                    resp = remote_coordinator.route_request(req, t)
+                    if resp is None:
+                        resp = _err(
+                            req.get("id"),
+                            -32072,
+                            "canonical runtime owner unavailable",
+                            {"outcome": "unknown", "retryable": False},
+                        )
+                elif method == "session.resume":
+                    resp = _prepare_runtime_resume_proxy(req, t)
+                    if resp is None:
+                        resp = handle_request(req)
+                else:
+                    resp = handle_request(req)
             except Exception as exc:
                 resp = _err(req.get("id"), -32000, f"handler error: {exc}")
             if resp is not None:
@@ -3398,6 +4113,21 @@ def _wait_agent_for_prompt(session: dict, rid: str, sid: str) -> dict | None:
     return _err(rid, 5032, err) if err else None
 
 
+def _ensure_runtime_owner_for_session(session: dict) -> None:
+    """Fence agent construction behind the canonical compression-root lease."""
+    existing = session.get("runtime_owner_lease")
+    if existing is not None and not getattr(existing, "released", False):
+        return
+    session_key = str(session.get("session_key") or "").strip()
+    if not session_key:
+        raise RuntimeError("session has no canonical runtime key")
+    conversation_key = str(session.get("runtime_owner_key") or session_key)
+    profile_home = Path(session.get("profile_home") or _hermes_home)
+    session["runtime_owner_lease"] = _claim_local_runtime_owner(
+        conversation_key, profile_home
+    )
+
+
 def _start_agent_build(sid: str, session: dict) -> None:
     """Start building the real AIAgent for a TUI session, once.
 
@@ -3419,6 +4149,7 @@ def _start_agent_build(sid: str, session: dict) -> None:
     # prompt/RPC builds the agent normally so the user can talk to the session.
     if session.get("lazy") and _child_run_active(str(session.get("session_key") or "")):
         return
+    _ensure_runtime_owner_for_session(session)
     lock = session.setdefault("agent_build_lock", threading.Lock())
     with lock:
         if ready.is_set() or session.get("agent_build_started"):
@@ -4870,6 +5601,32 @@ def _enable_gateway_prompts() -> None:
 # ── Blocking prompt factory ──────────────────────────────────────────
 
 
+def _prune_clarification_outcomes_locked(now: float | None = None) -> None:
+    """Bound and expire clarification tombstones while holding _prompt_lock."""
+    current = time.monotonic() if now is None else now
+    expired = [
+        request_id
+        for request_id, (_status, recorded_at) in _clarification_outcomes.items()
+        if current - recorded_at > _CLARIFICATION_OUTCOME_TTL_S
+    ]
+    for request_id in expired:
+        _clarification_outcomes.pop(request_id, None)
+    while len(_clarification_outcomes) > _CLARIFICATION_OUTCOMES_MAX:
+        _clarification_outcomes.pop(next(iter(_clarification_outcomes)))
+
+
+def _remember_clarification_outcome_locked(request_id: str, status: str) -> None:
+    _clarification_outcomes.pop(request_id, None)
+    _clarification_outcomes[request_id] = (status, time.monotonic())
+    _prune_clarification_outcomes_locked()
+
+
+def _clarification_outcome_locked(request_id: str) -> str | None:
+    _prune_clarification_outcomes_locked()
+    outcome = _clarification_outcomes.get(request_id)
+    return outcome[0] if outcome is not None else None
+
+
 def _block(
     event: str,
     sid: str,
@@ -4879,6 +5636,9 @@ def _block(
 ) -> str:
     rid = uuid.uuid4().hex[:8]
     ev = threading.Event()
+    if timeout is not None and timeout >= 0:
+        payload["timeout_seconds"] = timeout
+        payload["expires_at"] = time.time() + timeout
     with _prompt_lock:
         _pending[rid] = (sid, ev)
         payload["request_id"] = rid
@@ -4907,6 +5667,19 @@ def _block(
             batch_state = _batch_clarify.pop(rid, None)
             if batch_state is not None:
                 batch_answers = dict(batch_state["answers"])
+            if event == "clarify.request":
+                batch_resolved = bool(
+                    batch_state is not None
+                    and all(
+                        qid in batch_state["answers"] for qid in batch_state["qids"]
+                    )
+                )
+                _remember_clarification_outcome_locked(
+                    rid,
+                    "already_resolved"
+                    if answer_present or batch_resolved
+                    else "expired",
+                )
 
     if batch_qids is not None:
         # Cancel-all (respond with no question_id) resolves via _answers with
@@ -9422,9 +10195,11 @@ def _init_session(
             "model_override": None,
             # Pin async event emissions to whichever transport created the
             # session (stdio for Ink, JSON-RPC WS for the dashboard sidebar).
+            # Kept as a compatibility alias; event_hub owns delivery.
             "transport": current_transport() or _stdio_transport,
         }
         _session_todo_state(_sessions[sid])
+        _attach_current_transport(sid, _sessions[sid])
     _init_owns_db = False
     if session_db is not None:
         db = session_db
@@ -10010,15 +10785,26 @@ def _inflight_text(value: Any) -> str:
     return _content_display_text(value).strip()
 
 
-def _start_inflight_turn(session: dict, text: Any) -> None:
+def _start_inflight_turn(
+    session: dict,
+    text: Any,
+    *,
+    origin_client_id: str | None = None,
+    request_id: str | None = None,
+) -> None:
     now = time.time()
-    session["inflight_turn"] = {
+    inflight = {
         "assistant": "",
         "started_at": now,
         "streaming": True,
         "updated_at": now,
         "user": _inflight_text(text),
     }
+    if origin_client_id is not None:
+        inflight["origin_client_id"] = origin_client_id
+    if request_id is not None:
+        inflight["request_id"] = request_id
+    session["inflight_turn"] = inflight
 
 
 def _append_inflight_delta(session: dict, delta: Any) -> None:
@@ -10405,12 +11191,184 @@ def _maybe_schedule_auto_continue(sid: str, session: dict, session_key: str) -> 
     return {"attempt": attempt, "interrupted_at": marker["started_at"]}
 
 
+_ACCEPTED_CLIENT_MESSAGE_IDS_LIMIT = 2048
+_BUSY_QUEUE_MAX_ENTRIES = 32
+_BUSY_QUEUE_MAX_PAYLOAD_BYTES = 1024 * 1024
+
+
+def _busy_queue_payload_bytes(value: Any) -> int:
+    """Estimate retained user-controlled bytes without counting transport objects."""
+    if value is None:
+        return 0
+    if isinstance(value, str):
+        return len(value.encode("utf-8"))
+    if isinstance(value, bytes):
+        return len(value)
+    if isinstance(value, dict):
+        return sum(
+            len(str(key).encode("utf-8")) + _busy_queue_payload_bytes(item)
+            for key, item in value.items()
+            if key != "transport"
+        )
+    if isinstance(value, (list, tuple)):
+        return sum(_busy_queue_payload_bytes(item) for item in value)
+    return len(str(value).encode("utf-8"))
+
+
+def _busy_queue_entries(session: dict) -> list[dict]:
+    head = session.get("queued_prompt")
+    return ([head] if isinstance(head, dict) else []) + [
+        entry
+        for entry in session.get("queued_prompts") or []
+        if isinstance(entry, dict)
+    ]
+
+
+def _busy_queue_can_admit(
+    session: dict, queued: dict, *, replacing: dict | None = None
+) -> bool:
+    entries = _busy_queue_entries(session)
+    if replacing is None and len(entries) >= _BUSY_QUEUE_MAX_ENTRIES:
+        return False
+    retained_bytes = sum(
+        _busy_queue_payload_bytes(entry)
+        for entry in entries
+        if entry is not replacing
+    )
+    return (
+        retained_bytes + _busy_queue_payload_bytes(queued)
+        <= _BUSY_QUEUE_MAX_PAYLOAD_BYTES
+    )
+
+
+def _client_message_scope(transport: object | None = None) -> str:
+    """Return the stable, non-caller-forgeable owner of an idempotency key."""
+    target = transport if transport is not None else current_transport()
+    identity = getattr(target, "auth_identity", None)
+    if isinstance(identity, dict) and identity:
+        encoded = json.dumps(
+            identity, sort_keys=True, separators=(",", ":"), default=str
+        )
+        return "auth:" + hashlib.sha256(encoded.encode("utf-8")).hexdigest()
+    client_id = getattr(target, "client_id", None)
+    if client_id is not None and str(client_id).strip():
+        return "client:" + str(client_id).strip()
+    # Trusted in-process/stdio callers have no connection-scoped identity.
+    return "gateway-owner"
+
+
+def _client_message_identity(
+    client_message_id: str | None, transport: object | None = None
+) -> tuple[str, str] | None:
+    """Build ``(stable principal/client, message id)`` idempotency identity."""
+    if not client_message_id:
+        return None
+    return (_client_message_scope(transport), client_message_id)
+
+
+def _client_message_id_is_accepted(
+    session: dict,
+    client_message_id: str | None,
+    client_identity: tuple[str, str] | None = None,
+) -> bool:
+    """Return whether this stable client identity already owns an accepted turn.
+
+    Bare IDs from older runtimes/durable rows remain global duplicates because
+    their original client owner cannot be reconstructed safely.
+    """
+    if not client_message_id:
+        return False
+    identity = client_identity or _client_message_identity(client_message_id)
+    for accepted_identity in session.get("accepted_client_message_ids", ()):
+        if accepted_identity == client_message_id:  # pre-scoped runtime entry
+            return True
+        if isinstance(accepted_identity, (tuple, list)) and tuple(accepted_identity) == identity:
+            return True
+    for history in (
+        session.get("history") or [],
+        session.get("display_history_prefix") or [],
+    ):
+        for message in history:
+            if not isinstance(message, dict) or message.get("role") != "user":
+                continue
+            metadata = message.get("display_metadata")
+            if not (
+                isinstance(metadata, dict)
+                and metadata.get("client_message_id") == client_message_id
+            ):
+                continue
+            persisted_scope = metadata.get("client_identity")
+            if persisted_scope is None:
+                _remember_accepted_client_message_id(
+                    session, client_message_id, legacy_bare=True
+                )
+                return True
+            if identity is not None and persisted_scope == identity[0]:
+                _remember_accepted_client_message_id(
+                    session, client_message_id, identity
+                )
+                return True
+    return False
+
+
+def _remember_accepted_client_message_id(
+    session: dict,
+    client_message_id: str | None,
+    client_identity: tuple[str, str] | None = None,
+    *,
+    legacy_bare: bool = False,
+) -> None:
+    """Remember accepted identities with bounded per-runtime retention."""
+    if not client_message_id:
+        return
+    identity: object = (
+        client_message_id
+        if legacy_bare
+        else client_identity or _client_message_identity(client_message_id)
+    )
+    if identity is None:
+        return
+    accepted = session.setdefault("accepted_client_message_ids", [])
+    if identity in accepted:
+        return
+    accepted.append(identity)
+    overflow = len(accepted) - _ACCEPTED_CLIENT_MESSAGE_IDS_LIMIT
+    if overflow > 0:
+        del accepted[:overflow]
+
+
+def _forget_accepted_client_message_id(
+    session: dict,
+    client_message_id: str | None,
+    client_identity: tuple[str, str] | None = None,
+) -> None:
+    """Roll back an admission that was cancelled before execution started."""
+    if not client_message_id:
+        return
+    identity = client_identity or _client_message_identity(client_message_id)
+    accepted = session.get("accepted_client_message_ids")
+    if isinstance(accepted, list):
+        for candidate in (identity, client_message_id):
+            with contextlib.suppress(ValueError):
+                accepted.remove(candidate)
+
+
 def _enqueue_prompt(
     session: dict,
     text: Any,
     transport: Any,
     image_paths: list[str] | None = None,
-) -> None:
+    *,
+    origin_client_id: str | None = None,
+    request_id: str | None = None,
+    display_kind: str | None = None,
+    display_metadata: dict | None = None,
+    client_message_id: str | None = None,
+    client_identity: tuple[str, str] | None = None,
+    display_text: str | None = None,
+    submitted_at: float | None = None,
+    attachment_refs: list[str] | None = None,
+) -> bool:
     """Stash a message to run as the very next turn once the live one ends.
 
     Used when a prompt arrives mid-turn (see ``_handle_busy_submit``). Text-only
@@ -10421,6 +11379,20 @@ def _enqueue_prompt(
     sent it even if the session transport is rebound meanwhile.
     """
     image_paths = list(image_paths or [])
+    if client_message_id:
+        queued_entries = ([session.get("queued_prompt")] if session.get("queued_prompt") else []) + list(
+            session.get("queued_prompts") or []
+        )
+        if any(
+            isinstance(entry, dict)
+            and entry.get("client_message_id") == client_message_id
+            and (
+                entry.get("client_identity") is None
+                or tuple(entry.get("client_identity")) == client_identity
+            )
+            for entry in queued_entries
+        ):
+            return True
     # #84417: scrub any live-turn self-duplicates first so the consecutive-text
     # merge below cannot glue "{original}\\n\\n{later}" and re-fire original
     # on drain after a later correction settles.
@@ -10428,14 +11400,42 @@ def _enqueue_prompt(
     # Never queue a text-only self-copy of the live inflight user prompt. The
     # live turn already owns that text; draining it after settle would restart
     # the same user turn as a fresh agent invocation.
-    if not image_paths and isinstance(text, str):
+    if not client_message_id and not image_paths and isinstance(text, str):
         turn = session.get("inflight_turn")
         original = (
             str(turn.get("user") or "").strip() if isinstance(turn, dict) else ""
         )
         if original and text.strip() == original:
-            return
-    queued = {"text": text, "transport": transport}
+            return True
+    legacy_envelope = origin_client_id is None and request_id is None
+    queued = {"text": text}
+    queued.update(
+        {
+            key: value
+            for key, value in {
+                "display_kind": display_kind,
+                "display_metadata": (
+                    dict(display_metadata) if display_metadata is not None else None
+                ),
+                "client_message_id": client_message_id,
+                "client_identity": client_identity,
+                "display_text": display_text,
+                "submitted_at": submitted_at,
+                "attachment_refs": (
+                    list(attachment_refs) if attachment_refs is not None else None
+                ),
+            }.items()
+            if value is not None
+        }
+    )
+    if legacy_envelope:
+        # Compatibility for internal/older call sites while RPC ingress is
+        # migrated. Multi-client envelopes carry origin, never a destination.
+        queued["transport"] = transport
+    else:
+        queued["origin_client_id"] = origin_client_id or "unknown"
+        if request_id is not None:
+            queued["request_id"] = request_id
     if image_paths:
         queued["image_paths"] = image_paths
     existing = session.get("queued_prompt")
@@ -10446,14 +11446,34 @@ def _enqueue_prompt(
         and not existing.get("image_paths")
         and not image_paths
         and not session.get("queued_prompts")
+        and not existing.get("client_message_id")
+        and not client_message_id
+        and (
+            legacy_envelope
+            or existing.get("origin_client_id") == queued.get("origin_client_id")
+        )
     ):
         prev = existing["text"]
-        existing["text"] = f"{prev}\n\n{text}" if prev and text else (prev or text)
-        return
+        merged = dict(existing)
+        merged["text"] = f"{prev}\n\n{text}" if prev and text else (prev or text)
+        if request_id is not None:
+            request_ids = list(
+                merged.get("request_ids") or [existing.get("request_id")]
+            )
+            merged["request_ids"] = request_ids
+            if request_id not in request_ids:
+                request_ids.append(request_id)
+        if not _busy_queue_can_admit(session, merged, replacing=existing):
+            return False
+        existing.update(merged)
+        return True
+    if not _busy_queue_can_admit(session, queued):
+        return False
     if existing:
         session.setdefault("queued_prompts", []).append(queued)
-        return
+        return True
     session["queued_prompt"] = queued
+    return True
 
 
 def _sanitize_queued_entry_vs_inflight_user(
@@ -10470,6 +11490,8 @@ def _sanitize_queued_entry_vs_inflight_user(
     """
     if not original or not isinstance(entry, dict):
         return entry if isinstance(entry, dict) else None
+    if entry.get("client_message_id"):
+        return entry
     if entry.get("image_paths"):
         return entry
     text = entry.get("text")
@@ -10568,7 +11590,23 @@ def _interrupt_busy_session(sid: str, session: dict, agent: Any) -> None:
 
 
 def _handle_busy_submit(
-    rid, sid: str, session: dict, text: Any, transport: Any, queued: bool = False
+    rid,
+    sid: str,
+    session: dict,
+    text: Any,
+    transport: Any,
+    queued: bool = False,
+    *,
+    busy_policy: str | None = None,
+    origin_client_id: str | None = None,
+    display_kind: str | None = None,
+    display_metadata: dict | None = None,
+    client_message_id: str | None = None,
+    client_identity: tuple[str, str] | None = None,
+    display_text: str | None = None,
+    submitted_at: float | None = None,
+    attachment_refs: list[str] | None = None,
+    image_paths: list[str] | None = None,
 ) -> dict | None:
     """Apply the ``display.busy_input_mode`` policy to a prompt that lands while
     a turn is in flight, instead of rejecting it with ``session busy``.
@@ -10589,21 +11627,33 @@ def _handle_busy_submit(
     unwinding the turn) redirected the live turn with next-turn text — queue
     semantics betrayed by a millisecond race the user can't see.
     """
-    mode = "queue" if queued else _load_busy_input_mode()
+    if busy_policy not in {"interrupt", "queue", "reject", "steer"}:
+        busy_policy = None
+    mode = "queue" if queued else busy_policy or _load_busy_input_mode()
     agent = session.get("agent")
+    claimed_attached_images = False
     with session["history_lock"]:
         if not session.get("running"):
             # The turn ended between prompt.submit's first busy check and this
             # helper. Let the caller retry and claim the now-idle session.
             return None
+    if mode == "reject":
+        _forget_accepted_client_message_id(
+            session, client_message_id, client_identity
+        )
+        return _err(rid, -32001, "session busy")
     with session["history_lock"]:
         if not session.get("running"):
             return None
-        image_paths = list(session.get("attached_images", []))
-        if image_paths:
-            # Claim at submission time. A later paste must not be consumed by
-            # this prompt after the active turn finally yields.
-            session["attached_images"] = []
+        if image_paths is None:
+            image_paths = list(session.get("attached_images", []))
+            if image_paths:
+                # Claim at submission time. A later paste must not be consumed by
+                # this prompt after the active turn finally yields.
+                session["attached_images"] = []
+                claimed_attached_images = True
+        else:
+            image_paths = list(image_paths)
     text_only = not image_paths and _is_text_only_busy_payload(text)
     plain_text = _coerce_message_text(text).strip() if text_only else ""
     if mode == "steer" and text_only and plain_text and agent is not None and hasattr(agent, "steer"):
@@ -10646,7 +11696,30 @@ def _handle_busy_submit(
             if image_paths:
                 session["attached_images"] = image_paths + list(session.get("attached_images", []))
             return None
-        _enqueue_prompt(session, text, transport, image_paths=image_paths)
+        admitted = _enqueue_prompt(
+            session,
+            text,
+            transport,
+            image_paths=image_paths,
+            origin_client_id=origin_client_id,
+            request_id=str(rid) if origin_client_id is not None else None,
+            display_kind=display_kind,
+            display_metadata=display_metadata,
+            client_message_id=client_message_id,
+            client_identity=client_identity,
+            display_text=display_text,
+            submitted_at=submitted_at,
+            attachment_refs=attachment_refs,
+        )
+        if not admitted:
+            if claimed_attached_images and image_paths:
+                session["attached_images"] = image_paths + list(
+                    session.get("attached_images", [])
+                )
+            _forget_accepted_client_message_id(
+                session, client_message_id, client_identity
+            )
+            return _err(rid, -32002, "busy queue capacity exceeded")
         session["last_active"] = time.time()
 
     # Attachments need a separate model invocation. Queue them without
@@ -10683,6 +11756,16 @@ def _drain_queued_prompt(rid, sid: str, session: dict) -> bool:
         session["queued_prompt"] = queued_prompts.pop(0) if queued_prompts else None
         if not queued_prompts:
             session.pop("queued_prompts", None)
+        queued_client_message_id = queued.get("client_message_id")
+        queued_client_identity = queued.get("client_identity")
+        if _client_message_id_is_accepted(
+            session, queued_client_message_id, queued_client_identity
+        ):
+            session["running"] = False
+            return bool(session.get("queued_prompt"))
+        _remember_accepted_client_message_id(
+            session, queued_client_message_id, queued_client_identity
+        )
         session["running"] = True
         if queued.get("transport") is not None:
             session["transport"] = queued["transport"]
@@ -10704,9 +11787,21 @@ def _drain_queued_prompt(rid, sid: str, session: dict) -> bool:
                 session["queued_prompts"] = rest
             else:
                 session.pop("queued_prompts", None)
+            _forget_accepted_client_message_id(
+                session, queued_client_message_id, queued_client_identity
+            )
             session["running"] = False
             return True
     dispatch_failed = False
+    submit_metadata = {
+        "display_kind": queued.get("display_kind"),
+        "display_metadata": queued.get("display_metadata"),
+        "client_message_id": queued.get("client_message_id"),
+        "client_identity": queued.get("client_identity"),
+        "display_text": queued.get("display_text"),
+        "submitted_at": queued.get("submitted_at"),
+        "attachment_refs": queued.get("attachment_refs"),
+    }
     try:
         if use_compute_host:
             if queued.get("image_paths"):
@@ -10717,10 +11812,16 @@ def _drain_queued_prompt(rid, sid: str, session: dict) -> bool:
                     queued["text"],
                     image_paths=queued["image_paths"],
                     queued_prompt_generation=queue_generation,
+                    **submit_metadata,
                 )
             else:
                 resp = _submit_prompt_to_compute_host(
-                    rid, sid, session, queued["text"], queued_prompt_generation=queue_generation
+                    rid,
+                    sid,
+                    session,
+                    queued["text"],
+                    queued_prompt_generation=queue_generation,
+                    **submit_metadata,
                 )
             if resp.get("error"):
                 message = str(((resp.get("error") or {}).get("message")) or "queued prompt failed")
@@ -10738,6 +11839,9 @@ def _drain_queued_prompt(rid, sid: str, session: dict) -> bool:
                     queued["text"],
                     image_paths=queued["image_paths"],
                     queued_prompt_generation=queue_generation,
+                    origin_client_id=queued.get("origin_client_id"),
+                    request_id=queued.get("request_id"),
+                    **submit_metadata,
                 )
             else:
                 _run_prompt_submit(
@@ -10746,6 +11850,9 @@ def _drain_queued_prompt(rid, sid: str, session: dict) -> bool:
                     session,
                     queued["text"],
                     queued_prompt_generation=queue_generation,
+                    origin_client_id=queued.get("origin_client_id"),
+                    request_id=queued.get("request_id"),
+                    **submit_metadata,
                 )
     except Exception as exc:
         print(
@@ -10935,7 +12042,8 @@ def _lazy_resume_info(
 
 
 def _deferred_session_record(
-    session_key: str,
+    sid: str,
+    session_key: str | None = None,
     *,
     cols: int,
     cwd: str,
@@ -10950,11 +12058,14 @@ def _deferred_session_record(
     resume_runtime_overrides: dict | None = None,
     todo_state: dict | None = None,
     explicit_cwd: bool = False,
+    runtime_owner_key: str | None = None,
+    runtime_owner_lease=None,
 ) -> dict:
     """A live-session record whose AIAgent is built later (lazy watch / cold
     resume) — _init_session's shape minus the agent."""
+    session_key = session_key or sid
     now = time.time()
-    return {
+    record = {
         "agent": None,
         "agent_error": None,
         "agent_ready": threading.Event(),
@@ -10980,6 +12091,8 @@ def _deferred_session_record(
         "resume_runtime_overrides": resume_runtime_overrides,
         "resume_session_id": session_key,
         "running": False,
+        "runtime_owner_key": runtime_owner_key or session_key,
+        "runtime_owner_lease": runtime_owner_lease,
         "session_key": session_key,
         "show_reasoning": _load_show_reasoning(),
         "slash_worker": None,
@@ -10989,6 +12102,8 @@ def _deferred_session_record(
         "todo_state": todo_state,
         "transport": current_transport() or _stdio_transport,
     }
+    _attach_current_transport(sid, record)
+    return record
 
 
 _ANY_PROFILE = object()  # default: match a live session regardless of profile
@@ -11016,11 +12131,18 @@ def _claim_or_reuse_live(
     # The record carries the home this resume resolved; a live runtime of the
     # same stored id under ANOTHER profile is not a winner to reuse (#100029).
     profile_home = record.get("profile_home")
+    runtime_key = str(record.get("runtime_owner_key") or session_key)
     with _session_resume_lock:
-        live = _find_live_session_by_key(session_key, profile_home)
+        live = _find_live_session_by_runtime_key(runtime_key, profile_home)
         if live is not None:
+            if runtime_owner_lease := record.get("runtime_owner_lease"):
+                live[1].setdefault("runtime_owner_lease", runtime_owner_lease)
             if lease is not None:
                 lease.release()
+            # The complete candidate runtime lost the claim race; retire its
+            # attachment worker before the caller attaches to the winner.
+            if hub := record.get("event_hub"):
+                hub.close()
             # The winner is being reattached by this resume: any pending
             # ws-orphan reap for it must not fire against the reclaimed
             # client (storm killer — see _cancel_ws_orphan_reap).
@@ -11035,7 +12157,7 @@ def _claim_or_reuse_live(
         # those quietly so the reap doesn't later broadcast session.reclaimed
         # for a session the client just re-resumed (auto-re-resume storm).
         _cancel_ws_orphan_reap(sid)
-        stale = _claim_parked_runtimes(session_key, keep_sid=sid, profile_home=profile_home)
+        stale = _claim_parked_runtimes(runtime_key, keep_sid=sid, profile_home=profile_home)
     # Slow finalization work stays OUTSIDE _session_resume_lock (see
     # _pop_session_by_id) — the stale records are already claimed above.
     _finalize_superseded_runtimes(stale)
@@ -11043,12 +12165,12 @@ def _claim_or_reuse_live(
 
 
 def _claim_parked_runtimes(
-    session_key: str, *, keep_sid: str, profile_home=_ANY_PROFILE
+    runtime_key: str, *, keep_sid: str, profile_home=_ANY_PROFILE
 ) -> list[tuple[str, dict]]:
-    """Claim sentinel-parked stale runtimes of ``session_key`` for supersession.
+    """Claim sentinel-parked stale runtimes of ``runtime_key`` for supersession.
 
-    When a resume mints a fresh runtime for stored session id ``session_key``,
-    any older runtime record for the same stored id that is still parked on
+    When a resume mints a fresh runtime for canonical key ``runtime_key``,
+    any older runtime record for that same canonical conversation that is still parked on
     the detached-WS sentinel is superseded: its pending orphan-reap Timer is
     cancelled and the record is atomically popped from ``_sessions`` here
     (under the caller's _session_resume_lock), then finalized by
@@ -11061,9 +12183,13 @@ def _claim_parked_runtimes(
             for old_sid, old in list(_sessions.items())
             if old_sid != keep_sid
             and not old.get("_finalized")
-            and _session_lookup_key(old, fallback=old_sid) == session_key
+            and str(
+                old.get("runtime_owner_key")
+                or _session_lookup_key(old, fallback=old_sid)
+            )
+            == runtime_key
             and _live_profile_matches(old, profile_home)
-            and old.get("transport") is _detached_ws_transport
+            and _ws_session_is_detached(old)
         ]
     for old_sid, _old in candidates:
         _cancel_ws_orphan_reap(old_sid)
@@ -11196,11 +12322,8 @@ def _schedule_resume_hydration(
                 {"message": message, "phase": "history", "status": "failed"},
             )
             _emit("error", sid, {"message": message})
-            with _sessions_lock:
-                discarded = _sessions.pop(sid, None) if _sessions.get(sid) is session else None
-            lease = (discarded or {}).get("active_session_lease")
-            if lease is not None:
-                lease.release()
+            discarded = _pop_session_if_current(sid, session)
+            _teardown_popped_session(discarded, end_reason="resume_failed")
         finally:
             if close_db and hasattr(db, "close"):
                 try:
@@ -11304,6 +12427,31 @@ def _find_live_session_by_key(
         if _session_lookup_key(session, fallback=sid) == session_key and _live_profile_matches(
             session, profile_home
         ):
+            return sid, session
+    return None
+
+
+def _find_live_session_by_runtime_key(
+    runtime_key: str, profile_home: Path | None = None
+) -> tuple[str, dict] | None:
+    expected_profile = str(
+        Path(profile_home or _hermes_home).expanduser().resolve()
+    )
+    for sid, session in list(_sessions.items()):
+        if session.get("_finalized"):
+            continue
+        session_profile = str(
+            Path(session.get("profile_home") or _hermes_home)
+            .expanduser()
+            .resolve()
+        )
+        if session_profile != expected_profile:
+            continue
+        session_runtime_key = str(
+            session.get("runtime_owner_key")
+            or _session_lookup_key(session, fallback=sid)
+        )
+        if session_runtime_key == runtime_key:
             return sid, session
     return None
 
@@ -11424,24 +12572,20 @@ def _live_session_payload(
     cols: int | None = None,
     touch: bool = False,
     transport: Transport | None = None,
+    attachment_mode="control",
     omit_messages: bool = False,
 ) -> dict:
+    if transport is not None:
+        _attach_current_transport(
+            sid,
+            session,
+            attachment_mode,
+            transport=transport,
+        )
     with session["history_lock"]:
         if cols is not None:
             session["cols"] = cols
-        if transport is not None:
-            session["transport"] = transport
-            # Track every transport that has shown this session (multi-window:
-            # pop-out windows each resume the same sid). The last viewer
-            # becomes the transport on the disconnect path so closing a
-            # pop-out re-binds the session to a still-open window instead of
-            # stranding it on the drop sentinel (#83716).
-            viewers = session.setdefault("viewers", {})
-            viewers[transport] = time.time()
-            if transport is not _detached_ws_transport:
-                # A live transport rebind means the client is back — any
-                # pending ws-orphan reap must not fire (storm killer).
-                _cancel_ws_orphan_reap(sid)
+
         if touch:
             session["last_active"] = time.time()
         in_memory_history = list(session.get("display_history_prefix") or []) + list(
@@ -11485,10 +12629,15 @@ def _live_session_payload(
         payload["inflight"] = inflight
     if queued:
         payload["queued"] = queued
-    if approval := _pending_approval_request_payload(str(session.get("session_key") or "")):
-        payload["pending_approval"] = approval
-    if clarify := _pending_clarify_request_payload(sid):
-        payload["pending_clarify"] = clarify
+    session_key = str(session.get("session_key") or "")
+    approvals = _pending_approval_request_payloads(session_key)
+    clarifications = _pending_clarify_request_payloads(sid)
+    if approvals:
+        payload["pending_approval"] = approvals[0]
+        payload["pending_approvals"] = approvals
+    if clarifications:
+        payload["pending_clarify"] = clarifications[0]
+        payload["pending_clarifications"] = clarifications
     return _attach_todo_state(payload, session)
 
 
@@ -13187,6 +14336,13 @@ def _run_prompt_submit(
     image_paths: list[str] | None = None,
     queued_prompt_generation: int | None = None,
     terminal_callback: Callable[[dict[str, Any]], None] | None = None,
+    origin_client_id: str | None = None,
+    request_id: str | None = None,
+    client_message_id: str | None = None,
+    client_identity: tuple[str, str] | None = None,
+    display_text: str | None = None,
+    submitted_at: float | None = None,
+    attachment_refs: list[str] | None = None,
 ) -> bool:
     # Ownership admission at the ONE chokepoint every fresh turn source must
     # cross. prompt.submit already claims the slot in its RPC handler (so this
@@ -13223,7 +14379,12 @@ def _run_prompt_submit(
         # A retained failed turn (see _fail_inflight_turn) is a stale leftover
         # by the time a new turn starts — replace it, never append onto it.
         if not isinstance(inflight, dict) or inflight.get("status") == "error":
-            _start_inflight_turn(session, text)
+            _start_inflight_turn(
+                session,
+                text,
+                origin_client_id=origin_client_id,
+                request_id=request_id,
+            )
         agent = session["agent"]
         if hasattr(agent, "clear_interrupt"):
             try:
@@ -13562,6 +14723,11 @@ def _run_prompt_submit(
                     _build_persist_user_message(prompt, images, run_message) if images else prompt
                 ),
             }
+            persist_user_display_metadata = dict(display_metadata or {})
+            if client_message_id:
+                persist_user_display_metadata["client_message_id"] = client_message_id
+            if client_identity is not None:
+                persist_user_display_metadata["client_identity"] = client_identity[0]
             # Type a synthesized turn at turn START so the crash persist writes
             # its row as a timeline event, instead of leaving a raw user bubble
             # until the turn ends — and forever if it never does, which is
@@ -13576,7 +14742,13 @@ def _run_prompt_submit(
                 run_kwargs["task_id"] = session["session_key"]
             if display_kind and "persist_user_display_kind" in _run_params:
                 run_kwargs["persist_user_display_kind"] = display_kind
-                run_kwargs["persist_user_display_metadata"] = display_metadata
+            if (
+                persist_user_display_metadata
+                and "persist_user_display_metadata" in _run_params
+            ):
+                run_kwargs[
+                    "persist_user_display_metadata"
+                ] = persist_user_display_metadata
             # Auto-titling now fires inside the turn prologue (shared by every
             # surface). Hand the agent this session's live-rename hook so the
             # sidebar repaints the moment a title lands, rather than waiting
@@ -13585,6 +14757,33 @@ def _run_prompt_submit(
             agent._on_session_title = lambda t, _src, _k=_title_key: _emit(
                 "session.title", sid, {"session_id": _k, "title": t}
             )
+            # The turn prologue calls this only after its inbound user row is
+            # durable. Fan the existing change signal through this session's
+            # ordered event hub so peer clients refresh before assistant output;
+            # the global state.db watcher remains the out-of-process fallback.
+            def _on_user_message_persisted() -> None:
+                # The DB watcher remains a coarse out-of-process fallback, but
+                # attached clients need the row itself on the ordered session
+                # stream. Otherwise assistant/tool frames outrun the async
+                # transcript reload by seconds. Only real client submissions
+                # carry a client_message_id; synthesized auto-continue/loop
+                # turns retain their existing typed timeline projections.
+                if client_message_id and display_kind != "hidden":
+                    payload = {
+                        "message_id": client_message_id,
+                        "text": display_text
+                        if display_text is not None
+                        else _content_display_text(text),
+                        "timestamp": submitted_at or time.time(),
+                    }
+                    if attachment_refs:
+                        payload["attachment_refs"] = list(attachment_refs)
+                    if display_metadata:
+                        payload["display_metadata"] = dict(display_metadata)
+                    _emit("message.user", sid, payload)
+                _emit("sessions.changed", sid, {})
+
+            agent._on_user_message_persisted = _on_user_message_persisted
             _usage_stop, _usage_thread = _start_usage_ticker(sid, agent)
             try:
                 result = agent.run_conversation(run_message, **run_kwargs)
@@ -14121,9 +15320,10 @@ def _run_prompt_submit(
             _clear_session_context(session_tokens)
             _current_runtime_session_record.reset(runtime_session_token)
             reset_transport(transport_token)
-            # Clear the per-turn interim callback so a stale closure from
-            # this turn can't fire during a later turn on the same agent.
+            # Clear per-turn callbacks so stale closures from this turn cannot
+            # fire during a later turn on the same cached agent.
             agent.interim_assistant_callback = None
+            agent._on_user_message_persisted = None
             with session["history_lock"]:
                 session["running"] = False
                 session["last_active"] = time.time()
@@ -14551,31 +15751,63 @@ def _stage_session_file_attachment(
 def _respond(rid, params, key, *, allow_expired=False):
     r = params.get("request_id", "")
     question_id = str(params.get("question_id") or "")
-    with _prompt_lock:
-        entry = _pending.get(r)
-        if not entry:
-            if allow_expired and r:
-                return _ok(rid, {"status": "expired"})
-            return _err(rid, 4009, f"no pending {key} request")
-        _, ev = entry
-        batch = _batch_clarify.get(r)
-        if batch is not None and question_id:
-            # Per-question lock (multi-question clarify). Update-in-place is
-            # deliberate: a locked answer stays editable until the batch
-            # completes, and completion is exactly "every qid locked" — the
-            # final lock is the Confirm-and-continue click.
-            if question_id not in batch["qids"]:
-                return _err(rid, 4002, f"unknown question_id {question_id!r}")
-            batch["answers"][question_id] = params.get(key, "")
-            remaining = [
-                qid for qid in batch["qids"] if qid not in batch["answers"]
-            ]
-            if not remaining:
+    resolution = None
+    response = None
+    network_clarification = key == "answer" and current_transport() is not None
+    session_guard = _sessions_lock if network_clarification else contextlib.nullcontext()
+    with session_guard:
+        with _prompt_lock:
+            entry = _pending.get(r)
+            if not entry:
+                if allow_expired and r:
+                    outcome = (
+                        _clarification_outcome_locked(r) if key == "answer" else None
+                    )
+                    return _ok(rid, {"status": outcome or "expired"})
+                return _err(rid, 4009, f"no pending {key} request")
+            sid, ev = entry
+            if network_clarification and _sessions.get(sid) is None:
+                return _err(rid, 4009, "clarification owner is unavailable")
+            requested_sid = str(params.get("session_id") or "")
+            if key == "answer" and requested_sid and requested_sid != sid:
+                return _err(rid, 4009, "no pending answer request for session")
+            batch = _batch_clarify.get(r)
+            if batch is not None and question_id:
+                # Per-question lock (multi-question clarify). The prompt lock makes
+                # the first valid response authoritative even when two attached
+                # controllers answer concurrently.
+                if question_id not in batch["qids"]:
+                    return _err(rid, 4002, f"unknown question_id {question_id!r}")
+                if question_id in batch["answers"]:
+                    return _ok(rid, {"status": "already_resolved"})
+                batch["answers"][question_id] = params.get(key, "")
+                remaining = [
+                    qid for qid in batch["qids"] if qid not in batch["answers"]
+                ]
+                if not remaining:
+                    ev.set()
+                response = {"status": "ok", "remaining": remaining}
+            else:
+                if r in _answers:
+                    return _ok(rid, {"status": "already_resolved"})
+                _answers[r] = params.get(key, "")
                 ev.set()
-            return _ok(rid, {"status": "ok", "remaining": remaining})
-        _answers[r] = params.get(key, "")
-        ev.set()
-    return _ok(rid, {"status": "ok"})
+                response = {"status": "ok"}
+            if key == "answer":
+                resolution = (
+                    sid,
+                    {
+                        "request_id": r,
+                        "question_id": question_id or None,
+                        "status": "resolved",
+                    },
+                )
+    if resolution is not None:
+        # Resolution is committed under _prompt_lock above. Observer delivery is
+        # telemetry/presentation and must not delay or rewrite that authoritative
+        # result; disconnected observers recover it through replay/snapshots.
+        _emit("clarify.resolved", resolution[0], resolution[1])
+    return _ok(rid, response)
 
 
 # ── Methods: config ──────────────────────────────────────────────────

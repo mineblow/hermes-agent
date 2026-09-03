@@ -27,6 +27,13 @@ function createHarness(connection: RegistryGatewayWsConnection) {
   return { ensureBackend, handler, mintTicket, store }
 }
 
+function expectedWsHeaders(url: string, headers: Record<string, string> = {}) {
+  const parsed = new URL(url)
+  parsed.protocol = parsed.protocol === 'wss:' ? 'https:' : 'http:'
+
+  return { ...headers, Origin: parsed.origin }
+}
+
 function expectRequestHeaders(
   store: ReturnType<typeof createRemoteWsHeaderStore>,
   url: string,
@@ -37,7 +44,9 @@ function expectRequestHeaders(
   applyRemoteRequestHeaders({ url, requestHeaders: { Origin: 'app://hermes' } }, callback, store.headersFor)
 
   expect(callback).toHaveBeenCalledOnce()
-  expect(callback).toHaveBeenCalledWith(expected ? { requestHeaders: { Origin: 'app://hermes', ...expected } } : {})
+  expect(callback).toHaveBeenCalledWith(
+    expected ? { requestHeaders: expectedWsHeaders(url, { Origin: 'app://hermes', ...expected }) } : {}
+  )
 }
 
 function expectNoHeadersForNearbyUrls(store: ReturnType<typeof createRemoteWsHeaderStore>, exactUrl: string) {
@@ -71,6 +80,24 @@ function expectNoHeadersForNearbyUrls(store: ReturnType<typeof createRemoteWsHea
 }
 
 describe('registry gateway WebSocket headers', () => {
+  it('replaces the local renderer origin for the exact remote WebSocket URL', () => {
+    const store = createRemoteWsHeaderStore()
+    const wsUrl = 'wss://gateway.example/proxy/9120/api/ws?ticket=one'
+    const callback = vi.fn()
+
+    store.remember(wsUrl)
+    applyRemoteRequestHeaders(
+      { url: wsUrl, requestHeaders: { Origin: 'app://hermes' } },
+      callback,
+      store.headersFor
+    )
+
+    expect(callback).toHaveBeenCalledWith({
+      requestHeaders: { Origin: 'https://gateway.example' }
+    })
+    expect(store.headersFor('wss://gateway.example/api/ws?ticket=one')).toEqual({})
+  })
+
   it('evicts the least recently accessed exact URL', () => {
     const store = createRemoteWsHeaderStore(2)
     const firstUrl = 'wss://gateway.example/api/ws?token=first&profile=research'
@@ -80,13 +107,13 @@ describe('registry gateway WebSocket headers', () => {
     store.remember(firstUrl, accessHeaders)
     store.remember(secondUrl, accessHeaders)
     expect(store.headersFor('wss://gateway.example/api/ws?token=missing&profile=research')).toEqual({})
-    expect(store.headersFor(firstUrl)).toEqual(accessHeaders)
+    expect(store.headersFor(firstUrl)).toEqual(expectedWsHeaders(firstUrl, accessHeaders))
 
     store.remember(thirdUrl, accessHeaders)
 
-    expect(store.headersFor(firstUrl)).toEqual(accessHeaders)
+    expect(store.headersFor(firstUrl)).toEqual(expectedWsHeaders(firstUrl, accessHeaders))
     expect(store.headersFor(secondUrl)).toEqual({})
-    expect(store.headersFor(thirdUrl)).toEqual(accessHeaders)
+    expect(store.headersFor(thirdUrl)).toEqual(expectedWsHeaders(thirdUrl, accessHeaders))
   })
 
   it('updates headers without changing insertion recency', () => {
@@ -101,8 +128,8 @@ describe('registry gateway WebSocket headers', () => {
     store.remember(thirdUrl, accessHeaders)
 
     expect(store.headersFor(firstUrl)).toEqual({})
-    expect(store.headersFor(secondUrl)).toEqual(accessHeaders)
-    expect(store.headersFor(thirdUrl)).toEqual(accessHeaders)
+    expect(store.headersFor(secondUrl)).toEqual(expectedWsHeaders(secondUrl, accessHeaders))
+    expect(store.headersFor(thirdUrl)).toEqual(expectedWsHeaders(thirdUrl, accessHeaders))
   })
 
   it('token path binds headers to the exact profile scoped URL', async () => {
@@ -121,7 +148,7 @@ describe('registry gateway WebSocket headers', () => {
     expect(result).toBe(expectedUrl)
     expect(ensureBackend).toHaveBeenCalledWith('remote-one', 'research')
     expect(mintTicket).not.toHaveBeenCalled()
-    expect(store.headersFor(result)).toEqual(accessHeaders)
+    expect(store.headersFor(result)).toEqual(expectedWsHeaders(result, accessHeaders))
     expectRequestHeaders(store, result, accessHeaders)
     expectNoHeadersForNearbyUrls(store, result)
   })
@@ -142,7 +169,7 @@ describe('registry gateway WebSocket headers', () => {
     expect(result).toBe(expectedUrl)
     expect(mintTicket).toHaveBeenCalledOnce()
     expect(mintTicket).toHaveBeenCalledWith('https://gateway.example', accessHeaders)
-    expect(store.headersFor(result)).toEqual(accessHeaders)
+    expect(store.headersFor(result)).toEqual(expectedWsHeaders(result, accessHeaders))
     expectRequestHeaders(store, result, accessHeaders)
     expectNoHeadersForNearbyUrls(store, result)
   })
@@ -160,7 +187,7 @@ describe('registry gateway WebSocket headers', () => {
     const result = await handler({ connectionId: 'remote-one', profile: 'research' })
 
     expect(result).toBe('wss://gateway.example/api/ws?trace=one&token=secret')
-    expect(store.headersFor(result)).toEqual(accessHeaders)
+    expect(store.headersFor(result)).toEqual(expectedWsHeaders(result, accessHeaders))
     expectRequestHeaders(store, result, accessHeaders)
     expect(store.headersFor('wss://gateway.example/api/ws?token=secret&trace=one')).toEqual({})
   })

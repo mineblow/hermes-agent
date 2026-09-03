@@ -628,6 +628,11 @@ export type GatewayEvent =
   | { payload?: { text?: string }; session_id?: string; type: 'thinking.delta' }
   | { payload?: { kind?: string }; session_id?: string; type: 'reaction' }
   | { payload?: undefined; session_id?: string; type: 'message.start' }
+  | {
+      payload: { attachment_refs?: string[]; message_id: string; text?: string; timestamp?: number }
+      session_id?: string
+      type: 'message.user'
+    }
   | { payload?: { kind?: string; text?: string }; session_id?: string; type: 'status.update' }
   | {
       payload?: {
@@ -731,6 +736,7 @@ export type GatewayEvent =
         choices?: string[]
         command: string
         description: string
+        request_id?: string
         smart_denied?: boolean
       }
       session_id?: string
@@ -768,4 +774,23 @@ export type GatewayEvent =
       type: 'message.complete'
     }
   | { payload?: { usage?: Usage }; session_id?: string; type: 'session.usage' }
+  | {
+      payload?: {
+        durable_session_ids?: string[]
+        recovered_session_ids?: string[]
+        session_ids?: string[]
+      }
+      session_id?: string
+      type: 'session.runtime_owner_lost'
+    }
+  | {
+      payload: {
+        complete: (recoveredSessionId: string) => void
+        durable_session_id: string
+        fail: (error: unknown) => void
+        live_session_id: string
+      }
+      session_id: string
+      type: 'session.replay_resync_required'
+    }
   | { payload?: { message?: string }; session_id?: string; type: 'error' }

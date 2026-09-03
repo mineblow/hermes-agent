@@ -25,6 +25,8 @@ export type GatewayEventName =
   | (string & {})
 
 export interface GatewayEvent<P = unknown> {
+  /** Opaque server numbering generation paired with seq. */
+  epoch?: string
   payload?: P
   /** Renderer-side source tag added by the Desktop gateway registry. */
   profile?: string
@@ -32,11 +34,186 @@ export interface GatewayEvent<P = unknown> {
    * absent for the local/legacy primary path). */
   connectionId?: string
   session_id?: string
+  seq?: number
   type: GatewayEventName
 }
 
 export type ConnectionState = 'idle' | 'connecting' | 'open' | 'closed' | 'error'
+export type DurableResyncReason =
+  'replay_epoch_changed' | 'replay_truncated' | 'runtime_host_changed' | 'runtime_owner_lost'
+export interface DurableResyncRequest {
+  durable_session_id?: string
+  reason: DurableResyncReason
+  session_id: string
+}
+export interface RuntimeSessionRebound {
+  durable_session_id: string
+  new_session_id: string
+  old_session_id: string
+}
 export type GatewayRequestId = number | string
+export type AttachmentMode = 'observe' | 'control'
+export type AttachmentCapability =
+  | 'observe'
+  | 'prompt.submit'
+  | 'session.steer'
+  | 'session.interrupt'
+  | 'approval.respond'
+  | 'clarify.respond'
+  | 'ui.respond'
+export type ClientCapability = 'session.observe' | 'session.control' | 'session.replay'
+export type MultiClientMethod =
+  'client.attach' | 'session.attach' | 'session.detach' | 'session.attachments' | 'session.events.since'
+
+export interface GatewayReadyPayload {
+  capabilities?: MultiClientMethod[]
+  change_events?: boolean
+  connection_id: string
+  heartbeat?: boolean
+  multi_client?: {
+    attachment_modes: AttachmentMode[]
+    methods: MultiClientMethod[]
+    protocol_version: 1
+  }
+  multi_client_sessions?: 1
+  replay_epoch: string
+  /** Opaque canonical-runtime host generation. Optional for legacy gateways. */
+  runtime_host_id?: string
+  skin?: unknown
+}
+
+export interface ClientAttachParams {
+  capabilities?: ClientCapability[]
+  client_id: string
+  protocol_version: 1
+  surface: string
+}
+
+export interface GatewayClientIdStorage {
+  getItem(key: string): string | null
+  setItem(key: string, value: string): void
+}
+
+const GATEWAY_CLIENT_ID_PATTERN = /^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$/
+const GATEWAY_SURFACE_PATTERN = /^[a-z0-9][a-z0-9._-]{0,31}$/
+
+function randomGatewayClientId(): string {
+  try {
+    if (typeof globalThis.crypto?.randomUUID === 'function') {
+      return globalThis.crypto.randomUUID()
+    }
+  } catch {
+    // Fall through for restricted browser contexts.
+  }
+
+  return `${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 14)}`
+}
+
+/** Stable per-window identity: sessionStorage survives reconnect/reload but is isolated across windows. */
+export function getOrCreateGatewayClientId(
+  surface: string,
+  storage?: GatewayClientIdStorage | null,
+  createId: () => string = randomGatewayClientId
+): string {
+  const normalizedSurface = surface.trim().toLowerCase()
+
+  if (!GATEWAY_SURFACE_PATTERN.test(normalizedSurface)) {
+    throw new TypeError('gateway client surface is invalid')
+  }
+
+  const key = `hermes.gateway.client-id.${normalizedSurface}.v1`
+
+  try {
+    const existing = storage?.getItem(key)
+
+    if (existing && GATEWAY_CLIENT_ID_PATTERN.test(existing)) {
+      return existing
+    }
+  } catch {
+    // Storage can be unavailable in private/restricted browser contexts.
+  }
+
+  const generated = `${normalizedSurface}:${createId()}`
+
+  if (!GATEWAY_CLIENT_ID_PATTERN.test(generated)) {
+    throw new TypeError('generated gateway client identity is invalid')
+  }
+
+  try {
+    storage?.setItem(key, generated)
+  } catch {
+    // The in-memory identity remains valid for this client instance.
+  }
+
+  return generated
+}
+
+export interface ClientAttachResult {
+  capabilities: ClientCapability[]
+  client_id: string
+  connection_id: string
+  idempotent: boolean
+  protocol_version: 1
+  surface: string
+}
+
+export interface SessionAttachmentSnapshot {
+  capabilities: AttachmentCapability[]
+  client_id: string
+  mode: AttachmentMode
+}
+
+export interface SessionAttachParams {
+  last_seen_seq?: number
+  mode: AttachmentMode
+  session_id: string
+}
+
+export interface SessionAttachResult extends SessionAttachmentSnapshot {
+  epoch: string
+  events: GatewayEvent[]
+  latest_seq: number
+  replay?: {
+    events: GatewayEvent[]
+    truncated: boolean
+  }
+  replay_epoch: string
+  session_id: string
+  truncated: boolean
+}
+
+export interface SessionDetachParams {
+  session_id: string
+}
+
+export interface SessionDetachResult {
+  detached: boolean
+  session_id: string
+}
+
+export interface SessionAttachmentsParams {
+  session_id: string
+}
+
+export interface SessionAttachmentsResult {
+  attachments: SessionAttachmentSnapshot[]
+  session_id: string
+}
+
+export interface SessionEventsSinceParams {
+  last_seen?: number
+  last_seen_seq?: number
+  session_id: string
+  since_seq?: number
+}
+
+export interface SessionEventsSinceResult {
+  count: number
+  epoch: string
+  events: GatewayEvent[]
+  latest_seq: number
+  truncated: boolean
+}
 
 export interface JsonRpcErrorPayload {
   code?: number
@@ -73,13 +250,22 @@ type PendingCall = {
   timer?: ReturnType<typeof setTimeout>
 }
 
+type TrackedSession = {
+  durableSessionId?: string
+  mode: AttachmentMode
+}
+
 export interface GatewayClientOptions {
+  /** Stable logical identity and capability request for negotiated multi-client gateways. */
+  clientAttachment?: ClientAttachParams
   closedErrorMessage?: string
   connectErrorMessage?: string
   connectTimeoutMs?: number
   createRequestId?: (nextId: number) => GatewayRequestId
   heartbeatDeadlineMs?: number
   heartbeatIntervalMs?: number
+  onDurableResyncRequired?: (request: DurableResyncRequest) => void
+  onRuntimeSessionRebound?: (rebound: RuntimeSessionRebound) => void
   /** Return true to intercept the default closed-state transition. */
   onSocketClose?: (event: CloseEvent) => boolean | void
   requestIdPrefix?: string
@@ -110,6 +296,8 @@ export class JsonRpcGatewayClient {
   private lastInboundAt = 0
   /** Last observed event seq per session_id — drives lossless reconnect replay. */
   private lastSeenSeq = new Map<string, number>()
+  /** Live sessions plus their durable resume ids, restored after reconnect/owner loss. */
+  private trackedSessions = new Map<string, TrackedSession>()
   /** Set while a post-reconnect replay fetch is in flight (dedup guard). */
   private replayInFlight = false
   /**
@@ -128,13 +316,30 @@ export class JsonRpcGatewayClient {
    * silently believe nothing was missed.
    */
   private replayEpoch: string | null = null
+  /** Canonical runtime host generation learned from gateway.ready. */
+  private runtimeHostId: string | null = null
+  private runtimeHostRecoveryPending = false
   private readonly eventHandlers = new Map<string, Set<(event: GatewayEvent) => void>>()
   private readonly stateHandlers = new Set<(state: ConnectionState) => void>()
-  private readonly options: Required<Omit<GatewayClientOptions, 'socketFactory'>> &
-    Pick<GatewayClientOptions, 'socketFactory'>
+  private readonly options: Required<
+    Omit<
+      GatewayClientOptions,
+      'clientAttachment' | 'onDurableResyncRequired' | 'onRuntimeSessionRebound' | 'socketFactory'
+    >
+  > &
+    Pick<
+      GatewayClientOptions,
+      'clientAttachment' | 'onDurableResyncRequired' | 'onRuntimeSessionRebound' | 'socketFactory'
+    >
+  private negotiatingConnect: {
+    reject: (error: Error) => void
+    resolve: () => void
+    socket: WebSocketLike
+  } | null = null
 
   constructor(options: GatewayClientOptions = {}) {
     this.options = {
+      clientAttachment: options.clientAttachment,
       closedErrorMessage: options.closedErrorMessage ?? 'WebSocket closed',
       connectErrorMessage: options.connectErrorMessage ?? 'WebSocket connection failed',
       connectTimeoutMs: options.connectTimeoutMs ?? DEFAULT_CONNECT_TIMEOUT_MS,
@@ -142,6 +347,8 @@ export class JsonRpcGatewayClient {
       heartbeatDeadlineMs: options.heartbeatDeadlineMs ?? DEFAULT_HEARTBEAT_DEADLINE_MS,
       heartbeatIntervalMs: options.heartbeatIntervalMs ?? DEFAULT_HEARTBEAT_INTERVAL_MS,
       notConnectedErrorMessage: options.notConnectedErrorMessage ?? 'gateway not connected',
+      onDurableResyncRequired: options.onDurableResyncRequired,
+      onRuntimeSessionRebound: options.onRuntimeSessionRebound,
       onSocketClose: options.onSocketClose ?? (() => false),
       requestIdPrefix: options.requestIdPrefix ?? 'r',
       requestTimeoutMs: options.requestTimeoutMs ?? DEFAULT_REQUEST_TIMEOUT_MS,
@@ -225,30 +432,68 @@ export class JsonRpcGatewayClient {
         socket.removeEventListener('error', onError)
       }
 
+      const complete = () => {
+        if (settled || this.socket !== socket) {
+          return
+        }
+
+        settled = true
+        this.setState('open')
+
+        if (this.negotiatingConnect?.socket === socket) {
+          this.negotiatingConnect = null
+        }
+
+        cleanup()
+        resolve()
+      }
+
+      const fail = (error: Error, updateState = true) => {
+        if (settled) {
+          return
+        }
+
+        settled = true
+
+        if (this.negotiatingConnect?.socket === socket) {
+          this.negotiatingConnect = null
+        }
+
+        cleanup()
+
+        if (updateState) {
+          this.setState('error')
+        }
+
+        reject(error)
+      }
+
       const onOpen = () => {
         if (settled || this.socket !== socket) {
           return
         }
 
-        settled = true
-        cleanup()
-        this.setState('open')
-        resolve()
-        // Lossless resume: drain events emitted while we were disconnected.
-        // Fire-and-forget so connect() latency is unaffected; only runs when
-        // we actually observed seq'd events before the drop.
+        if (this.options.clientAttachment) {
+          this.negotiatingConnect = {
+            reject: fail,
+            resolve: complete,
+            socket
+          }
+
+          return
+        }
+
+        complete()
+        // Legacy clients retain their pre-negotiation replay behavior.
         void this.fetchReplay()
       }
 
       const onError = () => {
-        if (settled || this.socket !== socket) {
+        if (this.socket !== socket) {
           return
         }
 
-        settled = true
-        cleanup()
-        this.setState('error')
-        reject(new Error(this.options.connectErrorMessage))
+        fail(new Error(this.options.connectErrorMessage))
       }
 
       socket.addEventListener('open', onOpen, { once: true })
@@ -260,12 +505,11 @@ export class JsonRpcGatewayClient {
             return
           }
 
-          settled = true
-          cleanup()
+          const isCurrentSocket = this.socket === socket
 
-          // Drop the half-open socket so the next connect() starts clean
-          // instead of short-circuiting on a zombie 'connecting' state.
-          if (this.socket === socket) {
+          // Drop the half-open or unnegotiated socket so the next connect()
+          // starts clean instead of short-circuiting on a zombie state.
+          if (isCurrentSocket) {
             try {
               socket.close()
             } catch {
@@ -273,13 +517,48 @@ export class JsonRpcGatewayClient {
             }
 
             this.socket = null
-            this.setState('error')
           }
 
-          reject(new Error(this.options.connectErrorMessage))
+          fail(new Error(this.options.connectErrorMessage), isCurrentSocket)
         }, this.options.connectTimeoutMs)
       }
     })
+  }
+
+  attachClient(params: ClientAttachParams): Promise<ClientAttachResult> {
+    return this.request<ClientAttachResult>('client.attach', { ...params })
+  }
+
+  async attachSession(params: SessionAttachParams): Promise<SessionAttachResult> {
+    const result = await this.request<SessionAttachResult>('session.attach', { ...params })
+
+    const existing = this.trackedSessions.get(params.session_id)
+    this.trackedSessions.set(params.session_id, {
+      durableSessionId: existing?.durableSessionId,
+      mode: params.mode
+    })
+    this.applySessionAttachResult(result)
+
+    return result
+  }
+
+  async detachSession(params: SessionDetachParams): Promise<SessionDetachResult> {
+    const result = await this.request<SessionDetachResult>('session.detach', { ...params })
+
+    if (result.detached) {
+      this.trackedSessions.delete(params.session_id)
+      this.lastSeenSeq.delete(params.session_id)
+    }
+
+    return result
+  }
+
+  listSessionAttachments(params: SessionAttachmentsParams): Promise<SessionAttachmentsResult> {
+    return this.request<SessionAttachmentsResult>('session.attachments', { ...params })
+  }
+
+  getSessionEventsSince(params: SessionEventsSinceParams): Promise<SessionEventsSinceResult> {
+    return this.request<SessionEventsSinceResult>('session.events.since', { ...params })
   }
 
   close(): void {
@@ -371,6 +650,7 @@ export class JsonRpcGatewayClient {
       const pending: PendingCall = {
         resolve: value => {
           detach()
+          this.trackSuccessfulSessionRequest(method, params, value)
           resolve(value as T)
         },
         reject: error => {
@@ -429,6 +709,158 @@ export class JsonRpcGatewayClient {
     })
   }
 
+  private trackSuccessfulSessionRequest(method: string, params: Record<string, unknown>, value: unknown): void {
+    if (method !== 'session.create' && method !== 'session.resume') {
+      return
+    }
+
+    const result = value as Record<string, unknown> | null
+    const liveSessionId = typeof result?.session_id === 'string' ? result.session_id : ''
+
+    if (!liveSessionId) {
+      return
+    }
+
+    const requested = typeof params.session_id === 'string' ? params.session_id : ''
+
+    const storedSessionId = typeof result?.stored_session_id === 'string' ? result.stored_session_id : ''
+
+    const resultKey = typeof result?.session_key === 'string' ? result.session_key : ''
+    const resumed = typeof result?.resumed === 'string' ? result.resumed : ''
+
+    const durableSessionId =
+      method === 'session.resume'
+        ? requested || resumed || resultKey || liveSessionId
+        : storedSessionId || resultKey || liveSessionId
+
+    let mode: AttachmentMode = 'control'
+
+    for (const [sessionId, tracked] of this.trackedSessions) {
+      if (tracked.durableSessionId === durableSessionId) {
+        mode = tracked.mode
+        this.trackedSessions.delete(sessionId)
+        this.lastSeenSeq.delete(sessionId)
+      }
+    }
+
+    this.trackedSessions.set(liveSessionId, { durableSessionId, mode })
+  }
+
+  private async reconstructTrackedSessionsAfterHostChange(): Promise<void> {
+    const tracked = [...this.trackedSessions.entries()]
+
+    for (const [staleSessionId, session] of tracked) {
+      try {
+        const result = await this.request<{ session_id?: string }>('session.resume', {
+          session_id: session.durableSessionId
+        })
+
+        const recoveredSessionId = result?.session_id
+
+        if (session.durableSessionId && recoveredSessionId) {
+          this.options.onRuntimeSessionRebound?.({
+            durable_session_id: session.durableSessionId,
+            new_session_id: recoveredSessionId,
+            old_session_id: staleSessionId
+          })
+        }
+      } catch (error: unknown) {
+        // Never attach a stale process-local id to a replacement runtime.
+        this.trackedSessions.delete(staleSessionId)
+        this.lastSeenSeq.delete(staleSessionId)
+        this.dispatchEvent({
+          type: 'error',
+          session_id: staleSessionId,
+          payload: {
+            code: 'runtime_recovery_failed',
+            message:
+              error instanceof Error
+                ? `Session recovery failed: ${error.message}`
+                : 'Session recovery failed after runtime host takeover.'
+          }
+        })
+      }
+    }
+  }
+
+  private applySessionAttachResult(result: SessionAttachResult): void {
+    if (result.epoch) {
+      this.adoptReplayEpoch(result.epoch)
+    }
+
+    if (result.truncated) {
+      this.lastSeenSeq.delete(result.session_id)
+      const durableSessionId = this.trackedSessions.get(result.session_id)?.durableSessionId
+      this.options.onDurableResyncRequired?.({
+        ...(durableSessionId ? { durable_session_id: durableSessionId } : {}),
+        reason: 'replay_truncated',
+        session_id: result.session_id
+      })
+
+      return
+    }
+
+    for (const event of result.events) {
+      if (event?.type) {
+        this.dispatchIfNewer(event)
+      }
+    }
+  }
+
+  private async negotiateReady(payload: unknown): Promise<void> {
+    const pending = this.negotiatingConnect
+    const attachment = this.options.clientAttachment
+
+    if (!pending || !attachment || pending.socket !== this.socket) {
+      return
+    }
+
+    const methods = (payload as GatewayReadyPayload | undefined)?.multi_client?.methods
+
+    try {
+      if (methods?.includes('client.attach')) {
+        await this.attachClient(attachment)
+
+        if (this.runtimeHostRecoveryPending) {
+          this.runtimeHostRecoveryPending = false
+          await this.reconstructTrackedSessionsAfterHostChange()
+        }
+
+        if (methods.includes('session.attach') && this.trackedSessions.size > 0) {
+          this.replayHold = new Map([...this.trackedSessions.keys()].map(sessionId => [sessionId, []]))
+
+          try {
+            for (const [sessionId, tracked] of this.trackedSessions) {
+              const result = await this.request<SessionAttachResult>('session.attach', {
+                session_id: sessionId,
+                mode: tracked.mode,
+                last_seen_seq: this.lastSeenSeq.get(sessionId) ?? 0
+              })
+
+              this.applySessionAttachResult(result)
+            }
+          } finally {
+            this.flushReplayHold()
+          }
+        }
+      } else {
+        // Legacy gateway: identity negotiation is unavailable, so retain the
+        // previous best-effort replay path and let connect proceed.
+        void this.fetchReplay()
+      }
+
+      pending.resolve()
+    } catch (error) {
+      const failure = error instanceof Error ? error : new Error(String(error))
+
+      pending.reject(failure)
+
+      if (this.socket === pending.socket) {
+        this.invalidateSocket(pending.socket, failure)
+      }
+    }
+  }
+
   private handleMessage(raw: unknown): void {
     const text = typeof raw === 'string' ? raw : String(raw)
     let frame: JsonRpcFrame
@@ -463,6 +895,60 @@ export class JsonRpcGatewayClient {
     }
 
     if (frame.method === 'event' && frame.params?.type) {
+      if (frame.params.type === 'session.runtime_owner_lost') {
+        const payload = frame.params.payload as { session_ids?: unknown } | undefined
+        const sessionIds = Array.isArray(payload?.session_ids) ? payload.session_ids : []
+
+        for (const sessionId of sessionIds) {
+          if (typeof sessionId !== 'string' || !this.trackedSessions.has(sessionId)) {
+            continue
+          }
+
+          this.lastSeenSeq.delete(sessionId)
+          this.replayHold?.delete(sessionId)
+          const tracked = this.trackedSessions.get(sessionId)
+
+          const resync: DurableResyncRequest = {
+            reason: 'runtime_owner_lost',
+            session_id: sessionId
+          }
+
+          if (tracked?.durableSessionId) {
+            resync.durable_session_id = tracked.durableSessionId
+          }
+
+          this.options.onDurableResyncRequired?.(resync)
+
+          if (tracked?.durableSessionId) {
+            void this.request<{ session_id?: string }>('session.resume', {
+              session_id: tracked.durableSessionId
+            })
+              .then(result => {
+                if (typeof result?.session_id === 'string' && result.session_id) {
+                  this.options.onRuntimeSessionRebound?.({
+                    durable_session_id: tracked.durableSessionId!,
+                    new_session_id: result.session_id,
+                    old_session_id: sessionId
+                  })
+                }
+              })
+              .catch((error: unknown) => {
+                this.dispatchEvent({
+                  type: 'error',
+                  session_id: sessionId,
+                  payload: {
+                    code: 'runtime_recovery_failed',
+                    message:
+                      error instanceof Error
+                        ? `Session recovery failed: ${error.message}`
+                        : 'Session recovery failed after runtime owner loss.'
+                  }
+                })
+              })
+          }
+        }
+      }
+
       if (frame.params.type === 'gateway.ready') {
         if (this.gatewayReadyAdvertisesHeartbeat(frame.params.payload)) {
           const socket = this.socket
@@ -472,11 +958,50 @@ export class JsonRpcGatewayClient {
           }
         }
 
-        const epoch = (frame.params.payload as { replay_epoch?: unknown } | undefined)?.replay_epoch
+        const ready = frame.params.payload as GatewayReadyPayload | undefined
+        const epoch = ready?.replay_epoch
+        const runtimeHostId = ready?.runtime_host_id
+        let hostChanged = false
+
+        if (typeof runtimeHostId === 'string' && runtimeHostId) {
+          if (this.runtimeHostId && this.runtimeHostId !== runtimeHostId) {
+            hostChanged = true
+            this.runtimeHostRecoveryPending = true
+            this.lastSeenSeq.clear()
+            this.replayHold = null
+
+            for (const sessionId of this.trackedSessions.keys()) {
+              this.options.onDurableResyncRequired?.({
+                reason: 'runtime_host_changed',
+                session_id: sessionId
+              })
+            }
+          }
+
+          this.runtimeHostId = runtimeHostId
+        }
 
         if (typeof epoch === 'string' && epoch) {
-          this.adoptReplayEpoch(epoch)
+          this.adoptReplayEpoch(epoch, !hostChanged)
         }
+
+        if (this.options.clientAttachment) {
+          void this.negotiateReady(frame.params.payload)
+        }
+
+        if (hostChanged && !this.negotiatingConnect) {
+          this.runtimeHostRecoveryPending = false
+          void this.reconstructTrackedSessionsAfterHostChange()
+        }
+      }
+
+      const eventEpoch = frame.params.epoch
+
+      if (typeof eventEpoch === 'string' && eventEpoch) {
+        // Counter metadata is bounded. A long-lived gateway may rotate its
+        // replay epoch without reconnecting; clear stale watermarks before
+        // evaluating this event's restarted sequence.
+        this.adoptReplayEpoch(eventEpoch)
       }
 
       const sid = frame.params.session_id
@@ -490,8 +1015,10 @@ export class JsonRpcGatewayClient {
         return
       }
 
-      this.recordSeq(frame.params)
+      // Presentation owns acknowledgement: only persist the watermark after
+      // every registered callback accepted the frame without throwing.
       this.dispatchEvent(frame.params)
+      this.recordSeq(frame.params)
     }
   }
 
@@ -549,16 +1076,29 @@ export class JsonRpcGatewayClient {
       // One RPC per known session keeps params flat; sessions are few (<20).
       const results = await Promise.allSettled(
         entries.map(([sid, lastSeen]) =>
-          this.request<{ events?: Array<{ type: string; session_id?: string; seq?: number; payload?: unknown }> }>(
-            'session.events.since',
-            { session_id: sid, last_seen: lastSeen },
-            REPLAY_REQUEST_TIMEOUT_MS
-          )
+          this.request<{
+            events?: Array<{ type: string; session_id?: string; seq?: number; payload?: unknown }>
+            truncated?: boolean
+          }>('session.events.since', { session_id: sid, last_seen: lastSeen }, REPLAY_REQUEST_TIMEOUT_MS)
         )
       )
 
-      for (const result of results) {
+      for (const [index, result] of results.entries()) {
         if (result.status !== 'fulfilled' || !Array.isArray(result.value?.events)) {
+          continue
+        }
+
+        const [sessionId] = entries[index]
+
+        if (result.value.truncated === true) {
+          this.lastSeenSeq.delete(sessionId)
+          const durableSessionId = this.trackedSessions.get(sessionId)?.durableSessionId
+          this.options.onDurableResyncRequired?.({
+            ...(durableSessionId ? { durable_session_id: durableSessionId } : {}),
+            reason: 'replay_truncated',
+            session_id: sessionId
+          })
+
           continue
         }
 
@@ -608,7 +1148,12 @@ export class JsonRpcGatewayClient {
         return
       }
 
+      // A replay callback may fail while applying the event to presentation
+      // state. Keep the previous durable watermark so a reconnect can retry it.
+      this.dispatchEvent(event)
       this.lastSeenSeq.set(sid, seq)
+
+      return
     }
 
     this.dispatchEvent(event)
@@ -619,13 +1164,23 @@ export class JsonRpcGatewayClient {
    * seq watermarks describe a numbering that no longer exists — clear them
    * so the next reconnect doesn't silently believe it missed nothing.
    */
-  private adoptReplayEpoch(epoch: string): void {
+  private adoptReplayEpoch(epoch: string, notify = true): void {
     if (this.replayEpoch === epoch) {
       return
     }
 
     if (this.replayEpoch !== null) {
       this.lastSeenSeq.clear()
+      this.replayHold = null
+
+      if (notify) {
+        for (const sessionId of this.trackedSessions.keys()) {
+          this.options.onDurableResyncRequired?.({
+            reason: 'replay_epoch_changed',
+            session_id: sessionId
+          })
+        }
+      }
     }
 
     this.replayEpoch = epoch

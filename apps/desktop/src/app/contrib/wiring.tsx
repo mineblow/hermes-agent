@@ -389,7 +389,6 @@ export function ContribWiring({ children }: { children: ReactNode }) {
       }
 
       const storedProfile = $sessions.get().find(session => sessionMatchesStoredId(session, storedSessionId))?.profile
-
       for (let index = 0; index < Math.max(1, attempts); index += 1) {
         try {
           const latest = await getLatestSessionMessages(storedSessionId, storedProfile)
@@ -436,13 +435,14 @@ export function ContribWiring({ children }: { children: ReactNode }) {
       reconcileActiveTranscript({
         activeSessionIdRef,
         busyRef,
+        getSessionState: sessionId => sessionStateByRuntimeIdRef.current.get(sessionId),
         requestSequenceRef: activeTranscriptRequestSequenceRef,
         resolveSession: resolveActiveTranscriptSession,
         selectedStoredSessionIdRef,
         signatureRef: activeTranscriptSignatureRef,
         updateSessionState
       }),
-    [activeSessionIdRef, busyRef, selectedStoredSessionIdRef, updateSessionState]
+    [activeSessionIdRef, busyRef, selectedStoredSessionIdRef, sessionStateByRuntimeIdRef, updateSessionState]
   )
 
   const { handleGatewayEvent } = useMessageStream({

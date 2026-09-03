@@ -690,8 +690,22 @@ function isMissingProfileError(error: unknown): boolean {
 }
 
 function createSecondary(profile: string, connectionId: null | string = null): Secondary {
-  const gateway = new HermesGateway()
   const scope = registryBackendScopeKey(connectionId, profile)
+  const emitRecoveryEvent = (type: string, sessionId: string, payload: unknown) => {
+    g.config?.onEvent({
+      type,
+      session_id: sessionId,
+      payload,
+      profile,
+      ...(connectionId ? { connectionId } : {})
+    })
+  }
+  const gateway = new HermesGateway({
+    onDurableResyncRequired: request =>
+      emitRecoveryEvent('session.durable_resync_required', request.session_id, request),
+    onRuntimeSessionRebound: rebound =>
+      emitRecoveryEvent('session.runtime_recovered', rebound.new_session_id, rebound)
+  })
 
   const entry: Secondary = {
     scope,

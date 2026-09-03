@@ -7558,7 +7558,12 @@ class TelegramAdapter(BasePlatformAdapter):
                     logger.error("Failed to resolve gateway approval from Telegram button: %s", exc)
                     count = 0
 
-                if count:
+                if count and ":interaction:" in session_key:
+                    label = "⏳ Response submitted"
+                    edit_text = (
+                        f"{label} by {user_display}; awaiting active runtime confirmation"
+                    )
+                elif count:
                     # Map choice to human-readable label
                     label_map = {
                         "once": "✅ Approved once",

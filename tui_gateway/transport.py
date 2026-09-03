@@ -67,6 +67,9 @@ _DISABLE_FLUSH = (os.environ.get("HERMES_TUI_GATEWAY_NO_FLUSH", "") or "").strip
 class Transport(Protocol):
     """Minimal interface every transport implements."""
 
+    connection_id: str
+    client_id: Optional[str]
+
     def write(self, obj: dict) -> bool:
         """Emit one JSON frame. Return ``False`` when the peer is gone."""
 
@@ -105,11 +108,13 @@ class StdioTransport:
     existing test suite relies on (``monkeypatch.setattr(server, "_real_stdout", ...)``).
     """
 
-    __slots__ = ("_stream_getter", "_lock")
+    __slots__ = ("_stream_getter", "_lock", "connection_id", "client_id")
 
     def __init__(self, stream_getter: Callable[[], Any], lock: threading.Lock) -> None:
         self._stream_getter = stream_getter
         self._lock = lock
+        self.connection_id = "stdio"
+        self.client_id = "stdio"
 
     def write(self, obj: dict) -> bool:
         """Return ``True`` on success, ``False`` ONLY when the peer is gone.
@@ -207,6 +212,14 @@ class TeeTransport:
             except Exception:
                 pass
         return ok
+
+    @property
+    def connection_id(self) -> str:
+        return self._primary.connection_id
+
+    @property
+    def client_id(self) -> Optional[str]:
+        return self._primary.client_id
 
     def close(self) -> None:
         try:

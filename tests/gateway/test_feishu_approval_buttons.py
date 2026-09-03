@@ -204,6 +204,20 @@ class TestFeishuUpdatePrompt:
 class TestResolveApproval:
     """Test _resolve_approval pops state and calls resolve_gateway_approval."""
 
+    def test_canonical_card_waits_for_runtime_confirmation(self):
+        adapter = _make_adapter()
+
+        card = adapter._build_resolved_approval_card(
+            choice="once",
+            user_name="Norbert",
+            pending_confirmation=True,
+        )
+
+        rendered = json.dumps(card, ensure_ascii=False)
+        assert "Response submitted" in rendered
+        assert "awaiting active runtime confirmation" in rendered
+        assert "Approved" not in rendered
+
     @pytest.mark.asyncio
     async def test_resolves_once(self):
         adapter = _make_adapter()

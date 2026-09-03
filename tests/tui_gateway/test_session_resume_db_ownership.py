@@ -116,6 +116,140 @@ def _resume(**params):
     )
 
 
+def test_runtime_key_lookup_keeps_launch_and_named_profiles_isolated(
+    monkeypatch, tmp_path
+):
+    default_home = tmp_path / "default"
+    named_home = tmp_path / "named"
+    monkeypatch.setattr(server, "_hermes_home", default_home)
+    monkeypatch.setattr(
+        server,
+        "_sessions",
+        {
+            "named-runtime": {
+                "session_key": "named-alias",
+                "runtime_owner_key": "canonical",
+                "profile_home": str(named_home),
+            },
+            "default-runtime": {
+                "session_key": "default-alias",
+                "runtime_owner_key": "canonical",
+                "profile_home": None,
+            },
+        },
+    )
+
+    assert server._find_live_session_by_runtime_key("canonical", None) == (
+        "default-runtime",
+        server._sessions["default-runtime"],
+    )
+
+
+def test_claim_race_reuses_canonical_owner_across_durable_aliases(
+    monkeypatch, tmp_path
+):
+    monkeypatch.setattr(server, "_hermes_home", tmp_path)
+    existing = {
+        "session_key": "alias-a",
+        "runtime_owner_key": "canonical",
+        "profile_home": None,
+    }
+    monkeypatch.setattr(server, "_sessions", {"existing-runtime": existing})
+    monkeypatch.setattr(server, "_cancel_ws_orphan_reap", lambda _sid: None)
+
+    class _Hub:
+        closed = False
+
+        def close(self):
+            self.closed = True
+
+    hub = _Hub()
+    candidate = {
+        "session_key": "alias-b",
+        "runtime_owner_key": "canonical",
+        "runtime_owner_lease": None,
+        "profile_home": None,
+        "event_hub": hub,
+    }
+
+    assert server._claim_or_reuse_live(
+        "candidate-runtime", "alias-b", candidate, None
+    ) == ("existing-runtime", existing)
+    assert "candidate-runtime" not in server._sessions
+    assert hub.closed is True
+
+
+def test_eager_resume_rechecks_canonical_runtime_key_after_build(
+    profile_dbs, monkeypatch
+):
+    class _CanonicalDB(_RecordingDB):
+        def session_runtime_key(self, _target):
+            return "canonical"
+
+    def _factory(db_path=None, **kwargs):
+        db = _CanonicalDB(db_path=db_path, **kwargs)
+        db.rows["alias-b"] = {"id": "alias-b", "cwd": ""}
+        profile_dbs.append(db)
+        return db
+
+    winner = {
+        "session_key": "alias-a",
+        "runtime_owner_key": "canonical",
+        "history": [],
+        "created_at": 1.0,
+        "last_active": 1.0,
+        "running": False,
+    }
+    server._sessions["winner-runtime"] = winner
+    lookups = []
+
+    def _find_runtime(runtime_key, profile_home=None):
+        lookups.append((runtime_key, profile_home))
+        return None if len(lookups) < 3 else ("winner-runtime", winner)
+
+    class _Agent:
+        model = "test"
+        closed = False
+
+        def close(self):
+            self.closed = True
+
+    built = _Agent()
+    monkeypatch.setattr("hermes_state.get_shared_session_db", _factory)
+    monkeypatch.setattr(server, "_find_live_session_by_runtime_key", _find_runtime)
+    monkeypatch.setattr(server, "_claim_local_runtime_owner", lambda *_a, **_k: None)
+    monkeypatch.setattr(server, "_stored_session_runtime_overrides", lambda _found: {})
+    monkeypatch.setattr(server, "_make_agent", lambda *_a, **_k: built)
+    monkeypatch.setattr(
+        server,
+        "_live_session_payload",
+        lambda sid, _session, **_kwargs: {
+            "session_id": sid,
+            "message_count": 0,
+            "messages": [],
+            "running": False,
+        },
+    )
+    monkeypatch.setattr(
+        server,
+        "_init_session",
+        lambda *_a, **_k: pytest.fail("canonical winner should be reused"),
+    )
+    monkeypatch.setattr(server, "_session_info", lambda *_a, **_k: {"model": "test"})
+
+    resp = _resume(session_id="alias-b", profile="work", eager_build=True)
+
+    assert "result" in resp, resp
+    assert resp["result"]["session_id"] == "winner-runtime"
+    assert [runtime_key for runtime_key, _profile in lookups] == [
+        "canonical",
+        "canonical",
+        "canonical",
+    ]
+    assert built.closed is True
+    assert profile_dbs[0].closed == 1
+
+
 def test_resume_closes_profile_db_when_session_not_found(profile_dbs):
     """The 'session not found' early return must not leak the handle.
 
@@ -193,11 +327,13 @@ def test_resume_closes_profile_db_on_live_session_fast_path(profile_dbs, monkeyp
     live_session = {}
     with server._sessions_lock:
         server._sessions["live-sid"] = live_session
-    monkeypatch.setattr(
-        server,
-        "_find_live_session_by_key",
-        lambda _key, *_a: ("live-sid", live_session),
-    )
+    runtime_lookups = []
+
+    def _find_runtime(runtime_key, profile_home=None):
+        runtime_lookups.append((runtime_key, profile_home))
+        return "live-sid", live_session
+
+    monkeypatch.setattr(server, "_find_live_session_by_runtime_key", _find_runtime)
     monkeypatch.setattr(
         server,
         "_live_session_payload",
@@ -208,6 +344,7 @@ def test_resume_closes_profile_db_on_live_session_fast_path(profile_dbs, monkeyp
     resp = _resume(session_id="s1", profile="work")
 
     assert resp["result"]["resumed"] == "s1"
+    assert runtime_lookups and runtime_lookups[0][0] == "s1"
     assert profile_dbs[0].closed == 1
 
 

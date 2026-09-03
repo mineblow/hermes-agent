@@ -23,6 +23,7 @@ import queue
 import secrets
 import threading
 import time
+from collections import deque
 from dataclasses import dataclass
 from typing import Any, Callable, Optional
 
@@ -182,6 +183,147 @@ class StreamConsumerConfig:
     # "group", "supergroup", "forum").  Used to gate native draft streaming,
     # which is platform-specific (Telegram drafts are DM-only).
     chat_type: str = ""
+
+
+class LiveRuntimeStreamRenderer:
+    """Render ordered canonical events through one consumer per runtime turn."""
+
+    _LOCAL_MESSAGE_ID_LIMIT = 2048
+
+    def __init__(
+        self,
+        adapter: Any,
+        consumer_factory: Callable[[], Any],
+        *,
+        enqueue_tool_line: Optional[Callable[[Any], None]] = None,
+        tool_mode: str = "all",
+        preview_max_len: int = 40,
+        on_peer_user: Optional[Callable[[Any], None]] = None,
+        on_interaction: Optional[Callable[[Any], None]] = None,
+    ) -> None:
+        self.adapter = adapter
+        self._consumer_factory = consumer_factory
+        self._enqueue_tool_line = enqueue_tool_line
+        self._tool_mode = tool_mode
+        self._preview_max_len = preview_max_len
+        self._on_peer_user = on_peer_user
+        self._on_interaction = on_interaction
+        self._consumer: Any = None
+        self._dispatcher: Any = None
+        self._task: asyncio.Task[Any] | None = None
+        self._lifecycle_lock = asyncio.Lock()
+        self._local_message_ids: set[str] = set()
+        self._local_message_order: deque[str] = deque()
+
+    def register_local_message_id(self, message_id: str) -> None:
+        if not isinstance(message_id, str) or not message_id.strip():
+            return
+        if message_id in self._local_message_ids:
+            return
+        self._local_message_ids.add(message_id)
+        self._local_message_order.append(message_id)
+        while len(self._local_message_order) > self._LOCAL_MESSAGE_ID_LIMIT:
+            expired = self._local_message_order.popleft()
+            self._local_message_ids.discard(expired)
+
+    def _start_turn(self) -> None:
+        if self._consumer is not None:
+            return
+        from gateway.stream_dispatch import GatewayEventDispatcher
+
+        self._consumer = self._consumer_factory()
+        enqueue_tool_line = self._enqueue_tool_line
+        if enqueue_tool_line is None:
+            enqueue_tool_line = getattr(self._consumer, "on_tool_progress", None)
+        self._dispatcher = GatewayEventDispatcher(
+            self.adapter,
+            self._consumer,
+            enqueue_tool_line=enqueue_tool_line,
+            tool_mode=self._tool_mode,
+            preview_max_len=self._preview_max_len,
+        )
+        self._task = asyncio.create_task(self._consumer.run())
+
+    async def on_event(self, frame: dict[str, Any]) -> None:
+        from gateway.live_runtime_event_translation import translate_runtime_event
+        from gateway.stream_events import (
+            InteractionRequest,
+            MessageStart,
+            MessageStop,
+            PeerUserMessage,
+        )
+
+        async with self._lifecycle_lock:
+            event = translate_runtime_event(frame)
+            if event is None:
+                return
+            if isinstance(event, MessageStart):
+                await self._abort_turn()
+                self._start_turn()
+                return
+            if isinstance(event, PeerUserMessage):
+                if event.message_id in self._local_message_ids:
+                    return
+                if self._on_peer_user is not None:
+                    result = self._on_peer_user(event)
+                    if inspect.isawaitable(result):
+                        await result
+                return
+            if isinstance(event, InteractionRequest):
+                if self._on_interaction is not None:
+                    result = self._on_interaction(event)
+                    if inspect.isawaitable(result):
+                        await result
+                return
+
+            self._start_turn()
+            self._dispatcher.dispatch(event)
+            if isinstance(event, MessageStop) and event.final:
+                task = self._task
+                if task is not None:
+                    await task
+                self._consumer = None
+                self._dispatcher = None
+                self._task = None
+
+    async def _abort_turn(self) -> None:
+        task = self._task
+        self._consumer = None
+        self._dispatcher = None
+        self._task = None
+        if task is not None:
+            task.cancel()
+            await asyncio.gather(task, return_exceptions=True)
+
+    async def reset(self, signal: Any = None) -> None:
+        """Reconcile partial presentation state from an authoritative snapshot."""
+        from gateway.stream_events import MessageStop
+
+        async with self._lifecycle_lock:
+            await self._abort_turn()
+            snapshot = signal.get("snapshot") if isinstance(signal, dict) else None
+            latest = (
+                snapshot.get("latest_assistant") if isinstance(snapshot, dict) else None
+            )
+            text = latest.get("text") if isinstance(latest, dict) else None
+            if not isinstance(text, str) or not text:
+                return
+            self._start_turn()
+            self._dispatcher.dispatch(
+                MessageStop(final=True, text=text, status="complete")
+            )
+            task = self._task
+            if task is not None:
+                await task
+            self._consumer = None
+            self._dispatcher = None
+            self._task = None
+
+    async def close(self) -> None:
+        async with self._lifecycle_lock:
+            await self._abort_turn()
+            self._local_message_ids.clear()
+            self._local_message_order.clear()
 
 
 class GatewayStreamConsumer:

@@ -29,6 +29,8 @@ from gateway.stream_events import (
     LongToolHint,
     MessageChunk,
     MessageStop,
+    InteractionRequest,
+    PeerUserMessage,
     StreamEvent,
     ToolCallChunk,
     ToolCallFinished,
@@ -74,6 +76,8 @@ class GatewayEventDispatcher:
         preview_max_len: int = 40,
         on_long_tool: Optional[Callable[[LongToolHint], None]] = None,
         on_notice: Optional[Callable[[GatewayNotice], None]] = None,
+        on_peer_user: Optional[Callable[[PeerUserMessage], None]] = None,
+        on_interaction: Optional[Callable[[InteractionRequest], None]] = None,
     ) -> None:
         self.adapter = adapter
         self.sink = sink
@@ -82,6 +86,8 @@ class GatewayEventDispatcher:
         self.preview_max_len = preview_max_len
         self._on_long_tool = on_long_tool
         self._on_notice = on_notice
+        self._on_peer_user = on_peer_user
+        self._on_interaction = on_interaction
         # "new" mode dedup — only report when the tool changes.
         self._last_tool: Optional[str] = None
 
@@ -116,6 +122,16 @@ class GatewayEventDispatcher:
         if isinstance(event, ToolCallFinished):
             # Default: no chrome on completion (matches today — the gateway only
             # rendered "started" events).  Completion drives onboarding hints.
+            return
+
+        if isinstance(event, PeerUserMessage):
+            if self._on_peer_user is not None:
+                self._on_peer_user(event)
+            return
+
+        if isinstance(event, InteractionRequest):
+            if self._on_interaction is not None:
+                self._on_interaction(event)
             return
 
         if isinstance(event, LongToolHint):

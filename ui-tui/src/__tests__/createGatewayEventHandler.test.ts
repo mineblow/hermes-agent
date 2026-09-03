@@ -1060,6 +1060,17 @@ describe('createGatewayEventHandler', () => {
     expect(getUiState().status).toBe('recovering session…')
   })
 
+  it('on gateway.ready after websocket reattachment, keeps the already-live session', () => {
+    const ctx = buildCtx([])
+
+    patchUiState({ sid: 'still-live', status: 'gateway reconnecting' })
+    createGatewayEventHandler(ctx)({ payload: {}, type: 'gateway.ready' } as any)
+
+    expect(ctx.session.resumeById).not.toHaveBeenCalled()
+    expect(ctx.session.newSession).not.toHaveBeenCalled()
+    expect(getUiState()).toMatchObject({ sid: 'still-live', status: 'ready' })
+  })
+
   it('on gateway.ready with auto_resume on and a recent session, resumes it', async () => {
     const appended: Msg[] = []
     const newSession = vi.fn()
@@ -1247,12 +1258,17 @@ describe('createGatewayEventHandler', () => {
         choices: ['once', 'deny'],
         command: 'rm -rf /tmp/x',
         description: 'smart deny override',
+        request_id: 'approval-1',
         smart_denied: true
       },
       type: 'approval.request'
     } as any)
 
-    expect(getOverlayState().approval).toMatchObject({ choices: ['once', 'deny'], smartDenied: true })
+    expect(getOverlayState().approval).toMatchObject({
+      choices: ['once', 'deny'],
+      requestId: 'approval-1',
+      smartDenied: true
+    })
   })
 
   it('still surfaces terminal turn failures as errors', () => {
@@ -1547,6 +1563,143 @@ describe('createGatewayEventHandler', () => {
     expect(
       appended.slice(before).some(m => typeof m.text === 'string' && m.text.includes('Operation interrupted'))
     ).toBe(false)
+  })
+
+  it('rehydrates the active TUI session from durable identity after runtime owner loss', () => {
+    const appended: Msg[] = []
+    const ctx = buildCtx(appended)
+    const resumeById = vi.fn()
+    ctx.session.resumeById = resumeById
+    const onEvent = createGatewayEventHandler(ctx)
+
+    patchUiState({ sid: 'live-session' })
+    onEvent({
+      payload: {
+        durable_session_ids: ['stored-session'],
+        session_ids: ['live-session']
+      },
+      type: 'session.runtime_owner_lost'
+    } as any)
+
+    expect(resumeById).toHaveBeenCalledOnce()
+    expect(resumeById).toHaveBeenCalledWith('stored-session')
+    expect(getUiState().status).toBe('recovering session…')
+  })
+
+  it('acknowledges truncated replay recovery only after durable transcript hydration completes', async () => {
+    const ctx = buildCtx([])
+    let finishResume: ((value: { session_id: string }) => void) | undefined
+    const complete = vi.fn()
+    const fail = vi.fn()
+
+    ctx.session.resumeById = vi.fn(
+      () =>
+        new Promise(resolve => {
+          finishResume = resolve
+        })
+    )
+    const onEvent = createGatewayEventHandler(ctx)
+
+    patchUiState({ sid: 'live-session' })
+    onEvent({
+      payload: {
+        complete,
+        durable_session_id: 'durable-session',
+        fail,
+        live_session_id: 'live-session'
+      },
+      type: 'session.replay_resync_required'
+    } as any)
+
+    expect(ctx.session.resumeById).toHaveBeenCalledWith('durable-session')
+    expect(getUiState().status).toBe('recovering session…')
+    expect(complete).not.toHaveBeenCalled()
+
+    finishResume!({ session_id: 'live-session' })
+    await vi.waitFor(() => expect(complete).toHaveBeenCalledWith('live-session'))
+    expect(fail).not.toHaveBeenCalled()
+  })
+
+  it('adopts a gateway-recovered live session without resuming its durable session a second time', () => {
+    const ctx = buildCtx([])
+    const onEvent = createGatewayEventHandler(ctx)
+
+    patchUiState({ sid: 'live-old' })
+    onEvent({
+      payload: {
+        durable_session_ids: ['durable-session'],
+        recovered_session_ids: ['live-new'],
+        session_ids: ['live-old']
+      },
+      type: 'session.runtime_owner_lost'
+    } as any)
+
+    expect(ctx.session.resumeById).not.toHaveBeenCalled()
+    expect(getUiState().sid).toBe('live-new')
+    expect(getUiState().status).toBe('ready')
+  })
+
+  it('renders peer message.user rows once by message ID even when prompt text is identical', () => {
+    const appended: Msg[] = []
+    const onEvent = createGatewayEventHandler(buildCtx(appended))
+
+    onEvent({ payload: { message_id: 'peer-1', text: 'same prompt', timestamp: 10 }, type: 'message.user' } as any)
+    onEvent({ payload: { message_id: 'peer-1', text: 'same prompt', timestamp: 10 }, type: 'message.user' } as any)
+    onEvent({ payload: { message_id: 'peer-2', text: 'same prompt', timestamp: 11 }, type: 'message.user' } as any)
+
+    expect(appended.filter(message => message.role === 'user')).toEqual([
+      { createdAt: 10, messageId: 'peer-1', role: 'user', text: 'same prompt' },
+      { createdAt: 11, messageId: 'peer-2', role: 'user', text: 'same prompt' }
+    ])
+  })
+
+  it('does not acknowledge a peer message ID until transcript insertion succeeds', () => {
+    const appended: Msg[] = []
+    const ctx = buildCtx(appended)
+    ctx.transcript.appendMessage = vi
+      .fn()
+      .mockImplementationOnce(() => {
+        throw new Error('render failed')
+      })
+      .mockImplementation((message: Msg) => appended.push(message))
+    const onEvent = createGatewayEventHandler(ctx)
+
+    const event = {
+      payload: { message_id: 'peer-retry', text: 'retry me', timestamp: 12 },
+      type: 'message.user'
+    } as any
+
+    expect(() => onEvent(event)).toThrow('render failed')
+    expect(() => onEvent(event)).not.toThrow()
+
+    expect(appended.filter(message => message.role === 'user')).toEqual([
+      { createdAt: 12, messageId: 'peer-retry', role: 'user', text: 'retry me' }
+    ])
+  })
+
+  it('preserves attachment refs on attachment-only peer user messages', () => {
+    const appended: Msg[] = []
+    const onEvent = createGatewayEventHandler(buildCtx(appended))
+
+    onEvent({
+      payload: {
+        attachment_refs: ['attachment://report.pdf', 'attachment://photo.png'],
+        message_id: 'peer-attachment-only',
+        text: '',
+        timestamp: 12
+      },
+      type: 'message.user'
+    } as any)
+
+    expect(appended.filter(message => message.role === 'user')).toEqual([
+      {
+        attachmentRefs: ['attachment://report.pdf', 'attachment://photo.png'],
+        createdAt: 12,
+        messageId: 'peer-attachment-only',
+        role: 'user',
+        text: ''
+      }
+    ])
   })
 
   it('persists an abandoned (timed-out) clarify into the transcript when the clarify tool completes', () => {

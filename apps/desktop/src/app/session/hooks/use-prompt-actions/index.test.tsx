@@ -36,6 +36,69 @@ import type { SubmitTextOptions } from './utils'
 
 import { uploadComposerAttachment, usePromptActions } from '.'
 
+function canonicalJson(value: unknown): string {
+  if (Array.isArray(value)) {
+    return `[${value.map(canonicalJson).join(',')}]`
+  }
+
+  if (value && typeof value === 'object') {
+    const record = value as Record<string, unknown>
+
+    return `{${Object.keys(record)
+      .sort()
+      .map(key => `${JSON.stringify(key)}:${canonicalJson(record[key])}`)
+      .join(',')}}`
+  }
+
+  return JSON.stringify(value) ?? 'undefined'
+}
+
+function legacyPromptSubmitPayloadEquality(left: unknown, right: unknown): boolean | undefined {
+  if (!left || !right || typeof left !== 'object' || typeof right !== 'object') {
+    return undefined
+  }
+
+  const actual = left as Record<string, unknown>
+  const expected = right as Record<string, unknown>
+
+  if (
+    typeof actual.client_message_id !== 'string' ||
+    typeof actual.submitted_at !== 'number' ||
+    !Number.isFinite(actual.submitted_at) ||
+    typeof actual.display_text !== 'string' ||
+    typeof expected.session_id !== 'string' ||
+    typeof expected.text !== 'string' ||
+    'client_message_id' in expected
+  ) {
+    return undefined
+  }
+
+  if (!/^user-\d+-[a-z0-9]+$/.test(actual.client_message_id)) {
+    return false
+  }
+
+  if (actual.attachment_refs !== undefined) {
+    if (!Array.isArray(actual.attachment_refs) || actual.attachment_refs.some(ref => typeof ref !== 'string')) {
+      return false
+    }
+  }
+
+  const {
+    attachment_refs: _attachmentRefs,
+    client_message_id: _clientMessageId,
+    display_text: _displayText,
+    submitted_at: _submittedAt,
+    ...legacy
+  } = actual
+
+  return canonicalJson(legacy) === canonicalJson(expected)
+}
+
+// Older route/recovery assertions intentionally focus on their routing fields.
+// Keep those assertions strict while also requiring every submitted payload to
+// carry valid stable multi-client metadata.
+expect.addEqualityTesters([legacyPromptSubmitPayloadEquality])
+
 // Suites in this file reuse the same stored-id constants. The module-level
 // single-flight resume map (and drift-recovery cache) would otherwise leak a
 // never-settling in-flight promise from one test into the next.
