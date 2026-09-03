@@ -498,6 +498,7 @@ local fallback and the no-local-retry rule after an unknown submission outcome.
     unattached-client escalation through `session.active_list`/`session.activate`;
   - [x] preserve monotonic owner generations across clean owner replacement;
   - [x] fence stale replay watermarks when a runtime ID changes in the same epoch;
+  - [x] rotate replay epochs before a released session ID can restart at sequence one;
   - [ ] consume stable message IDs exactly once for redirect/steer outcomes and
     scope idempotency by authenticated principal, client, and message ID;
   - [x] fix classic interrupt replacement completion accounting and bound pending IDs;

@@ -181,12 +181,19 @@ def test_release_session_reclaims_counter_and_buffer_state():
     frame = _frame("finished")
     event_replay._stamp_event(frame)
     assert latest_seq("finished") == 1
+    initial_epoch = event_replay.replay_epoch()
 
     event_replay.release_session("finished")
 
     assert latest_seq("finished") == 0
     assert events_since("finished", 0) == []
     assert event_replay.is_truncated("finished", 0) is False
+    assert event_replay.replay_epoch() != initial_epoch
+
+    replacement = _frame("finished")
+    event_replay._stamp_event(replacement)
+    assert replacement["params"]["seq"] == 1
+    assert replacement["params"]["epoch"] != initial_epoch
 
 
 def test_concurrent_stamping_never_drops_or_duplicates_seq():

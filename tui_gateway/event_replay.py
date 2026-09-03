@@ -143,6 +143,10 @@ def release_session(sid: str) -> None:
     if not sid:
         return
     with _replay_lock:
+        # Sequence numbering for this session ID will restart at one. Rotate
+        # the explicit epoch first so clients retaining the released runtime's
+        # watermark cannot mistake replacement events for old duplicates.
+        _roll_replay_epoch_locked()
         _replay_buffers.pop(sid, None)
         _replay_next_seq.pop(sid, None)
 
