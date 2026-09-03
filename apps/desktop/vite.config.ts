@@ -118,6 +118,14 @@ export default defineConfig(({ command }) => ({
     postcss: { plugins: [] }
   },
   build: {
+    // Electron loads the production renderer over file:// with webSecurity
+    // enabled. Emitting the full entry graph as modulepreload links launches
+    // dozens of concurrent file requests; Chromium starts failing the tail of
+    // that burst with net::ERR_FAILED and then reuses those failed preloads for
+    // the real module graph, leaving #root empty. Let native ESM imports load
+    // dependencies on demand instead. This keeps webSecurity enabled and does
+    // not affect Vite's development server.
+    modulePreload: false,
     // The renderer intentionally ships FEW chunks (not one, not thousands):
     //   · `codeSplitting: false` (the old setup) inlines every `lazy()` /
     //     dynamic import into the entry, so heavyweight lazy-only deps
@@ -161,7 +169,12 @@ export default defineConfig(({ command }) => ({
               name: 'shiki',
               test: /node_modules[\\/](shiki|@shikijs|react-shiki|@streamdown[\\/]code|oniguruma-to-es|oniguruma-parser|regex(-[^\\/]+)?)[\\/]/
             },
-            { name: 'katex', test: /node_modules[\\/]katex[\\/]/ }
+            { name: 'katex', test: /node_modules[\\/]katex[\\/]/ },
+            // Electron's secure file:// loader cannot reliably satisfy a boot
+            // graph containing ~100 concurrent static chunk imports. Merge the
+            // remaining initial dependency chain into one chunk, while the
+            // higher-priority groups above keep lazy heavyweight families split.
+            { name: 'initial', tags: ['$initial'] }
           ]
         }
       }
