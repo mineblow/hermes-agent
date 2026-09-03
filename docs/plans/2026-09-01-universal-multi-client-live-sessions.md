@@ -496,11 +496,11 @@ local fallback and the no-local-retry rule after an unknown submission outcome.
 - [ ] Finish Task 17 specification, code-quality, security, and full PR-scope review:
   - [ ] fail closed for unclassified live-session RPCs and prevent observer or
     unattached-client escalation through `session.active_list`/`session.activate`;
-  - [ ] preserve monotonic owner generations across clean owner replacement;
-  - [ ] fence stale replay watermarks when a runtime ID changes in the same epoch;
+  - [x] preserve monotonic owner generations across clean owner replacement;
+  - [x] fence stale replay watermarks when a runtime ID changes in the same epoch;
   - [ ] consume stable message IDs exactly once for redirect/steer outcomes and
     scope idempotency by authenticated principal, client, and message ID;
-  - [ ] fix classic interrupt replacement completion accounting and bound pending IDs;
+  - [x] fix classic interrupt replacement completion accounting and bound pending IDs;
   - [ ] remove network-delivery waits from session ingress/interaction-resolution locks;
   - [ ] make approval retries request-ID safe and idempotent;
   - [ ] filter sensitive interaction payloads from unauthorized observers in live
