@@ -24,6 +24,18 @@
 - [x] Phase 3, Task 6: async GatewayRunner frontend client
 - [x] Phase 4, Task 7: platform-neutral attachment state
 - [x] Phase 4, Task 8: shared-scheduler messaging input
+- [x] Phase 4, Task 9: runtime-output translation into platform presentation
+- [x] Phase 5, Task 10: Discord live-session end-to-end coverage
+- [x] Phase 5, Task 11: reusable platform-adapter contract coverage
+- [x] Phase 6, Task 12: default TUI and classic interactive CLI support
+- [x] Phase 6, Task 13: ACP/MCP/A2A/cron/webhook surface inventory
+- [x] Phase 7, Task 14: authoritative user/developer documentation
+- [ ] Phase 7, Task 15: final automated gates partially complete; unavailable
+  runner and pod-capacity gates remain tracked below
+- [ ] Phase 7, Task 16: manual cross-surface acceptance deferred until the user
+  is available
+- [ ] Phase 7, Task 17: final review performed; critical/important findings
+  must be resolved before readiness
 
 ---
 
@@ -474,6 +486,19 @@ local fallback and the no-local-retry rule after an unknown submission outcome.
 4. Keep unavailable high-core fork jobs classified as unavailable infrastructure; do not weaken workflows.
 5. Mark the fork PR ready only after user approval.
 6. Take no upstream action without separate explicit approval.
+
+### Remaining-work tracker
+
+- [ ] Complete the deferred Task 15 full Python, JavaScript/TypeScript, Windows,
+  Nix, and Desktop E2E gates when suitable runners or safe capacity are available.
+- [ ] Complete Task 16 manual acceptance across Desktop PC A, Desktop/TUI PC B,
+  Discord, and dashboard/web when the user is available.
+- [ ] Finish Task 17 specification, code-quality, security, and full PR-scope review;
+  resolve every critical and important finding before readiness.
+- [ ] Keep fork PR #1 draft and unmerged until the user explicitly approves
+  changing its readiness or merge state.
+- [ ] Take no upstream PR, push, or other submission action without a separate
+  explicit user approval.
 
 ---
 
