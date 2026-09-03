@@ -431,7 +431,7 @@ class ClassicLiveRuntimeFrontend:
         self.client = client
         self.client_id = client_id
         self._on_row = on_row
-        self._local_message_ids: set[str] = set()
+        self._local_message_ids: dict[str, None] = {}
 
     async def start(self) -> None:
         await self.client.start()
@@ -466,7 +466,10 @@ class ClassicLiveRuntimeFrontend:
 
     def remember_local_message_id(self, message_id: str) -> None:
         if message_id:
-            self._local_message_ids.add(message_id)
+            self._local_message_ids.pop(message_id, None)
+            self._local_message_ids[message_id] = None
+            while len(self._local_message_ids) > 2048:
+                self._local_message_ids.pop(next(iter(self._local_message_ids)))
 
     async def submit(
         self,
@@ -501,7 +504,7 @@ class ClassicLiveRuntimeFrontend:
         if event_type == "message.user":
             message_id = payload.get("message_id")
             if message_id in self._local_message_ids:
-                self._local_message_ids.discard(message_id)
+                self._local_message_ids.pop(message_id, None)
                 return
             metadata = payload.get("display_metadata", {})
             row = {

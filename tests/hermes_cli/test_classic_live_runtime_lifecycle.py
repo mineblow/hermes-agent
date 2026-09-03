@@ -60,6 +60,19 @@ async def test_classic_frontend_submits_with_stable_identity_and_closes_cleanly(
     assert frontend.surface == "classic-cli"
 
 
+def test_classic_frontend_bounds_pending_local_message_ids():
+    frontend = ClassicLiveRuntimeFrontend(
+        client=AsyncMock(), client_id="classic-cli:test"
+    )
+
+    for index in range(2050):
+        frontend.remember_local_message_id(f"message-{index}")
+
+    assert len(frontend._local_message_ids) == 2048
+    assert "message-0" not in frontend._local_message_ids
+    assert "message-2049" in frontend._local_message_ids
+
+
 @pytest.mark.asyncio
 async def test_classic_frontend_reconnects_from_callback_delivered_watermark():
     owner = RuntimeOwner(
@@ -161,7 +174,11 @@ async def test_classic_frontend_reconnects_from_callback_delivered_watermark():
 
     await frontend.close()
 
-    assert second.hellos[0]["replay"] == {"epoch": "epoch-1", "seq": 1}
+    assert second.hellos[0]["replay"] == {
+        "epoch": "epoch-1",
+        "seq": 1,
+        "runtime_id": "runtime-1",
+    }
     assert [row["text"] for row in rows] == ["peer one", "peer two"]
     assert first.closed is True
     assert second.closed is True
@@ -711,6 +728,7 @@ def test_cli_busy_interrupt_submits_replacement_through_canonical_runtime(
 
         def submit(self, text, **kwargs):
             submissions.append((text, kwargs))
+            return {"status": "redirected"}
 
         def wait_for_terminal(self, **_kwargs):
             self.wait_count += 1
@@ -718,8 +736,12 @@ def test_cli_busy_interrupt_submits_replacement_through_canonical_runtime(
                 cli._interrupt_queue.put(("replacement", [interrupt_image]))
                 raise TimeoutError
             if self.wait_count == 2:
-                return {"kind": "assistant", "status": "interrupted", "text": ""}
-            return {"kind": "assistant", "status": "complete", "text": "replacement answer"}
+                return {
+                    "kind": "assistant",
+                    "status": "complete",
+                    "text": "replacement answer",
+                }
+            raise TimeoutError
 
     cli = object.__new__(HermesCLI)
     cli._classic_live_runtime = FakeRuntime()

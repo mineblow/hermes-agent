@@ -17682,9 +17682,9 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
         if runtime is None:
             raise RuntimeError("classic live runtime is not started")
 
-        def _submit(prompt: str, prompt_images: list[Path], *, policy: str) -> None:
+        def _submit(prompt: str, prompt_images: list[Path], *, policy: str) -> Any:
             image_refs = [str(path) for path in prompt_images]
-            runtime.submit(
+            return runtime.submit(
                 prompt,
                 submitted_at=time.time(),
                 message_id=uuid.uuid4().hex,
@@ -17726,9 +17726,17 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
                     if not isinstance(interrupt_text, str) or not interrupt_text:
                         continue
                     _cprint("\n⚡ New message detected, interrupting canonical turn...")
-                    _submit(interrupt_text, list(interrupt_images or []), policy="interrupt")
+                    submission = _submit(
+                        interrupt_text,
+                        list(interrupt_images or []),
+                        policy="interrupt",
+                    )
                     submitted_prompts.append(interrupt_text)
-                    outstanding += 1
+                    if not (
+                        isinstance(submission, dict)
+                        and submission.get("status") == "redirected"
+                    ):
+                        outstanding += 1
                     self._clear_active_overlays_for_interrupt()
 
             remaining = deadline - time.monotonic()
