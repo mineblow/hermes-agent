@@ -29,6 +29,22 @@ _CONTROL_CAPABILITIES = frozenset({
     "ui.respond",
 })
 SUPPORTED_CAPABILITIES = _CONTROL_CAPABILITIES
+_INTERACTION_EVENT_CAPABILITIES = {
+    "approval.request": "approval.respond",
+    "approval.resolved": "approval.respond",
+    "clarify.request": "clarify.respond",
+    "clarify.resolved": "clarify.respond",
+}
+
+
+def required_event_capability(frame: dict) -> str | None:
+    """Return the capability required to observe a sensitive event frame."""
+    if frame.get("method") != "event":
+        return None
+    params = frame.get("params")
+    if not isinstance(params, dict):
+        return None
+    return _INTERACTION_EVENT_CAPABILITIES.get(params.get("type"))
 
 
 class AttachmentMode(str, Enum):
@@ -224,9 +240,15 @@ class SessionEventHub:
                 attachments = list(self._attachments.values())
             if prepare is not None:
                 prepare(normalized)
+            required_capability = required_event_capability(normalized)
 
             for attachment in attachments:
                 if attachment.stopped.is_set():
+                    continue
+                if (
+                    required_capability is not None
+                    and required_capability not in attachment.snapshot.capabilities
+                ):
                     continue
                 try:
                     item = _QueuedFrame(

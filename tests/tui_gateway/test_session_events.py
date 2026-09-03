@@ -125,6 +125,44 @@ def test_require_rejects_missing_transport_or_capability():
         hub.close()
 
 
+def test_interaction_events_are_filtered_by_attachment_capability():
+    hub = SessionEventHub()
+    observer = RecordingTransport()
+    controller = RecordingTransport()
+    try:
+        hub.attach(observer, client_id="observer", mode=AttachmentMode.OBSERVE)
+        hub.attach(controller, client_id="controller", mode=AttachmentMode.CONTROL)
+
+        assert hub.publish(
+            {
+                "jsonrpc": "2.0",
+                "method": "event",
+                "params": {"type": "approval.request", "payload": {"command": "deploy"}},
+            }
+        )
+        controller.wait_for_count(1)
+        assert observer.written.wait(timeout=0.1) is False
+
+        assert hub.publish(
+            {
+                "jsonrpc": "2.0",
+                "method": "event",
+                "params": {"type": "message.delta", "payload": {"text": "safe"}},
+            }
+        )
+        observer.wait_for_count(1)
+        controller.wait_for_count(2)
+        assert [frame["params"]["type"] for frame in observer.frames] == [
+            "message.delta"
+        ]
+        assert [frame["params"]["type"] for frame in controller.frames] == [
+            "approval.request",
+            "message.delta",
+        ]
+    finally:
+        hub.close()
+
+
 def test_publish_copies_one_frame_per_subscriber_and_returns_before_delivery():
     hub = SessionEventHub()
     blocked = BlockingTransport()
