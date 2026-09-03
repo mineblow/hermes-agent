@@ -80,6 +80,16 @@ afterEach(() => {
 });
 
 describe("GatewayClient", () => {
+  it("forwards durable resync recovery to the shared gateway client", () => {
+    const onDurableResyncRequired = vi.fn();
+    const gw = new GatewayClient({ onDurableResyncRequired });
+    const internal = gw as unknown as {
+      options: { onDurableResyncRequired?: (request: unknown) => void };
+    };
+
+    expect(internal.options.onDurableResyncRequired).toBe(onDurableResyncRequired);
+  });
+
   it("treats loopback 4401 closes as stale-token reload candidates", async () => {
     reloadMocks.maybeReloadForLoopbackWsAuthFailure.mockReturnValue(true);
     const gw = new GatewayClient();

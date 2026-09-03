@@ -18,6 +18,7 @@ import {
   buildHermesWebSocketUrl,
   getOrCreateGatewayClientId,
   type ConnectionState,
+  type DurableResyncRequest,
   type GatewayEvent,
   type GatewayEventName,
 } from "@hermes/shared";
@@ -26,6 +27,10 @@ import { HERMES_BASE_PATH, buildWsAuthParam } from "@/lib/api";
 import { maybeReloadForLoopbackWsAuthFailure } from "@/lib/dashboard-auth-reload";
 
 export type { ConnectionState, GatewayEvent, GatewayEventName };
+
+export interface GatewayClientOptions {
+  onDurableResyncRequired?: (request: DurableResyncRequest) => void;
+}
 
 function webClientId(): string {
   try {
@@ -36,7 +41,7 @@ function webClientId(): string {
 }
 
 export class GatewayClient extends JsonRpcGatewayClient {
-  constructor() {
+  constructor(options: GatewayClientOptions = {}) {
     super({
       clientAttachment: {
         client_id: webClientId(),
@@ -46,6 +51,7 @@ export class GatewayClient extends JsonRpcGatewayClient {
       closedErrorMessage: "WebSocket closed",
       connectErrorMessage: "WebSocket connection failed",
       notConnectedErrorMessage: "gateway not connected",
+      onDurableResyncRequired: options.onDurableResyncRequired,
       onSocketClose: (event) => maybeReloadForLoopbackWsAuthFailure(event.code),
       requestIdPrefix: "w",
     });
