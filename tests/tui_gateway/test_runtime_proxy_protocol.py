@@ -599,6 +599,48 @@ def test_resolution_event_bytes_precede_rpc_response_over_proxy(resolution_type)
         sender.close()
 
 
+def test_proxy_transport_sender_failure_releases_all_synchronous_waiters():
+    sending = threading.Event()
+    release = threading.Event()
+
+    def failing_send(_frame):
+        sending.set()
+        assert release.wait(timeout=2)
+        return False
+
+    transport = runtime_proxy.ProxyTransport(
+        client_id="failing-client",
+        send=failing_send,
+        outbound_queue_size=4,
+    )
+    frame = {"jsonrpc": "2.0", "method": "event", "params": {}}
+    assert transport.write(frame) is True
+    assert sending.wait(timeout=1)
+
+    results = []
+    writers = [
+        threading.Thread(
+            target=lambda: results.append(transport.write_and_wait(frame)),
+            daemon=True,
+        )
+        for _ in range(3)
+    ]
+    for writer in writers:
+        writer.start()
+
+    deadline = time.monotonic() + 1
+    while transport._outbound.qsize() < len(writers) and time.monotonic() < deadline:
+        time.sleep(0.001)
+    assert transport._outbound.qsize() == len(writers)
+
+    release.set()
+    for writer in writers:
+        writer.join(timeout=1)
+
+    assert all(not writer.is_alive() for writer in writers)
+    assert results == [False, False, False]
+
+
 def test_proxy_transport_fails_closed_when_slow_sender_fills_bounded_queue():
     sending = threading.Event()
     release = threading.Event()

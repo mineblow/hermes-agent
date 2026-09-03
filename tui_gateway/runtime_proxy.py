@@ -144,6 +144,7 @@ class ProxyTransport:
 
     def write(self, frame: dict[str, Any]) -> bool:
         kind = "event" if frame.get("method") == "event" else "rpc.response"
+        overflow = False
         with self._state_lock:
             if self._closed:
                 return False
@@ -151,7 +152,10 @@ class ProxyTransport:
                 self._outbound.put_nowait(({"kind": kind, "frame": frame}, None, []))
             except queue.Full:
                 self._closed = True
-                return False
+                overflow = True
+        if overflow:
+            self._fail_pending_writes()
+            return False
         return True
 
     def write_and_wait(self, frame: dict[str, Any]) -> bool:
@@ -159,6 +163,7 @@ class ProxyTransport:
         kind = "event" if frame.get("method") == "event" else "rpc.response"
         completed = threading.Event()
         outcome: list[bool] = []
+        overflow = False
         with self._state_lock:
             if self._closed:
                 return False
@@ -170,12 +175,35 @@ class ProxyTransport:
                 ))
             except queue.Full:
                 self._closed = True
-                return False
+                overflow = True
+        if overflow:
+            self._fail_pending_writes()
+            return False
         if not completed.wait(timeout=11.0):
             with self._state_lock:
                 self._closed = True
+            self._fail_pending_writes()
             return False
         return bool(outcome and outcome[0])
+
+    @staticmethod
+    def _fail_write(
+        item: tuple[dict[str, Any], threading.Event | None, list[bool]] | None,
+    ) -> None:
+        if item is None:
+            return
+        _envelope, completed, outcome = item
+        if completed is not None:
+            outcome.append(False)
+            completed.set()
+
+    def _fail_pending_writes(self) -> None:
+        while True:
+            try:
+                item = self._outbound.get_nowait()
+            except queue.Empty:
+                return
+            self._fail_write(item)
 
     def _write_loop(self) -> None:
         while True:
@@ -184,23 +212,20 @@ class ProxyTransport:
                 return
             envelope, completed, outcome = item
             if self._closed:
-                if completed is not None:
-                    outcome.append(False)
-                    completed.set()
+                self._fail_write(item)
+                self._fail_pending_writes()
                 return
             try:
                 result = self._send(envelope)
             except Exception:
                 self._closed = True
-                if completed is not None:
-                    outcome.append(False)
-                    completed.set()
+                self._fail_write(item)
+                self._fail_pending_writes()
                 return
             if result is False:
                 self._closed = True
-                if completed is not None:
-                    outcome.append(False)
-                    completed.set()
+                self._fail_write(item)
+                self._fail_pending_writes()
                 return
             if completed is not None:
                 outcome.append(True)
@@ -208,9 +233,8 @@ class ProxyTransport:
 
     def close(self) -> None:
         with self._state_lock:
-            if self._closed:
-                return
             self._closed = True
+            self._fail_pending_writes()
             try:
                 self._outbound.put_nowait(None)
             except queue.Full:
