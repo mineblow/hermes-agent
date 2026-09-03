@@ -1,7 +1,7 @@
 ---
 sidebar_position: 6
 title: "Multi-Client Live Sessions"
-description: "Use the CLI, TUI, Desktop, dashboard, and messaging platforms together on one canonical Hermes runtime"
+description: "Use supported CLI, TUI, Desktop, dashboard chat, and messaging surfaces on one canonical Hermes runtime"
 ---
 
 # Multi-Client Live Sessions
@@ -12,8 +12,8 @@ Typical examples:
 
 - keep a Desktop or TUI session open while replying from Discord;
 - resume the same live conversation from the classic CLI in another terminal;
-- watch tool activity in the dashboard while a messaging client submits the next prompt;
-- reconnect after a terminal, network, or frontend restart without duplicating delivered events.
+- watch current tool activity in the dashboard while a messaging client submits the next prompt;
+- reconnect a replay-capable surface after a transport drop without duplicating accepted events.
 
 ## Supported surfaces
 
@@ -22,7 +22,7 @@ Persistent presentation surfaces supported by the shared runtime include:
 - classic interactive CLI (`hermes --cli` or a CLI-configured bare `hermes`);
 - default TUI (`hermes --tui`);
 - Desktop's native chat surface;
-- the web dashboard's embedded TUI;
+- the web dashboard's embedded TUI. Its PTY-side structured-events sidebar is a best-effort view, not a durable replay client;
 - authorized gateway messaging adapters, including Discord, Telegram, Slack, API Server/OpenWebUI, Email, and other adapters that use the common `GatewayRunner` contract.
 
 Not every Hermes protocol is a presentation client. One-shot CLI, A2A, cron, and webhooks are producers; MCP is a tool/control protocol; ACP currently owns separate ACP sessions rather than attaching to a canonical gateway runtime. See the authoritative [live-session surface classification](/reference/live-session-surface-classification).
@@ -79,7 +79,7 @@ If the canonical runtime is already active, Hermes attaches to it instead of cre
 
 ### Reconnect
 
-A temporarily disconnected attached client reconnects to the same owner generation and requests events after its last successfully delivered sequence. Hermes closes superseded connections and ignores stale frames from older owner generations.
+A temporarily disconnected replay-capable client reconnects to the same owner generation and requests events after its last successfully accepted sequence. Hermes closes superseded connections and ignores stale frames from older owner generations. This guarantee belongs to the client/runtime attachment protocol; auxiliary feeds such as the dashboard's `/api/events` sidebar reconnect without a cursor and can miss events during a drop.
 
 Reconnect is not the same as loading the durable transcript. On a fresh attachment, the frontend loads or displays saved history and starts live event delivery at the owner's current sequence. On transport reconnect, the runtime replays only the missing retained events.
 
@@ -92,20 +92,19 @@ Every canonical input carries a stable `client_message_id`:
 - redelivery of the same native message maps to the same ID and executes once;
 - identical text in two distinct native messages has two IDs and executes twice.
 
-Runtime output carries a replay epoch and monotonic event sequence. Clients deliver callbacks in that order and advance their replay watermark only after presentation accepts the event. A disconnect therefore cannot acknowledge an event the frontend never saw.
+Runtime output carries a replay epoch and monotonic event sequence. In the direct TUI client, an event is accepted when all synchronous `event` listeners return successfully; only then does the client advance its local replay watermark. This is callback completion inside the client, not a per-event acknowledgement sent back to the server. Runtime-proxy adapters maintain their own delivered-sequence contract. Best-effort feeds with no cursor, including the dashboard sidebar's `/api/events` socket, provide neither guarantee.
 
 When several clients submit while a turn is busy, the canonical scheduler—not the frontend—applies the submitted busy policy:
 
 - `interrupt`: replace/redirect the active turn;
 - `queue`: run after the current turn;
 - `reject`: decline the busy submission;
-- `steer`: where supported, inject guidance at a safe boundary.
 
-The classic CLI maps its interactive steer/replacement behavior into the canonical busy policy and never calls a separate local agent while attached.
+Steering is a separate control operation: where supported, it injects guidance into the active run at a safe boundary. It is not a fourth busy policy. The classic CLI routes steering and interrupt/replacement through the canonical runtime and never calls a separate local agent while attached.
 
 ## Approvals and clarifications
 
-Approval and clarification requests have canonical request IDs. Every authorized observer may render a pending interaction, but only a client granted `interaction.respond` can answer it.
+Approval and clarification requests have canonical request IDs. Only attachments granted the corresponding `approval.respond` or `clarify.respond` capability receive the sensitive request payload and may answer it; observe-only attachments do not receive those events.
 
 The first valid response wins. Later responses to the same request are rejected or treated as already resolved; they do not run the operation twice. Interaction-response calls use a short, strict deadline. If the transport fails after submission and the outcome is unknown, the client does not retry automatically.
 
@@ -131,15 +130,15 @@ An unauthorized user cannot attach, observe private runtime events, steer a turn
 
 ## Replay and recovery
 
-Normal recovery uses three fences:
+Replay-capable attachments use the fences implemented by their adapter:
 
 1. **Owner generation** — rejects stale connections after owner replacement.
-2. **Replay epoch and sequence** — resumes after the last callback-delivered event without duplicates.
-3. **Authoritative completion snapshot** — when the retained event window is too short, the owner returns a validated durable completion boundary so the client can reload durable state and continue from a safe point.
+2. **Replay epoch and sequence** — resumes after the adapter's last accepted event without duplicates.
+3. **Authoritative presentation snapshot (runtime-proxy path)** — when the retained event window is too short, runtime-proxy adapters validate the owner's latest assistant completion boundary before advancing. The direct TUI currently fails closed on a truncated `session.attach` replay rather than silently advancing across the gap.
 
-Pending approvals or clarifications are included in attachment state so a reconnecting client can render an unresolved interaction even when its original request event is no longer in the retained replay window.
+Pending approvals or clarifications are restored by the runtime-proxy handshake for adapters that consume its `pending_interactions` state. Direct `session.attach` clients only recover an interaction when its request event remains in the retained window; the dashboard's best-effort sidebar does not recover pending interactions.
 
-Slow consumers are bounded. A client that cannot keep up may be detached without blocking healthy peers or the runtime owner; it can later reattach and recover through replay or durable resynchronization.
+Slow consumers are bounded. A client that cannot keep up may be detached without blocking healthy peers or the runtime owner. It can later reattach using the recovery its adapter implements: retained replay, runtime-proxy snapshot reconciliation, or fail-closed recovery when no safe resynchronization path exists.
 
 ## Failure and fallback behavior
 

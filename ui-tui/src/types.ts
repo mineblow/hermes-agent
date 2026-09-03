@@ -127,6 +127,8 @@ export interface ClarifyReq {
 }
 
 export interface Msg {
+  /** Canonical attachment references carried by a user event. */
+  attachmentRefs?: string[]
   info?: SessionInfo
   kind?: 'diff' | 'event' | 'intro' | 'panel' | 'slash' | 'trail'
   panelData?: PanelData

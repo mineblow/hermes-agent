@@ -234,7 +234,9 @@ export const MessageLine = memo(function MessageLine({
     // the accent it wore in the composer, instead of flattening back into the
     // body text.
     if (msg.role === 'user') {
-      const segments = splitComposerHighlights(msg.text)
+      const attachmentText = msg.attachmentRefs?.map(ref => `[[ ${ref} ]]`).join('\n') ?? ''
+      const displayText = [msg.text, attachmentText].filter(Boolean).join('\n')
+      const segments = splitComposerHighlights(displayText)
 
       return (
         <Text {...(body ? { color: body } : {})}>

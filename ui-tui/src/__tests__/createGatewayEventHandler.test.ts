@@ -1585,6 +1585,31 @@ describe('createGatewayEventHandler', () => {
     ])
   })
 
+  it('preserves attachment refs on attachment-only peer user messages', () => {
+    const appended: Msg[] = []
+    const onEvent = createGatewayEventHandler(buildCtx(appended))
+
+    onEvent({
+      payload: {
+        attachment_refs: ['attachment://report.pdf', 'attachment://photo.png'],
+        message_id: 'peer-attachment-only',
+        text: '',
+        timestamp: 12
+      },
+      type: 'message.user'
+    } as any)
+
+    expect(appended.filter(message => message.role === 'user')).toEqual([
+      {
+        attachmentRefs: ['attachment://report.pdf', 'attachment://photo.png'],
+        createdAt: 12,
+        messageId: 'peer-attachment-only',
+        role: 'user',
+        text: ''
+      }
+    ])
+  })
+
   it('persists an abandoned (timed-out) clarify into the transcript when the clarify tool completes', () => {
     const appended: Msg[] = []
     const onEvent = createGatewayEventHandler(buildCtx(appended))

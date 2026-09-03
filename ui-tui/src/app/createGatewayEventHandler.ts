@@ -776,9 +776,7 @@ export function createGatewayEventHandler(ctx: GatewayEventHandlerContext): (ev:
       case 'session.runtime_owner_lost': {
         const sessionIds = Array.isArray(ev.payload?.session_ids) ? ev.payload.session_ids : []
 
-        const durableSessionIds = Array.isArray(ev.payload?.durable_session_ids)
-          ? ev.payload.durable_session_ids
-          : []
+        const durableSessionIds = Array.isArray(ev.payload?.durable_session_ids) ? ev.payload.durable_session_ids : []
 
         const recoveredSessionIds = Array.isArray(ev.payload?.recovered_session_ids)
           ? ev.payload.recovered_session_ids
@@ -827,7 +825,13 @@ export function createGatewayEventHandler(ctx: GatewayEventHandlerContext): (ev:
         }
 
         seenPeerUserMessageIds.add(messageId)
+
+        const attachmentRefs = Array.isArray(ev.payload?.attachment_refs)
+          ? ev.payload.attachment_refs.filter((ref): ref is string => typeof ref === 'string' && ref.length > 0)
+          : []
+
         appendMessage({
+          ...(attachmentRefs.length > 0 ? { attachmentRefs } : {}),
           createdAt: typeof ev.payload.timestamp === 'number' ? ev.payload.timestamp : undefined,
           messageId,
           role: 'user',

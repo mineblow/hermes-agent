@@ -618,7 +618,7 @@ export type GatewayEvent =
   | { payload?: { kind?: string }; session_id?: string; type: 'reaction' }
   | { payload?: undefined; session_id?: string; type: 'message.start' }
   | {
-      payload: { message_id: string; text?: string; timestamp?: number }
+      payload: { attachment_refs?: string[]; message_id: string; text?: string; timestamp?: number }
       session_id?: string
       type: 'message.user'
     }
