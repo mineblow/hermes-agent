@@ -1782,10 +1782,12 @@ def _(rid, params: dict) -> dict:
         session = _approval_respond_session_fallback(params)
         if session is None:
             return err
+    request_id = str(params.get("request_id") or "").strip()
+    if not request_id:
+        return _err(rid, 4002, "request_id is required for approval responses")
     try:
         from tools.approval import resolve_gateway_approval
 
-        request_id = str(params.get("request_id") or "")
         outcome_key = (str(session["session_key"]), request_id)
         should_emit = False
         with _approval_resolution_lock:

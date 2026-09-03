@@ -1200,6 +1200,43 @@ def test_approval_response_reports_atomic_winner_and_duplicate(monkeypatch):
         server._teardown_session(session)
 
 
+def test_approval_respond_requires_request_id_for_live_session(monkeypatch):
+    controller = _LifecycleTransport("approval-id-controller")
+    session = {
+        "history_lock": threading.Lock(),
+        "transport": controller,
+        "session_key": "approval-id-key",
+    }
+    server._attach_current_transport(
+        "approval-id-sid", session, "control", transport=controller
+    )
+    server._sessions["approval-id-sid"] = session
+    resolved = []
+    monkeypatch.setattr(
+        "tools.approval.resolve_gateway_approval",
+        lambda *args, **kwargs: resolved.append((args, kwargs)) or 1,
+    )
+    try:
+        response = _dispatch_sync(
+            {
+                "id": "missing-approval-id",
+                "method": "approval.respond",
+                "params": {
+                    "session_id": "approval-id-sid",
+                    "choice": "once",
+                },
+            },
+            controller,
+        )
+
+        assert response["error"]["code"] == 4002
+        assert "request_id" in response["error"]["message"]
+        assert resolved == []
+    finally:
+        server._sessions.pop("approval-id-sid", None)
+        server._teardown_session(session)
+
+
 def test_approval_respond_rejects_choice_outside_protocol_allowlist():
     controller = _LifecycleTransport("approval-choice-controller")
     session = {
