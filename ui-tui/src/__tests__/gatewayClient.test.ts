@@ -499,18 +499,26 @@ describe('GatewayClient websocket attach mode', () => {
     gw.kill()
   })
 
-  it('fails closed without publishing or advancing when session.attach replay is truncated', async () => {
+  it('durably rehydrates before acknowledging a truncated replay and releasing queued live events', async () => {
     const gw = new GatewayClient()
     const events: any[] = []
+    let completeResync: ((recoveredSessionId: string) => void) | undefined
 
     const internal = gw as unknown as {
       durableSessionIds: Map<string, string>
+      publishSessionEvent: (event: any) => void
       request: (method: string, params: Record<string, unknown>, track?: boolean) => Promise<unknown>
       restoreSessionAttachments: (replayEpoch: string) => Promise<void>
       sessionWatermarks: Map<string, { epoch: string; seq: number }>
     }
 
-    gw.on('event', event => events.push(event))
+    gw.on('event', event => {
+      events.push(event)
+
+      if (event.type === 'session.replay_resync_required') {
+        completeResync = event.payload.complete
+      }
+    })
     gw.drain()
     await Promise.resolve()
     internal.durableSessionIds.set('live-session', 'durable-session')
@@ -530,9 +538,28 @@ describe('GatewayClient websocket attach mode', () => {
       truncated: true
     }))
 
-    await expect(internal.restoreSessionAttachments('epoch-1')).rejects.toThrow('truncated')
-    expect(events).toEqual([])
+    const restoring = internal.restoreSessionAttachments('epoch-1')
+
+    await vi.waitFor(() => expect(completeResync).toBeTypeOf('function'))
+    internal.publishSessionEvent({
+      epoch: 'epoch-1',
+      payload: { text: 'live after snapshot' },
+      seq: 21,
+      session_id: 'live-session',
+      type: 'message.delta'
+    })
+
+    expect(events.filter(event => event.type === 'message.delta')).toEqual([])
     expect(internal.sessionWatermarks.get('live-session')).toEqual({ epoch: 'epoch-1', seq: 7 })
+
+    completeResync!('live-session')
+    await restoring
+
+    expect(events.filter(event => event.type === 'message.delta').map(event => event.payload?.text)).toEqual([
+      'live after snapshot'
+    ])
+    expect(events.some(event => event.payload?.text === 'partial replay')).toBe(false)
+    expect(internal.sessionWatermarks.get('live-session')).toEqual({ epoch: 'epoch-1', seq: 21 })
     gw.kill()
   })
 

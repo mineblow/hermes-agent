@@ -796,6 +796,19 @@ export function createGatewayEventHandler(ctx: GatewayEventHandlerContext): (ev:
         return
       }
 
+      case 'session.replay_resync_required': {
+        patchUiState({ status: 'recovering session…' })
+        void resumeById(ev.payload.durable_session_id).then(result => {
+          if (result?.session_id) {
+            ev.payload.complete(result.session_id)
+          } else {
+            ev.payload.fail(new Error('durable session recovery did not complete'))
+          }
+        }, ev.payload.fail)
+
+        return
+      }
+
       case 'skin.changed':
         if (ev.payload) {
           applySkin(ev.payload)

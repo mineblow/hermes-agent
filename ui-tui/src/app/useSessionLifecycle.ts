@@ -327,60 +327,63 @@ export function useSessionLifecycle(opts: UseSessionLifecycleOptions) {
   )
 
   const resumeById = useCallback(
-    (id: string) => {
+    async (id: string): Promise<null | SessionResumeResponse> => {
       patchOverlayState({ sessions: false })
       patchUiState({ status: 'resuming…' })
 
-      rpc<SetupStatusResponse>('setup.status', {}).then(setup => {
+      try {
+        const setup = await rpc<SetupStatusResponse>('setup.status', {})
+
         if (setup?.provider_configured === false) {
           panel(SETUP_REQUIRED_TITLE, buildSetupRequiredSections())
           patchUiState({ status: 'setup required' })
 
-          return
+          return null
         }
 
         const previousSid = getUiState().sid
+        const raw = await gw.request<SessionResumeResponse>('session.resume', { cols: colsRef.current, session_id: id })
+        const r = asRpcResult<SessionResumeResponse>(raw)
 
-        gw.request<SessionResumeResponse>('session.resume', { cols: colsRef.current, session_id: id })
-          .then(raw => {
-            const r = asRpcResult<SessionResumeResponse>(raw)
+        if (!r) {
+          sys('error: invalid response: session.resume')
+          patchUiState({ status: 'ready' })
 
-            if (!r) {
-              sys('error: invalid response: session.resume')
+          return null
+        }
 
-              return patchUiState({ status: 'ready' })
-            }
+        const info = r.info ?? null
+        const running = Boolean(r.running || r.status === 'working' || r.status === 'waiting')
 
-            const info = r.info ?? null
-            const running = Boolean(r.running || r.status === 'working' || r.status === 'waiting')
+        resetSession()
+        setSessionStartedAt(r.started_at ? r.started_at * 1000 : Date.now())
 
-            resetSession()
-            setSessionStartedAt(r.started_at ? r.started_at * 1000 : Date.now())
+        const resumed = [...toTranscriptMessages(r.messages), ...liveSessionInflightMessages(r.inflight)]
 
-            const resumed = [...toTranscriptMessages(r.messages), ...liveSessionInflightMessages(r.inflight)]
+        setHistoryItems(info ? [introMsg(info), ...resumed] : resumed)
+        writeActiveSessionFile(r.resumed ?? r.session_id)
+        patchUiState({
+          busy: running,
+          info,
+          sid: r.session_id,
+          status: statusFromLiveSession(r.status, running),
+          usage: usageFrom(info)
+        })
+        hydrateLiveSessionInflight(r.inflight)
+        cancelResumeScrollRef.current?.()
+        cancelResumeScrollRef.current = scheduleResumeScrollToBottom(scrollRef)
 
-            setHistoryItems(info ? [introMsg(info), ...resumed] : resumed)
-            writeActiveSessionFile(r.resumed ?? r.session_id)
-            patchUiState({
-              busy: running,
-              info,
-              sid: r.session_id,
-              status: statusFromLiveSession(r.status, running),
-              usage: usageFrom(info)
-            })
-            hydrateLiveSessionInflight(r.inflight)
-            cancelResumeScrollRef.current?.()
-            cancelResumeScrollRef.current = scheduleResumeScrollToBottom(scrollRef)
+        if (previousSid && previousSid !== r.session_id) {
+          void closeSession(previousSid)
+        }
 
-            if (previousSid && previousSid !== r.session_id) {
-              void closeSession(previousSid)
-            }
-          })
-          .catch((e: Error) => {
-            sys(`error: ${e.message}`)
-            patchUiState({ status: 'ready' })
-          })
-      })
+        return r
+      } catch (e) {
+        sys(`error: ${e instanceof Error ? e.message : String(e)}`)
+        patchUiState({ status: 'ready' })
+
+        return null
+      }
     },
     [closeSession, colsRef, gw, panel, resetSession, rpc, scrollRef, setHistoryItems, setSessionStartedAt, sys]
   )
@@ -418,8 +421,7 @@ export function useSessionLifecycle(opts: UseSessionLifecycleOptions) {
       newSession,
       resetSession,
       resetVisibleHistory,
-      resumeById,
-      trimTail
+      resumeById
     ]
   )
 }

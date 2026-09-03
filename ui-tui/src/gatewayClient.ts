@@ -800,7 +800,7 @@ export class GatewayClient extends EventEmitter {
   }
 
   private async restoreSessionAttachments(replayEpoch: string) {
-    for (const sessionId of this.durableSessionIds.keys()) {
+    for (const [sessionId, durableSessionId] of [...this.durableSessionIds.entries()]) {
       const watermark = this.sessionWatermarks.get(sessionId)
       const lastSeenSeq = watermark?.epoch === replayEpoch ? watermark.seq : 0
 
@@ -824,7 +824,40 @@ export class GatewayClient extends EventEmitter {
         )
 
         if (result?.truncated === true) {
-          throw new Error(`session.attach replay truncated for ${sessionId}; durable resynchronization required`)
+          const recoveredSessionId = await new Promise<string>((resolve, reject) => {
+            this.publish({
+              payload: {
+                complete: resolve,
+                durable_session_id: durableSessionId,
+                fail: reject,
+                live_session_id: sessionId
+              },
+              session_id: sessionId,
+              type: 'session.replay_resync_required'
+            })
+          })
+
+          const epoch = typeof result.replay_epoch === 'string' ? result.replay_epoch : replayEpoch
+
+          const latestSeq =
+            typeof result.latest_seq === 'number' && Number.isInteger(result.latest_seq) && result.latest_seq >= 0
+              ? result.latest_seq
+              : 0
+
+          this.sessionWatermarks.delete(sessionId)
+          this.sessionWatermarks.set(recoveredSessionId, { epoch, seq: latestSeq })
+
+          const queued = this.queuedSessionEvents.get(sessionId) ?? []
+          queued.sort((a, b) => Number((a as { seq?: unknown }).seq ?? 0) - Number((b as { seq?: unknown }).seq ?? 0))
+
+          for (const event of queued) {
+            this.publishSessionEvent(
+              recoveredSessionId === sessionId ? event : { ...event, session_id: recoveredSessionId },
+              true
+            )
+          }
+
+          continue
         }
 
         const events = Array.isArray(result?.events)

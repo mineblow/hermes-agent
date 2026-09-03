@@ -771,4 +771,14 @@ export type GatewayEvent =
       session_id?: string
       type: 'session.runtime_owner_lost'
     }
+  | {
+      payload: {
+        complete: (recoveredSessionId: string) => void
+        durable_session_id: string
+        fail: (error: unknown) => void
+        live_session_id: string
+      }
+      session_id: string
+      type: 'session.replay_resync_required'
+    }
   | { payload?: { message?: string }; session_id?: string; type: 'error' }

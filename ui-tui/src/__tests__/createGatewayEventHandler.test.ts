@@ -1552,6 +1552,40 @@ describe('createGatewayEventHandler', () => {
     expect(getUiState().status).toBe('recovering session…')
   })
 
+  it('acknowledges truncated replay recovery only after durable transcript hydration completes', async () => {
+    const ctx = buildCtx([])
+    let finishResume: ((value: { session_id: string }) => void) | undefined
+    const complete = vi.fn()
+    const fail = vi.fn()
+
+    ctx.session.resumeById = vi.fn(
+      () =>
+        new Promise(resolve => {
+          finishResume = resolve
+        })
+    )
+    const onEvent = createGatewayEventHandler(ctx)
+
+    patchUiState({ sid: 'live-session' })
+    onEvent({
+      payload: {
+        complete,
+        durable_session_id: 'durable-session',
+        fail,
+        live_session_id: 'live-session'
+      },
+      type: 'session.replay_resync_required'
+    } as any)
+
+    expect(ctx.session.resumeById).toHaveBeenCalledWith('durable-session')
+    expect(getUiState().status).toBe('recovering session…')
+    expect(complete).not.toHaveBeenCalled()
+
+    finishResume!({ session_id: 'live-session' })
+    await vi.waitFor(() => expect(complete).toHaveBeenCalledWith('live-session'))
+    expect(fail).not.toHaveBeenCalled()
+  })
+
   it('adopts a gateway-recovered live session without resuming its durable session a second time', () => {
     const ctx = buildCtx([])
     const onEvent = createGatewayEventHandler(ctx)
