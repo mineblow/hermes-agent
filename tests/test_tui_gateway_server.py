@@ -6143,6 +6143,7 @@ def _session(agent=None, **extra):
         "slash_worker": None,
         "show_reasoning": False,
         "tool_progress_mode": "all",
+        "transport": server._stdio_transport,
         **extra,
     }
 

@@ -1251,7 +1251,7 @@ def _(rid, params: dict) -> dict:
     without closing siblings.
     """
     current = str(params.get("current_session_id") or "")
-    transport = current_transport()
+    transport = current_transport() or _stdio_transport
     try:
         with _sessions_lock:
             snapshot = list(_sessions.items())
@@ -1277,14 +1277,16 @@ def _(rid, params: dict) -> dict:
     for sid, session in snapshot:
         if session.get("_finalized"):
             continue
-        if transport is not None:
-            hub = session.get("event_hub")
-            try:
-                if hub is None:
-                    raise PermissionError("transport is not attached")
-                hub.require(transport, "observe")
-            except PermissionError:
-                continue
+        hub = session.get("event_hub")
+        if hub is None and session.get("transport") is _stdio_transport:
+            rows.append(_session_live_item(sid, session, current))
+            continue
+        try:
+            if hub is None:
+                raise PermissionError("transport is not attached")
+            hub.require(transport, "observe")
+        except PermissionError:
+            continue
         rows.append(_session_live_item(sid, session, current))
     return _ok(rid, {"sessions": rows})
 
@@ -1302,15 +1304,25 @@ def _(rid, params: dict) -> dict:
         return err
     assert session is not None
 
-    transport = current_transport()
-    if transport is not None:
-        hub = session.get("event_hub")
-        try:
-            if hub is None:
-                raise PermissionError("transport is not attached")
-            hub.require(transport, "observe")
-        except PermissionError:
-            return _err(rid, 4003, "existing session attachment required")
+    transport = current_transport() or _stdio_transport
+    hub = session.get("event_hub")
+    if hub is None and session.get("transport") is _stdio_transport:
+        return _ok(
+            rid,
+            _live_session_payload(
+                sid,
+                session,
+                touch=True,
+                transport=None,
+                omit_messages=is_truthy_value(params.get("omit_messages", False)),
+            ),
+        )
+    try:
+        if hub is None:
+            raise PermissionError("transport is not attached")
+        hub.require(transport, "observe")
+    except PermissionError:
+        return _err(rid, 4003, "existing session attachment required")
 
     return _ok(
         rid,
@@ -1321,7 +1333,7 @@ def _(rid, params: dict) -> dict:
             # Activation switches UI focus; it is not an attachment grant.
             # Preserve the existing mode/capability intersection instead of
             # applying the payload helper's legacy control-mode default.
-            transport=None if transport is not None else _stdio_transport,
+            transport=None,
             omit_messages=is_truthy_value(params.get("omit_messages", False)),
         ),
     )

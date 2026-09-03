@@ -110,6 +110,24 @@ def test_active_list_reveals_nothing_to_unattached_transport(monkeypatch):
     assert response["result"]["sessions"] == []
 
 
+def test_unbound_active_list_does_not_bypass_stdio_attachment_membership(monkeypatch):
+    attached = _Transport("attached", frozenset({"observe"}))
+    _live_session("live", attached, AttachmentMode.OBSERVE)
+    monkeypatch.setattr(
+        server,
+        "_session_live_item",
+        lambda sid, _session, _current: {"session_id": sid},
+    )
+
+    response = server.handle_request({
+        "id": "list",
+        "method": "session.active_list",
+        "params": {},
+    })
+
+    assert response["result"]["sessions"] == []
+
+
 def test_activate_rejects_transport_without_existing_attachment(monkeypatch):
     attached = _Transport("attached", frozenset({"observe"}))
     stranger = _Transport("stranger", frozenset({"observe"}))
@@ -120,6 +138,17 @@ def test_activate_rejects_transport_without_existing_attachment(monkeypatch):
         response = _request("session.activate")
 
     assert response["error"]["code"] == 4003
+
+
+def test_unbound_activate_does_not_implicitly_attach_stdio_as_controller(monkeypatch):
+    attached = _Transport("attached", frozenset({"observe"}))
+    hub = _live_session("live", attached, AttachmentMode.OBSERVE)
+    monkeypatch.setattr(server, "_live_session_payload", lambda *_args, **_kwargs: {})
+
+    response = _request("session.activate")
+
+    assert response["error"]["code"] == 4003
+    assert hub.count() == 1
 
 
 def test_activate_preserves_observe_only_attachment(monkeypatch):
@@ -148,6 +177,9 @@ def test_activate_preserves_observe_only_attachment(monkeypatch):
         "session.set_hidden",
         "session.compress",
         "config.set",
+        "handoff.request",
+        "message.react",
+        "llm.oneshot",
     ],
 )
 def test_live_session_mutations_require_controller_capability(method):
@@ -160,6 +192,25 @@ def test_live_session_mutations_require_controller_capability(method):
 
     with _bound(observer):
         response = _request(method)
+
+    assert response["error"]["code"] == 4003
+    assert called == []
+
+
+def test_workspace_move_resolves_live_session_by_durable_key(monkeypatch):
+    owner = _Transport("owner", frozenset({"observe", "session.steer"}))
+    stranger = _Transport("stranger", frozenset({"observe", "session.steer"}))
+    _live_session("live", owner, AttachmentMode.CONTROL)
+    server._sessions["live"]["session_key"] = "durable"
+    called = []
+    monkeypatch.setitem(server._methods, "session.workspace.move", lambda rid, params: called.append(params) or {})
+
+    with _bound(stranger):
+        response = server.handle_request({
+            "id": "rpc",
+            "method": "session.workspace.move",
+            "params": {"cwd": "/tmp", "session_key": "durable"},
+        })
 
     assert response["error"]["code"] == 4003
     assert called == []

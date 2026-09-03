@@ -3280,6 +3280,9 @@ _SESSION_RPC_CAPABILITIES = {
     "session.events.since": "observe",
     "session.presentation.snapshot": "observe",
     "config.set": "session.steer",
+    "handoff.request": "session.steer",
+    "message.react": "session.steer",
+    "llm.oneshot": "prompt.submit",
     "prompt.background": "session.steer",
     "image.attach": "session.steer",
     "image.attach_bytes": "session.steer",
@@ -3315,6 +3318,13 @@ def _authorization_session(method_name: str, params: dict) -> dict | None:
     if session is not None:
         return session
 
+    durable_key = str(params.get("session_key") or "")
+    if durable_key:
+        with _sessions_lock:
+            for candidate in _sessions.values():
+                if candidate.get("session_key") == durable_key:
+                    return candidate
+
     # Approval cards may outlive a reminted live sid. Preserve the existing
     # durable-identity fallback, but authorize against the runtime it resolves.
     if method_name == "approval.respond":
@@ -3344,6 +3354,11 @@ def _resolve_authorization_session(
 
 
 def _authorize_session_rpc(rid, method_name: str, params: dict) -> dict | None:
+    # Direct in-process dispatch is the trusted stdio/runtime implementation,
+    # not a remote attachment boundary. Network and proxy transports are bound
+    # explicitly and must pass the capability policy below.
+    if current_transport() is None:
+        return None
     capability = _SESSION_RPC_CAPABILITIES.get(method_name)
     if capability is None:
         session, resolution_error = _resolve_authorization_session(
@@ -3351,11 +3366,7 @@ def _authorize_session_rpc(rid, method_name: str, params: dict) -> dict | None:
         )
         if resolution_error is not None:
             return resolution_error
-        if (
-            method_name.startswith("session.")
-            and method_name not in _SELF_AUTHORIZING_SESSION_RPCS
-            and session is not None
-        ):
+        if method_name not in _SELF_AUTHORIZING_SESSION_RPCS and session is not None:
             # New session RPCs must be deliberately classified before they can
             # operate on a live shared runtime. Durable/non-live lookups retain
             # legacy handler behavior because they resolve no live record.
