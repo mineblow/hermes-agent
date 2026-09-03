@@ -180,6 +180,16 @@ def test_activate_preserves_observe_only_attachment(monkeypatch):
         "handoff.request",
         "message.react",
         "llm.oneshot",
+        "approval.received",
+        "terminal.resize",
+        "clipboard.paste",
+        "preview.restart",
+        "handoff.fail",
+        "input.detect_drop",
+        "subagent.steer",
+        "process.kill",
+        "slash.exec",
+        "rollback.restore",
     ],
 )
 def test_live_session_mutations_require_controller_capability(method):
@@ -214,6 +224,31 @@ def test_workspace_move_resolves_live_session_by_durable_key(monkeypatch):
 
     assert response["error"]["code"] == 4003
     assert called == []
+
+
+@pytest.mark.parametrize(
+    ("method", "capability"),
+    [
+        ("approval.pending", "observe"),
+        ("approval.received", "approval.respond"),
+        ("terminal.resize", "session.steer"),
+        ("clipboard.paste", "prompt.submit"),
+        ("preview.restart", "session.steer"),
+        ("handoff.state", "observe"),
+        ("handoff.fail", "session.steer"),
+        ("input.detect_drop", "prompt.submit"),
+        ("subagent.steer", "session.steer"),
+        ("process.list", "observe"),
+        ("process.kill", "session.steer"),
+        ("slash.exec", "session.steer"),
+        ("rollback.list", "observe"),
+        ("rollback.diff", "observe"),
+        ("rollback.restore", "session.steer"),
+        ("config.get", "observe"),
+    ],
+)
+def test_live_session_rpc_policy_inventory_is_explicit(method, capability):
+    assert server._SESSION_RPC_CAPABILITIES[method] == capability
 
 
 def test_unclassified_session_rpc_resolving_live_session_fails_closed():

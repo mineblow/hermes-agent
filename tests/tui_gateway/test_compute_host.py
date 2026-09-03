@@ -178,6 +178,7 @@ def test_real_turn_forwards_user_event_metadata_to_gateway_runner(monkeypatch):
         "display_kind": None,
         "display_metadata": {"platform": "discord", "user_id": "user-1"},
         "client_message_id": "user-pc1-123",
+        "client_identity": None,
         "display_text": "hello from pc 1",
         "submitted_at": 1234.5,
         "attachment_refs": ["attachment://one"],

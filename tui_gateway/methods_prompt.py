@@ -304,6 +304,7 @@ def _(rid, params: dict) -> dict:
         client_message_id = None
     else:
         client_message_id = client_message_id.strip()[:256]
+    client_identity = _client_message_identity(client_message_id)
     raw_display_text = params.get("display_text")
     display_text = (
         sanitize_user_prompt_text(raw_display_text)
@@ -383,7 +384,9 @@ def _(rid, params: dict) -> dict:
     if (limit_message := _ensure_active_session_slot(sid, session)) is not None:
         return _err(rid, 4090, limit_message)
     with session["history_lock"]:
-        if _client_message_id_is_accepted(session, client_message_id):
+        if _client_message_id_is_accepted(
+            session, client_message_id, client_identity
+        ):
             return _ok(
                 rid,
                 {
@@ -436,6 +439,7 @@ def _(rid, params: dict) -> dict:
             display_kind=display_kind,
             display_metadata=display_metadata,
             client_message_id=client_message_id,
+            client_identity=client_identity,
             display_text=display_text,
             submitted_at=submitted_at,
             attachment_refs=attachment_refs,
@@ -873,7 +877,9 @@ def _(rid, params: dict) -> dict:
                             )
             session["history"] = truncated
             session["history_version"] = int(session.get("history_version", 0)) + 1
-        if _client_message_id_is_accepted(session, client_message_id):
+        if _client_message_id_is_accepted(
+            session, client_message_id, client_identity
+        ):
             return _ok(
                 rid,
                 {
@@ -882,7 +888,9 @@ def _(rid, params: dict) -> dict:
                     "client_message_id": client_message_id,
                 },
             )
-        _remember_accepted_client_message_id(session, client_message_id)
+        _remember_accepted_client_message_id(
+            session, client_message_id, client_identity
+        )
         session["running"] = True
         session["_turn_cancel_requested"] = False
         session["last_active"] = time.time()
@@ -905,6 +913,7 @@ def _(rid, params: dict) -> dict:
             display_kind=display_kind,
             display_metadata=display_metadata,
             client_message_id=client_message_id,
+            client_identity=client_identity,
             display_text=display_text,
             submitted_at=submitted_at,
             attachment_refs=attachment_refs,
@@ -938,7 +947,9 @@ def _(rid, params: dict) -> dict:
         from hermes_state import is_disk_full_error
 
         with session["history_lock"]:
-            _forget_accepted_client_message_id(session, client_message_id)
+            _forget_accepted_client_message_id(
+                session, client_message_id, client_identity
+            )
             session["running"] = False
             session["last_active"] = time.time()
             _clear_inflight_turn(session)
@@ -1009,6 +1020,7 @@ def _(rid, params: dict) -> dict:
             display_kind=display_kind,
             display_metadata=display_metadata,
             client_message_id=client_message_id,
+            client_identity=client_identity,
             display_text=display_text,
             submitted_at=submitted_at,
             attachment_refs=attachment_refs,

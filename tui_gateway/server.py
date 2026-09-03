@@ -2920,6 +2920,7 @@ def _compute_host_turn_frame(
     display_kind: str | None = None,
     display_metadata: dict | None = None,
     client_message_id: str | None = None,
+    client_identity: tuple[str, str] | None = None,
     display_text: str | None = None,
     submitted_at: float | None = None,
     attachment_refs: list[str] | None = None,
@@ -2947,6 +2948,11 @@ def _compute_host_turn_frame(
         **(
             {"client_message_id": client_message_id}
             if client_message_id
+            else {}
+        ),
+        **(
+            {"client_identity": list(client_identity)}
+            if client_identity is not None
             else {}
         ),
         **({"display_text": display_text} if display_text is not None else {}),
@@ -3047,6 +3053,7 @@ def _submit_prompt_to_compute_host(
     display_kind: str | None = None,
     display_metadata: dict | None = None,
     client_message_id: str | None = None,
+    client_identity: tuple[str, str] | None = None,
     display_text: str | None = None,
     submitted_at: float | None = None,
     attachment_refs: list[str] | None = None,
@@ -3062,6 +3069,7 @@ def _submit_prompt_to_compute_host(
         display_kind=display_kind,
         display_metadata=display_metadata,
         client_message_id=client_message_id,
+        client_identity=client_identity,
         display_text=display_text,
         submitted_at=submitted_at,
         attachment_refs=attachment_refs,
@@ -3284,6 +3292,22 @@ _SESSION_RPC_CAPABILITIES = {
     "message.react": "session.steer",
     "llm.oneshot": "prompt.submit",
     "prompt.background": "session.steer",
+    "approval.pending": "observe",
+    "approval.received": "approval.respond",
+    "terminal.resize": "session.steer",
+    "clipboard.paste": "prompt.submit",
+    "preview.restart": "session.steer",
+    "handoff.state": "observe",
+    "handoff.fail": "session.steer",
+    "input.detect_drop": "prompt.submit",
+    "subagent.steer": "session.steer",
+    "process.list": "observe",
+    "process.kill": "session.steer",
+    "slash.exec": "session.steer",
+    "rollback.list": "observe",
+    "rollback.diff": "observe",
+    "rollback.restore": "session.steer",
+    "config.get": "observe",
     "image.attach": "session.steer",
     "image.attach_bytes": "session.steer",
     "pdf.attach": "session.steer",
@@ -10272,18 +10296,98 @@ def _maybe_schedule_auto_continue(sid: str, session: dict, session_key: str) -> 
 
 
 _ACCEPTED_CLIENT_MESSAGE_IDS_LIMIT = 2048
+_BUSY_QUEUE_MAX_ENTRIES = 32
+_BUSY_QUEUE_MAX_PAYLOAD_BYTES = 1024 * 1024
 
 
-def _client_message_id_is_accepted(session: dict, client_message_id: str | None) -> bool:
+def _busy_queue_payload_bytes(value: Any) -> int:
+    """Estimate retained user-controlled bytes without counting transport objects."""
+    if value is None:
+        return 0
+    if isinstance(value, str):
+        return len(value.encode("utf-8"))
+    if isinstance(value, bytes):
+        return len(value)
+    if isinstance(value, dict):
+        return sum(
+            len(str(key).encode("utf-8")) + _busy_queue_payload_bytes(item)
+            for key, item in value.items()
+            if key != "transport"
+        )
+    if isinstance(value, (list, tuple)):
+        return sum(_busy_queue_payload_bytes(item) for item in value)
+    return len(str(value).encode("utf-8"))
+
+
+def _busy_queue_entries(session: dict) -> list[dict]:
+    head = session.get("queued_prompt")
+    return ([head] if isinstance(head, dict) else []) + [
+        entry
+        for entry in session.get("queued_prompts") or []
+        if isinstance(entry, dict)
+    ]
+
+
+def _busy_queue_can_admit(
+    session: dict, queued: dict, *, replacing: dict | None = None
+) -> bool:
+    entries = _busy_queue_entries(session)
+    if replacing is None and len(entries) >= _BUSY_QUEUE_MAX_ENTRIES:
+        return False
+    retained_bytes = sum(
+        _busy_queue_payload_bytes(entry)
+        for entry in entries
+        if entry is not replacing
+    )
+    return (
+        retained_bytes + _busy_queue_payload_bytes(queued)
+        <= _BUSY_QUEUE_MAX_PAYLOAD_BYTES
+    )
+
+
+def _client_message_scope(transport: object | None = None) -> str:
+    """Return the stable, non-caller-forgeable owner of an idempotency key."""
+    target = transport if transport is not None else current_transport()
+    identity = getattr(target, "auth_identity", None)
+    if isinstance(identity, dict) and identity:
+        encoded = json.dumps(
+            identity, sort_keys=True, separators=(",", ":"), default=str
+        )
+        return "auth:" + hashlib.sha256(encoded.encode("utf-8")).hexdigest()
+    client_id = getattr(target, "client_id", None)
+    if client_id is not None and str(client_id).strip():
+        return "client:" + str(client_id).strip()
+    # Trusted in-process/stdio callers have no connection-scoped identity.
+    return "gateway-owner"
+
+
+def _client_message_identity(
+    client_message_id: str | None, transport: object | None = None
+) -> tuple[str, str] | None:
+    """Build ``(stable principal/client, message id)`` idempotency identity."""
+    if not client_message_id:
+        return None
+    return (_client_message_scope(transport), client_message_id)
+
+
+def _client_message_id_is_accepted(
+    session: dict,
+    client_message_id: str | None,
+    client_identity: tuple[str, str] | None = None,
+) -> bool:
     """Return whether this stable client identity already owns an accepted turn.
 
-    Callers hold ``history_lock`` so admission and the transition to ``running``
-    remain one atomic decision across every attached controller.
+    Bare IDs from older runtimes/durable rows remain global duplicates because
+    their original client owner cannot be reconstructed safely.
     """
     if not client_message_id:
         return False
-    if client_message_id in session.get("accepted_client_message_ids", ()):
-        return True
+    identity = client_identity or _client_message_identity(client_message_id)
+    for accepted_identity in session.get("accepted_client_message_ids", ()):
+        if accepted_identity == client_message_id:  # pre-scoped runtime entry
+            return True
+        if isinstance(accepted_identity, (tuple, list)) and tuple(accepted_identity) == identity:
+            return True
     for history in (
         session.get("history") or [],
         session.get("display_history_prefix") or [],
@@ -10292,40 +10396,65 @@ def _client_message_id_is_accepted(session: dict, client_message_id: str | None)
             if not isinstance(message, dict) or message.get("role") != "user":
                 continue
             metadata = message.get("display_metadata")
-            if (
+            if not (
                 isinstance(metadata, dict)
                 and metadata.get("client_message_id") == client_message_id
             ):
-                _remember_accepted_client_message_id(session, client_message_id)
+                continue
+            persisted_scope = metadata.get("client_identity")
+            if persisted_scope is None:
+                _remember_accepted_client_message_id(
+                    session, client_message_id, legacy_bare=True
+                )
+                return True
+            if identity is not None and persisted_scope == identity[0]:
+                _remember_accepted_client_message_id(
+                    session, client_message_id, identity
+                )
                 return True
     return False
 
 
 def _remember_accepted_client_message_id(
-    session: dict, client_message_id: str | None
+    session: dict,
+    client_message_id: str | None,
+    client_identity: tuple[str, str] | None = None,
+    *,
+    legacy_bare: bool = False,
 ) -> None:
     """Remember accepted identities with bounded per-runtime retention."""
     if not client_message_id:
         return
-    accepted = session.setdefault("accepted_client_message_ids", [])
-    if client_message_id in accepted:
+    identity: object = (
+        client_message_id
+        if legacy_bare
+        else client_identity or _client_message_identity(client_message_id)
+    )
+    if identity is None:
         return
-    accepted.append(client_message_id)
+    accepted = session.setdefault("accepted_client_message_ids", [])
+    if identity in accepted:
+        return
+    accepted.append(identity)
     overflow = len(accepted) - _ACCEPTED_CLIENT_MESSAGE_IDS_LIMIT
     if overflow > 0:
         del accepted[:overflow]
 
 
 def _forget_accepted_client_message_id(
-    session: dict, client_message_id: str | None
+    session: dict,
+    client_message_id: str | None,
+    client_identity: tuple[str, str] | None = None,
 ) -> None:
     """Roll back an admission that was cancelled before execution started."""
     if not client_message_id:
         return
+    identity = client_identity or _client_message_identity(client_message_id)
     accepted = session.get("accepted_client_message_ids")
     if isinstance(accepted, list):
-        with contextlib.suppress(ValueError):
-            accepted.remove(client_message_id)
+        for candidate in (identity, client_message_id):
+            with contextlib.suppress(ValueError):
+                accepted.remove(candidate)
 
 
 def _enqueue_prompt(
@@ -10339,10 +10468,11 @@ def _enqueue_prompt(
     display_kind: str | None = None,
     display_metadata: dict | None = None,
     client_message_id: str | None = None,
+    client_identity: tuple[str, str] | None = None,
     display_text: str | None = None,
     submitted_at: float | None = None,
     attachment_refs: list[str] | None = None,
-) -> None:
+) -> bool:
     """Stash a message to run as the very next turn once the live one ends.
 
     Used when a prompt arrives mid-turn (see ``_handle_busy_submit``). Text-only
@@ -10360,9 +10490,13 @@ def _enqueue_prompt(
         if any(
             isinstance(entry, dict)
             and entry.get("client_message_id") == client_message_id
+            and (
+                entry.get("client_identity") is None
+                or tuple(entry.get("client_identity")) == client_identity
+            )
             for entry in queued_entries
         ):
-            return
+            return True
     # #84417: scrub any live-turn self-duplicates first so the consecutive-text
     # merge below cannot glue "{original}\\n\\n{later}" and re-fire original
     # on drain after a later correction settles.
@@ -10376,7 +10510,7 @@ def _enqueue_prompt(
             str(turn.get("user") or "").strip() if isinstance(turn, dict) else ""
         )
         if original and text.strip() == original:
-            return
+            return True
     legacy_envelope = origin_client_id is None and request_id is None
     queued = {"text": text}
     queued.update(
@@ -10388,6 +10522,7 @@ def _enqueue_prompt(
                     dict(display_metadata) if display_metadata is not None else None
                 ),
                 "client_message_id": client_message_id,
+                "client_identity": client_identity,
                 "display_text": display_text,
                 "submitted_at": submitted_at,
                 "attachment_refs": (
@@ -10423,18 +10558,26 @@ def _enqueue_prompt(
         )
     ):
         prev = existing["text"]
-        existing["text"] = f"{prev}\n\n{text}" if prev and text else (prev or text)
+        merged = dict(existing)
+        merged["text"] = f"{prev}\n\n{text}" if prev and text else (prev or text)
         if request_id is not None:
-            request_ids = existing.setdefault(
-                "request_ids", [existing.get("request_id")]
+            request_ids = list(
+                merged.get("request_ids") or [existing.get("request_id")]
             )
+            merged["request_ids"] = request_ids
             if request_id not in request_ids:
                 request_ids.append(request_id)
-        return
+        if not _busy_queue_can_admit(session, merged, replacing=existing):
+            return False
+        existing.update(merged)
+        return True
+    if not _busy_queue_can_admit(session, queued):
+        return False
     if existing:
         session.setdefault("queued_prompts", []).append(queued)
-        return
+        return True
     session["queued_prompt"] = queued
+    return True
 
 
 def _sanitize_queued_entry_vs_inflight_user(
@@ -10563,6 +10706,7 @@ def _handle_busy_submit(
     display_kind: str | None = None,
     display_metadata: dict | None = None,
     client_message_id: str | None = None,
+    client_identity: tuple[str, str] | None = None,
     display_text: str | None = None,
     submitted_at: float | None = None,
     attachment_refs: list[str] | None = None,
@@ -10591,13 +10735,16 @@ def _handle_busy_submit(
         busy_policy = None
     mode = "queue" if queued else busy_policy or _load_busy_input_mode()
     agent = session.get("agent")
+    claimed_attached_images = False
     with session["history_lock"]:
         if not session.get("running"):
             # The turn ended between prompt.submit's first busy check and this
             # helper. Let the caller retry and claim the now-idle session.
             return None
     if mode == "reject":
-        _forget_accepted_client_message_id(session, client_message_id)
+        _forget_accepted_client_message_id(
+            session, client_message_id, client_identity
+        )
         return _err(rid, -32001, "session busy")
     with session["history_lock"]:
         if not session.get("running"):
@@ -10608,6 +10755,7 @@ def _handle_busy_submit(
                 # Claim at submission time. A later paste must not be consumed by
                 # this prompt after the active turn finally yields.
                 session["attached_images"] = []
+                claimed_attached_images = True
         else:
             image_paths = list(image_paths)
     text_only = not image_paths and _is_text_only_busy_payload(text)
@@ -10652,7 +10800,7 @@ def _handle_busy_submit(
             if image_paths:
                 session["attached_images"] = image_paths + list(session.get("attached_images", []))
             return None
-        _enqueue_prompt(
+        admitted = _enqueue_prompt(
             session,
             text,
             transport,
@@ -10662,10 +10810,20 @@ def _handle_busy_submit(
             display_kind=display_kind,
             display_metadata=display_metadata,
             client_message_id=client_message_id,
+            client_identity=client_identity,
             display_text=display_text,
             submitted_at=submitted_at,
             attachment_refs=attachment_refs,
         )
+        if not admitted:
+            if claimed_attached_images and image_paths:
+                session["attached_images"] = image_paths + list(
+                    session.get("attached_images", [])
+                )
+            _forget_accepted_client_message_id(
+                session, client_message_id, client_identity
+            )
+            return _err(rid, -32002, "busy queue capacity exceeded")
         session["last_active"] = time.time()
 
     # Attachments need a separate model invocation. Queue them without
@@ -10703,10 +10861,15 @@ def _drain_queued_prompt(rid, sid: str, session: dict) -> bool:
         if not queued_prompts:
             session.pop("queued_prompts", None)
         queued_client_message_id = queued.get("client_message_id")
-        if _client_message_id_is_accepted(session, queued_client_message_id):
+        queued_client_identity = queued.get("client_identity")
+        if _client_message_id_is_accepted(
+            session, queued_client_message_id, queued_client_identity
+        ):
             session["running"] = False
             return bool(session.get("queued_prompt"))
-        _remember_accepted_client_message_id(session, queued_client_message_id)
+        _remember_accepted_client_message_id(
+            session, queued_client_message_id, queued_client_identity
+        )
         session["running"] = True
         if queued.get("transport") is not None:
             session["transport"] = queued["transport"]
@@ -10728,7 +10891,9 @@ def _drain_queued_prompt(rid, sid: str, session: dict) -> bool:
                 session["queued_prompts"] = rest
             else:
                 session.pop("queued_prompts", None)
-            _forget_accepted_client_message_id(session, queued_client_message_id)
+            _forget_accepted_client_message_id(
+                session, queued_client_message_id, queued_client_identity
+            )
             session["running"] = False
             return True
     dispatch_failed = False
@@ -10736,6 +10901,7 @@ def _drain_queued_prompt(rid, sid: str, session: dict) -> bool:
         "display_kind": queued.get("display_kind"),
         "display_metadata": queued.get("display_metadata"),
         "client_message_id": queued.get("client_message_id"),
+        "client_identity": queued.get("client_identity"),
         "display_text": queued.get("display_text"),
         "submitted_at": queued.get("submitted_at"),
         "attachment_refs": queued.get("attachment_refs"),
@@ -13190,6 +13356,7 @@ def _run_prompt_submit(
     origin_client_id: str | None = None,
     request_id: str | None = None,
     client_message_id: str | None = None,
+    client_identity: tuple[str, str] | None = None,
     display_text: str | None = None,
     submitted_at: float | None = None,
     attachment_refs: list[str] | None = None,
@@ -13519,6 +13686,8 @@ def _run_prompt_submit(
             persist_user_display_metadata = dict(display_metadata or {})
             if client_message_id:
                 persist_user_display_metadata["client_message_id"] = client_message_id
+            if client_identity is not None:
+                persist_user_display_metadata["client_identity"] = client_identity[0]
             # Type a synthesized turn at turn START so the crash persist writes
             # its row as a timeline event, instead of leaving a raw user bubble
             # until the turn ends — and forever if it never does, which is

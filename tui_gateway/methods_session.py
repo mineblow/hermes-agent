@@ -3677,9 +3677,27 @@ def _(rid, params: dict) -> dict:
     text = (params.get("text") or "").strip()
     if not text:
         return _err(rid, 4002, "text is required")
+    client_message_id = params.get("client_message_id")
+    if not isinstance(client_message_id, str) or not client_message_id.strip():
+        client_message_id = None
+    else:
+        client_message_id = client_message_id.strip()[:256]
+    client_identity = _client_message_identity(client_message_id)
     session, err = _sess_nowait(params, rid)
     if err:
         return err
+    with session["history_lock"]:
+        if _client_message_id_is_accepted(
+            session, client_message_id, client_identity
+        ):
+            return _ok(
+                rid,
+                {
+                    "status": "duplicate",
+                    "duplicate": True,
+                    "client_message_id": client_message_id,
+                },
+            )
     agent = session.get("agent")
     if agent is None or not hasattr(agent, "steer"):
         return _err(rid, 4010, "agent does not support steer")
@@ -3693,6 +3711,9 @@ def _(rid, params: dict) -> dict:
         # rebuilds the transcript from the inflight snapshot and the steered
         # text has no user bubble — the "my message vanished on reload" loss.
         with session["history_lock"]:
+            _remember_accepted_client_message_id(
+                session, client_message_id, client_identity
+            )
             _record_inflight_correction(session, text)
             # #84417: steer does not cancel the live original, but a server
             # queue self-copy of that original must still not re-fire after
@@ -3708,9 +3729,27 @@ def _(rid, params: dict) -> dict:
     text = (params.get("text") or "").strip()
     if not text:
         return _err(rid, 4002, "text is required")
+    client_message_id = params.get("client_message_id")
+    if not isinstance(client_message_id, str) or not client_message_id.strip():
+        client_message_id = None
+    else:
+        client_message_id = client_message_id.strip()[:256]
+    client_identity = _client_message_identity(client_message_id)
     session, err = _sess_nowait(params, rid)
     if err:
         return err
+    with session["history_lock"]:
+        if _client_message_id_is_accepted(
+            session, client_message_id, client_identity
+        ):
+            return _ok(
+                rid,
+                {
+                    "status": "duplicate",
+                    "duplicate": True,
+                    "client_message_id": client_message_id,
+                },
+            )
     agent = session.get("agent")
     # Turn-build window: a fresh turn flips running=True and kicks off an async
     # agent build, so session["agent"] is briefly None. That is not an
@@ -3725,6 +3764,11 @@ def _(rid, params: dict) -> dict:
             queue_transport,
             origin_client_id=_legacy_client_id_for_transport(queue_transport),
             request_id=str(rid),
+            client_message_id=client_message_id,
+            client_identity=client_identity,
+        )
+        _remember_accepted_client_message_id(
+            session, client_message_id, client_identity
         )
         session["last_active"] = time.time()
         return _ok(rid, {"status": "queued", "text": text})
@@ -3740,6 +3784,9 @@ def _(rid, params: dict) -> dict:
         return _err(rid, 5000, f"redirect failed: {exc}")
     if accepted:
         with session["history_lock"]:
+            _remember_accepted_client_message_id(
+                session, client_message_id, client_identity
+            )
             _record_inflight_correction(session, text)
             # #84417: purge server-queue self-duplicates of the live original
             # so post-turn drain cannot restart the pre-correction prompt.

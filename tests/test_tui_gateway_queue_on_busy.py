@@ -52,6 +52,56 @@ def test_enqueue_preserves_order_after_an_image_turn():
     ]
 
 
+def test_enqueue_rejects_envelopes_past_count_limit(monkeypatch):
+    monkeypatch.setattr(server, "_BUSY_QUEUE_MAX_ENTRIES", 2)
+    monkeypatch.setattr(server, "_BUSY_QUEUE_MAX_PAYLOAD_BYTES", 1_000_000)
+    session = _session()
+
+    assert server._enqueue_prompt(session, "A", "ws-1", image_paths=["a.png"])
+    assert server._enqueue_prompt(session, "B", "ws-1", image_paths=["b.png"])
+    assert not server._enqueue_prompt(
+        session, "C", "ws-1", image_paths=["c.png"]
+    )
+    assert len(server._busy_queue_entries(session)) == 2
+
+
+def test_enqueue_rejects_merged_text_past_utf8_byte_limit(monkeypatch):
+    monkeypatch.setattr(server, "_BUSY_QUEUE_MAX_ENTRIES", 32)
+    session = _session()
+    assert server._enqueue_prompt(session, "éé", "ws-1")
+    original = dict(session["queued_prompt"])
+    monkeypatch.setattr(
+        server,
+        "_BUSY_QUEUE_MAX_PAYLOAD_BYTES",
+        server._busy_queue_payload_bytes(original) + 1,
+    )
+
+    assert not server._enqueue_prompt(session, "é", "ws-1")
+    assert session["queued_prompt"] == original
+
+
+def test_busy_submit_reports_capacity_rejection_and_restores_claimed_images(
+    monkeypatch,
+):
+    monkeypatch.setattr(server, "_BUSY_QUEUE_MAX_ENTRIES", 1)
+    monkeypatch.setattr(server, "_BUSY_QUEUE_MAX_PAYLOAD_BYTES", 1_000_000)
+    session = _session(running=True, attached_images=["new.png"])
+    session["queued_prompt"] = {
+        "text": "already queued",
+        "transport": "ws-1",
+        "image_paths": ["old.png"],
+    }
+
+    response = server._handle_busy_submit(
+        "r1", "sid", session, "next", "ws-1", busy_policy="queue"
+    )
+
+    assert response["error"] == {
+        "code": -32002,
+        "message": "busy queue capacity exceeded",
+    }
+    assert session["attached_images"] == ["new.png"]
+    assert len(server._busy_queue_entries(session)) == 1
 
 
 # ── _handle_busy_submit (policy) ───────────────────────────────────────────
