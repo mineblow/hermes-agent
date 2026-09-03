@@ -4,6 +4,7 @@ import asyncio
 import os
 import threading
 import time
+from types import SimpleNamespace
 
 import pytest
 
@@ -19,6 +20,12 @@ from gateway.session import SessionSource
 from gateway.session_state import SessionState
 from hermes_cli.classic_live_runtime import build_classic_live_runtime_frontend
 from hermes_cli.live_runtime_owners import RuntimeOwner
+from tests.e2e.conftest import (
+    _make_discord_adapter_wired,
+    make_discord_message,
+    make_fake_dm_channel,
+    make_runner,
+)
 from tests.test_tui_gateway_server import _LifecycleTransport, _dispatch_sync
 from tui_gateway import server
 from tui_gateway.runtime_proxy import RuntimeProxyServer
@@ -237,23 +244,71 @@ async def test_tui_classic_and_discord_share_one_live_runtime(monkeypatch, tmp_p
         with desktop._condition:
             desktop.frames.clear()
 
-        discord_message = MessageEvent(
-            text="discord prompt",
-            user_id="discord-user-1",
-            user_name="Discord Controller",
-            source=source,
+        # Exercise Discord's production adapter boundary and GatewayRunner's
+        # production ingress.  Keep the heavyweight local-agent tail replaced
+        # by a narrow handoff into the production canonical-routing helper: the
+        # assertion below proves the adapter-built MessageEvent reaches the one
+        # runtime owned by the desktop rather than constructing a gateway agent.
+        runner = make_runner(Platform.DISCORD)
+        runner.__dict__["_live_runtime_bridge_instance"] = bridge
+        runner._session_db = SimpleNamespace(
+            session_runtime_key=lambda session_id: (
+                durable_root
+                if session_id == stored_sid
+                else (_ for _ in ()).throw(AssertionError(session_id))
+            )
+        )
+        runner._resolve_profile_home_for_source = lambda _source: profile_home
+        runner._lookup_live_runtime_owner = owner_lookup
+        runner._make_live_runtime_client = client_factory
+        runner._scale_to_zero_note_real_inbound = lambda: None
+        runner._is_user_authorized_for_source = lambda _source: True
+
+        async def route_to_canonical(event, event_source, session_key, _generation):
+            routed = await runner._try_route_live_runtime_input(
+                event=event,
+                source=event_source,
+                session_key=session_key,
+                durable_session_id=stored_sid,
+            )
+            assert routed is True
+            return None
+
+        runner._handle_message_with_agent.side_effect = route_to_canonical
+        discord_adapter, _ = _make_discord_adapter_wired(runner)
+        discord_adapter._text_batch_delay_seconds = 0
+        discord_author = SimpleNamespace(
+            id="discord-user-1",
+            name="discord-controller",
+            display_name="Discord Controller",
+            bot=False,
+        )
+        raw_discord_message = make_discord_message(
+            content="discord prompt",
+            author=discord_author,
+            channel=make_fake_dm_channel(channel_id="channel-1"),
             message_id="discord-delivery-1",
         )
-        first = await bridge.submit_message(attachment, discord_message)
-        assert first["status"] == "streaming"
+        assert await discord_adapter._handle_message(raw_discord_message) is True
         await asyncio.to_thread(desktop.wait_for_event, "message.complete")
         async with asyncio.timeout(5):
             while len(run_prompts) < 2:
                 await asyncio.sleep(0.01)
         assert run_prompts == ["desktop prompt", "discord prompt"]
+        runner._handle_message_with_agent.assert_awaited_once()
+        ingress_event = runner._handle_message_with_agent.call_args.args[0]
+        ingress_session_key = runner._handle_message_with_agent.call_args.args[2]
+        assert ingress_event.raw_message is raw_discord_message
+        assert ingress_event.message_id == "discord-delivery-1"
         async with asyncio.timeout(5):
             while session["running"]:
                 await asyncio.sleep(0.01)
+        assert [
+            message
+            for message in session["history"]
+            if message.get("role") == "user"
+            and message.get("content") == "discord prompt"
+        ] == [{"role": "user", "content": "discord prompt"}]
 
         with desktop._condition:
             desktop.frames.clear()
@@ -283,7 +338,15 @@ async def test_tui_classic_and_discord_share_one_live_runtime(monkeypatch, tmp_p
             for row in classic_rows
         )
 
-        duplicate = await bridge.submit_message(attachment, discord_message)
+        ingress_attachment = bridge.attachment_for(
+            ingress_session_key,
+            next(
+                current.routing_key
+                for current in states[ingress_session_key].live_runtime_attachments.values()
+            ),
+        )
+        assert ingress_attachment is not None
+        duplicate = await bridge.submit_message(ingress_attachment, ingress_event)
         assert duplicate["duplicate"] is True
         assert run_prompts == [
             "desktop prompt",
@@ -294,20 +357,42 @@ async def test_tui_classic_and_discord_share_one_live_runtime(monkeypatch, tmp_p
         watermark = attachment.client.replay_watermark
         assert watermark is not None
         await bridge.detach(
-            "discord:guild-1:channel-1", attachment.routing_key, expected=attachment
+            ingress_session_key,
+            ingress_attachment.routing_key,
+            expected=ingress_attachment,
         )
         discord_events.clear()
-        reattached = await bridge.attach(
-            session_key="discord:guild-1:channel-1",
-            source=source,
-            principal_id="discord-user-1",
-            durable_root=durable_root,
-            durable_session_id=stored_sid,
-            profile_home=profile_home,
-            mode=AttachmentMode.CONTROL,
-            client_factory=client_factory,
+        proxy.stop()
+        async with asyncio.timeout(5):
+            while attachment.client._connection is not None:
+                await asyncio.sleep(0.01)
+        server._emit(
+            "message.user",
+            sid,
+            {
+                "text": "desktop event while Discord is disconnected",
+                "display_metadata": {"user_name": "Desktop Controller"},
+            },
         )
-        assert reattached.client.replay_watermark is not None
+        await asyncio.sleep(0.05)
+        assert discord_events == []
+        proxy = RuntimeProxyServer(
+            endpoint=endpoint,
+            owner_lookup=lambda key: owner if key == conversation_key else None,
+            dispatch=server.dispatch,
+        )
+        assert proxy.start() is True
+        await attachment.client.wait_for_sequence(watermark[1] + 1)
+        assert attachment.client.replay_watermark == (watermark[0], watermark[1] + 1)
+        await _wait_for_event(discord_events, "message.user")
+        detached_replays = [
+            event
+            for event in discord_events
+            if event["type"] == "message.user"
+            and event["payload"].get("text")
+            == "desktop event while Discord is disconnected"
+        ]
+        assert len(detached_replays) == 1
         replay_seqs = [event["seq"] for event in discord_events]
         assert len(replay_seqs) == len(set(replay_seqs))
 
@@ -339,7 +424,7 @@ async def test_tui_classic_and_discord_share_one_live_runtime(monkeypatch, tmp_p
         assert desktop_answer["result"]["status"] == "ok"
         worker.join(timeout=5)
         assert clarification_result == ["yes"]
-        losing_answer = await reattached.client.respond_to_interaction(
+        losing_answer = await attachment.client.respond_to_interaction(
             {
                 "interaction_type": "clarification",
                 "request_id": request_id,
@@ -380,7 +465,7 @@ async def test_tui_classic_and_discord_share_one_live_runtime(monkeypatch, tmp_p
         )
         assert desktop_approval is not None
         assert desktop_approval["result"]["status"] == "resolved"
-        losing_approval = await reattached.client.respond_to_interaction(
+        losing_approval = await attachment.client.respond_to_interaction(
             {
                 "interaction_type": "approval",
                 "request_id": "approval-cross-surface-1",

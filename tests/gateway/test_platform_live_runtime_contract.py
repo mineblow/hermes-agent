@@ -19,12 +19,27 @@ from hermes_cli.live_runtime_protocol import runtime_event
 
 
 REPRESENTATIVE_ADAPTERS = [
-    ("plugins.platforms.discord.adapter", "DiscordAdapter"),
-    ("plugins.platforms.telegram.adapter", "TelegramAdapter"),
-    ("plugins.platforms.slack.adapter", "SlackAdapter"),
-    ("gateway.platforms.api_server", "APIServerAdapter"),
-    ("plugins.platforms.email.adapter", "EmailAdapter"),
-    ("plugins.platforms.ntfy.adapter", "NtfyAdapter"),
+    (
+        "discord",
+        "plugins.platforms.discord.adapter",
+        "DiscordAdapter",
+        Platform.DISCORD,
+    ),
+    (
+        "telegram",
+        "plugins.platforms.telegram.adapter",
+        "TelegramAdapter",
+        Platform.TELEGRAM,
+    ),
+    ("slack", "plugins.platforms.slack.adapter", "SlackAdapter", Platform.SLACK),
+    (
+        None,
+        "gateway.platforms.api_server",
+        "APIServerAdapter",
+        Platform.API_SERVER,
+    ),
+    ("email", "plugins.platforms.email.adapter", "EmailAdapter", Platform.EMAIL),
+    ("ntfy", "plugins.platforms.ntfy.adapter", "NtfyAdapter", Platform("ntfy")),
 ]
 
 
@@ -33,18 +48,22 @@ def test_base_adapter_declares_runner_owned_live_runtime_presentation():
     assert BasePlatformAdapter.STARTS_LIVE_RUNTIME is False
 
 
-@pytest.mark.parametrize("module_name,class_name", REPRESENTATIVE_ADAPTERS)
-def test_representative_adapters_inherit_runner_owned_live_runtime_contract(
-    module_name, class_name
-):
-    module = importlib.import_module(module_name)
-    adapter_class = getattr(module, class_name)
+def _build_production_adapter(registry_name, module_name, class_name):
+    """Construct the adapter shipped by its real registry factory when possible."""
+    from gateway.config import PlatformConfig
+    from hermes_cli.plugins import discover_plugins
 
-    assert issubclass(adapter_class, BasePlatformAdapter)
-    assert adapter_class.LIVE_RUNTIME_PRESENTATION_VIA_RUNNER is True
-    assert adapter_class.STARTS_LIVE_RUNTIME is False
-    assert "LIVE_RUNTIME_PRESENTATION_VIA_RUNNER" not in adapter_class.__dict__
-    assert "STARTS_LIVE_RUNTIME" not in adapter_class.__dict__
+    if registry_name is None:
+        adapter_class = getattr(importlib.import_module(module_name), class_name)
+        adapter = adapter_class(PlatformConfig())
+        return adapter, None
+
+    discover_plugins()
+    entry = platform_registry.get(registry_name)
+    assert entry is not None, f"{registry_name} is missing from the platform registry"
+    adapter = entry.adapter_factory(PlatformConfig())
+    assert type(adapter).__name__ == class_name
+    return adapter, entry
 
 
 def test_registry_entries_default_to_runner_owned_live_runtime_presentation():
@@ -77,41 +96,32 @@ def test_all_registered_platforms_share_runner_owned_live_runtime_contract():
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize(
-    "platform",
-    [
-        Platform.DISCORD,
-        Platform.TELEGRAM,
-        Platform.SLACK,
-        Platform.API_SERVER,
-        Platform.EMAIL,
-        Platform("ntfy"),
-    ],
+    "registry_name,module_name,class_name,platform",
+    REPRESENTATIVE_ADAPTERS,
 )
-async def test_common_renderer_preserves_routing_for_peer_and_assistant_delivery(
-    monkeypatch, platform
+async def test_production_adapter_presents_live_runtime_events_through_runner(
+    monkeypatch, registry_name, module_name, class_name, platform
 ):
+    adapter, entry = _build_production_adapter(registry_name, module_name, class_name)
+    assert isinstance(adapter, BasePlatformAdapter)
+    assert adapter.platform == platform
+    assert adapter.LIVE_RUNTIME_PRESENTATION_VIA_RUNNER is True
+    assert adapter.STARTS_LIVE_RUNTIME is False
+    if entry is not None:
+        assert entry.live_runtime_presentation_via_runner is True
+        assert entry.starts_live_runtime is False
+
     send = AsyncMock(
         return_value=SimpleNamespace(success=True, message_id="platform-message-1")
     )
     edit_message = AsyncMock(
         return_value=SimpleNamespace(success=True, message_id="platform-message-1")
     )
-    adapter = SimpleNamespace(
-        send=send,
-        edit_message=edit_message,
-        MAX_MESSAGE_LENGTH=4096,
-        REQUIRES_EDIT_FINALIZE=False,
-        supports_native_streaming=False,
-        supports_draft_streaming=False,
-        supports_code_blocks=False,
-        splits_long_messages=False,
-    )
-    adapter.render_message_event = (
-        lambda event, sink: BasePlatformAdapter.render_message_event(adapter, event, sink)
-    )
+    monkeypatch.setattr(adapter, "send", send)
+    monkeypatch.setattr(adapter, "edit_message", edit_message)
 
     runner = object.__new__(GatewayRunner)
-    runner.config = SimpleNamespace(streaming=StreamingConfig(enabled=True))
+    runner.config = SimpleNamespace(streaming=StreamingConfig(enabled=False))
     runner._adapter_for_source = lambda _source: adapter
     runner._build_stream_consumer_config = lambda *_args, **_kwargs: (
         StreamConsumerConfig(edit_interval=0.001, buffer_threshold=1),
@@ -140,31 +150,32 @@ async def test_common_renderer_preserves_routing_for_peer_and_assistant_delivery
             payload=payload,
         )
 
-    await renderer.on_event(
-        event(
-            1,
-            "message.user",
-            {
-                "message_id": "peer-message-1",
-                "text": "peer prompt",
-                "timestamp": 1.0,
-                "display_metadata": {"user_name": "Alice"},
-            },
+    try:
+        await renderer.on_event(
+            event(
+                1,
+                "message.user",
+                {
+                    "message_id": "peer-message-1",
+                    "text": "peer prompt",
+                    "timestamp": 1.0,
+                    "display_metadata": {"user_name": "Alice"},
+                },
+            )
         )
-    )
-    await renderer.on_event(
-        event(2, "message.delta", {"text": "assistant reply"})
-    )
-    await renderer.on_event(
-        event(
-            3,
-            "message.complete",
-            {"text": "assistant reply", "status": "complete"},
+        await renderer.on_event(event(2, "message.delta", {"text": "assistant reply"}))
+        await renderer.on_event(
+            event(
+                3,
+                "message.complete",
+                {"text": "assistant reply", "status": "complete"},
+            )
         )
-    )
+    finally:
+        await renderer.close()
 
-    assert adapter.send.await_count >= 2
-    calls = adapter.send.await_args_list
+    assert send.await_count == 2
+    calls = send.await_args_list
     assert calls[0].args[:2] == ("chat-1", "Alice: peer prompt")
     assert all(call.kwargs["metadata"]["thread_id"] == "thread-1" for call in calls)
     if platform == Platform.SLACK:
