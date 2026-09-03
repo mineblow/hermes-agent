@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import threading
 import uuid
 from pathlib import Path
@@ -7,6 +8,7 @@ from unittest.mock import AsyncMock
 
 import pytest
 
+from gateway.live_runtime_client import AsyncLiveRuntimeClient
 from hermes_cli.classic_live_runtime import (
     ClassicLiveRuntimeController,
     ClassicLiveRuntimeFrontend,
@@ -56,6 +58,113 @@ async def test_classic_frontend_submits_with_stable_identity_and_closes_cleanly(
     client.close.assert_awaited_once_with()
     assert frontend.client_id == "classic-cli:test"
     assert frontend.surface == "classic-cli"
+
+
+@pytest.mark.asyncio
+async def test_classic_frontend_reconnects_from_callback_delivered_watermark():
+    owner = RuntimeOwner(
+        conversation_key="root-1",
+        owner_id="owner-1",
+        generation=1,
+        pid=1,
+        process_start_time=1.0,
+        endpoint="/tmp/runtime.sock",
+        profile_home="/tmp/profile",
+        surface="tui_gateway",
+        started_at=1.0,
+    )
+
+    class Connection:
+        def __init__(self, replay_seq):
+            self.replay_seq = replay_seq
+            self.received = asyncio.Queue()
+            self.hellos = []
+            self.closed = False
+
+        async def send(self, frame):
+            if frame["kind"] != "frontend.hello":
+                return
+            self.hellos.append(frame)
+            await self.received.put(
+                {
+                    "kind": "frontend.hello.ok",
+                    "protocol": 1,
+                    "owner_id": "owner-1",
+                    "generation": 1,
+                    "accepted_capabilities": [
+                        "interaction.respond",
+                        "observe",
+                        "prompt.submit",
+                    ],
+                    "runtime_id": "runtime-1",
+                    "durable_session_id": "session-1",
+                    "replay_epoch": "epoch-1",
+                    "replay_truncated": False,
+                    "replay_seq": self.replay_seq,
+                }
+            )
+
+        async def recv(self):
+            item = await self.received.get()
+            if isinstance(item, BaseException):
+                raise item
+            return item
+
+        async def close(self):
+            self.closed = True
+
+    first = Connection(0)
+    second = Connection(1)
+    connections = iter((first, second))
+    rows = []
+    holder = {}
+    client = AsyncLiveRuntimeClient(
+        conversation_key="root-1",
+        durable_root="root-1",
+        client_id="classic-cli:reconnect",
+        principal={
+            "provider": "classic-cli",
+            "subject": "classic-cli:reconnect",
+            "authenticated": True,
+        },
+        surface="classic-cli",
+        requested_capabilities={"observe", "prompt.submit", "interaction.respond"},
+        owner_lookup=lambda _key: owner,
+        connector=lambda _owner: next(connections),
+        on_event=lambda event: holder["frontend"].on_event(event),
+        reconnect_delay=0.01,
+    )
+    frontend = ClassicLiveRuntimeFrontend(
+        client=client,
+        client_id="classic-cli:reconnect",
+        on_row=rows.append,
+    )
+    holder["frontend"] = frontend
+
+    await frontend.start()
+    await first.received.put(
+        _event(1, "message.user", {"text": "peer one", "client_id": "peer"})
+    )
+    async with asyncio.timeout(2):
+        while len(rows) < 1:
+            await asyncio.sleep(0.01)
+    await first.received.put(ConnectionError("replace owner transport"))
+    async with asyncio.timeout(2):
+        while not second.hellos:
+            await asyncio.sleep(0.01)
+    await second.received.put(
+        _event(2, "message.user", {"text": "peer two", "client_id": "peer"})
+    )
+    async with asyncio.timeout(2):
+        while len(rows) < 2:
+            await asyncio.sleep(0.01)
+
+    await frontend.close()
+
+    assert second.hellos[0]["replay"] == {"epoch": "epoch-1", "seq": 1}
+    assert [row["text"] for row in rows] == ["peer one", "peer two"]
+    assert first.closed is True
+    assert second.closed is True
 
 
 def test_classic_frontend_renders_peer_rows_but_deduplicates_local_echoes():

@@ -382,6 +382,18 @@ runtime proxy -> prompt.submit` exactly once.
 
 **Coverage:** attach/resume, prompt identity, live peer rows, replay, interrupt, approval/clarification, reconnect, and clean exit.
 
+**Result:** Classic interactive mode now creates or resumes through gateway ownership,
+then attaches as a presentation-only client over the canonical runtime proxy. Prompt
+identity, attachments, live peer rows, pending interactions, strict interaction
+response deadlines, and canonical interrupt replacement are preserved without local
+agent execution or duplicate persistence. Fresh attachment starts at the owner's
+latest sequence while reconnect resumes from the callback-delivered epoch/sequence
+watermark; truncated replay is fenced by the validated authoritative completion
+snapshot. Default TUI responses preserve canonical interaction request identity and
+use the same response deadline. One-shot `-q` remains a producer rather than a
+persistent attached frontend. Lifecycle, proxy, replay, simultaneous
+TUI/classic/Discord, full TUI, typecheck, lint, and build gates pass.
+
 ### Task 13: Inventory ACP, MCP, A2A, cron, and webhooks
 
 **Objective:** Prevent inaccurate universal-support claims.
