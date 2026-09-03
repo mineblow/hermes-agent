@@ -90,6 +90,17 @@ def test_dead_owner_is_reclaimed_with_incremented_generation(tmp_path, monkeypat
     assert second.owner.generation == first.owner.generation + 1
 
 
+def test_clean_release_preserves_monotonic_owner_generation(tmp_path):
+    first = _claim(tmp_path, owner_id="owner-a", endpoint="/tmp/a.sock")
+    assert first.lease is not None
+    assert owners.release_runtime_owner(first.lease) is True
+
+    second = _claim(tmp_path, owner_id="owner-b", endpoint="/tmp/b.sock")
+
+    assert second.kind == "owned"
+    assert second.owner.generation > first.owner.generation
+
+
 def test_claim_sweeps_unrelated_proven_dead_owners(tmp_path, monkeypatch):
     first = _claim(tmp_path, owner_id="owner-a", endpoint="/tmp/a.sock")
     monkeypatch.setattr(

@@ -138,12 +138,12 @@ def _parse_owner(raw: Any, path: Path) -> RuntimeOwner:
     )
 
 
-def _read(path: Path) -> list[RuntimeOwner]:
+def _read(path: Path) -> tuple[list[RuntimeOwner], int]:
     try:
         with open(path, "r", encoding="utf-8") as handle:
             payload = json.load(handle)
     except FileNotFoundError:
-        return []
+        return [], 1
     except Exception as exc:
         raise RuntimeOwnerRegistryError(
             f"runtime owner registry unreadable: {path}"
@@ -162,16 +162,32 @@ def _read(path: Path) -> list[RuntimeOwner]:
         raise RuntimeOwnerRegistryError(
             f"runtime owner registry has duplicate conversation keys: {path}"
         )
-    return parsed
+    minimum_next = max((owner.generation for owner in parsed), default=0) + 1
+    next_generation = payload.get("next_generation", minimum_next)
+    if (
+        isinstance(next_generation, bool)
+        or not isinstance(next_generation, int)
+        or next_generation < minimum_next
+    ):
+        raise RuntimeOwnerRegistryError(
+            f"runtime owner registry has invalid next generation: {path}"
+        )
+    return parsed, next_generation
 
 
-def _write(path: Path, entries: list[RuntimeOwner]) -> None:
+def _write(
+    path: Path, entries: list[RuntimeOwner], next_generation: int
+) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     temporary = path.with_name(f"{path.name}.{os.getpid()}.{uuid.uuid4().hex}.tmp")
     try:
         with open(temporary, "w", encoding="utf-8") as handle:
             json.dump(
-                {"version": 1, "entries": [asdict(owner) for owner in entries]},
+                {
+                    "version": 1,
+                    "entries": [asdict(owner) for owner in entries],
+                    "next_generation": next_generation,
+                },
                 handle,
                 sort_keys=True,
             )
@@ -225,7 +241,7 @@ def claim_runtime_owner(
         Path(profile_home) if profile_home is not None else _home(registry_home)
     )
     with _FileLock(lock_path):
-        entries = _read(state_path)
+        entries, next_generation = _read(state_path)
         existing = next(
             (entry for entry in entries if entry.conversation_key == conversation_key),
             None,
@@ -234,14 +250,14 @@ def claim_runtime_owner(
             entries,
             preserve_key=existing.conversation_key if existing is not None else None,
         )
-        generation = 1
+        generation = next_generation
         if existing is not None:
             liveness = _owner_liveness(existing)
             if liveness is None:
                 raise RuntimeOwnerRegistryError("runtime owner liveness is unknown")
             if liveness:
                 if swept:
-                    _write(state_path, entries)
+                    _write(state_path, entries, next_generation)
                 if (
                     existing.owner_id == owner_id
                     and existing.pid == os.getpid()
@@ -251,11 +267,11 @@ def claim_runtime_owner(
                         "owned", existing, _lease(existing, state_path, lock_path)
                     )
                 return OwnerClaimResult("remote", existing, None)
-            generation = existing.generation + 1
+            generation = max(generation, existing.generation + 1)
             entries.remove(existing)
         if len(entries) >= MAX_RUNTIME_OWNERS:
             if swept:
-                _write(state_path, entries)
+                _write(state_path, entries, next_generation)
             raise RuntimeOwnerRegistryError("runtime owner registry capacity exceeded")
         owner = RuntimeOwner(
             conversation_key=conversation_key,
@@ -269,7 +285,7 @@ def claim_runtime_owner(
             started_at=time.time(),
         )
         entries.append(owner)
-        _write(state_path, entries)
+        _write(state_path, entries, generation + 1)
         return OwnerClaimResult("owned", owner, _lease(owner, state_path, lock_path))
 
 
@@ -278,9 +294,10 @@ def lookup_runtime_owner(
 ) -> RuntimeOwner | None:
     state_path, lock_path = _paths(registry_home)
     with _FileLock(lock_path):
-        entries, swept = _sweep_proven_dead(_read(state_path))
+        entries, next_generation = _read(state_path)
+        entries, swept = _sweep_proven_dead(entries)
         if swept:
-            _write(state_path, entries)
+            _write(state_path, entries, next_generation)
         return next(
             (owner for owner in entries if owner.conversation_key == conversation_key),
             None,
@@ -289,10 +306,11 @@ def lookup_runtime_owner(
 
 def assert_runtime_owner(lease: RuntimeOwnerLease) -> bool:
     with _FileLock(lease.lock_path):
+        entries, _next_generation = _read(lease.state_path)
         current = next(
             (
                 owner
-                for owner in _read(lease.state_path)
+                for owner in entries
                 if owner.conversation_key == lease.owner.conversation_key
             ),
             None,
@@ -308,7 +326,7 @@ def release_runtime_owner(lease: RuntimeOwnerLease) -> bool:
     if lease.released:
         return False
     with _FileLock(lease.lock_path):
-        entries = _read(lease.state_path)
+        entries, next_generation = _read(lease.state_path)
         current = next(
             (
                 owner
@@ -320,7 +338,7 @@ def release_runtime_owner(lease: RuntimeOwnerLease) -> bool:
         if current is None or current != lease.owner:
             return False
         entries.remove(current)
-        _write(lease.state_path, entries)
+        _write(lease.state_path, entries, next_generation)
         lease.released = True
         return True
 
@@ -330,9 +348,9 @@ def release_process_runtime_owners(
 ) -> int:
     state_path, lock_path = _paths(registry_home)
     with _FileLock(lock_path):
-        entries = _read(state_path)
+        entries, next_generation = _read(state_path)
         retained = [owner for owner in entries if owner.owner_id != owner_id]
         removed = len(entries) - len(retained)
         if removed:
-            _write(state_path, retained)
+            _write(state_path, retained, next_generation)
         return removed
