@@ -1585,6 +1585,30 @@ describe('createGatewayEventHandler', () => {
     ])
   })
 
+  it('does not acknowledge a peer message ID until transcript insertion succeeds', () => {
+    const appended: Msg[] = []
+    const ctx = buildCtx(appended)
+    ctx.transcript.appendMessage = vi
+      .fn()
+      .mockImplementationOnce(() => {
+        throw new Error('render failed')
+      })
+      .mockImplementation((message: Msg) => appended.push(message))
+    const onEvent = createGatewayEventHandler(ctx)
+
+    const event = {
+      payload: { message_id: 'peer-retry', text: 'retry me', timestamp: 12 },
+      type: 'message.user'
+    } as any
+
+    expect(() => onEvent(event)).toThrow('render failed')
+    expect(() => onEvent(event)).not.toThrow()
+
+    expect(appended.filter(message => message.role === 'user')).toEqual([
+      { createdAt: 12, messageId: 'peer-retry', role: 'user', text: 'retry me' }
+    ])
+  })
+
   it('preserves attachment refs on attachment-only peer user messages', () => {
     const appended: Msg[] = []
     const onEvent = createGatewayEventHandler(buildCtx(appended))

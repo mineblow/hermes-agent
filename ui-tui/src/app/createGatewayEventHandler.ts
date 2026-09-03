@@ -824,8 +824,6 @@ export function createGatewayEventHandler(ctx: GatewayEventHandlerContext): (ev:
           return
         }
 
-        seenPeerUserMessageIds.add(messageId)
-
         const attachmentRefs = Array.isArray(ev.payload?.attachment_refs)
           ? ev.payload.attachment_refs.filter((ref): ref is string => typeof ref === 'string' && ref.length > 0)
           : []
@@ -837,6 +835,7 @@ export function createGatewayEventHandler(ctx: GatewayEventHandlerContext): (ev:
           role: 'user',
           text: ev.payload.text ?? ''
         })
+        seenPeerUserMessageIds.add(messageId)
 
         return
       }

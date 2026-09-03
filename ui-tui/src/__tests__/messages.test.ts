@@ -120,6 +120,45 @@ describe('MessageLine', () => {
     expect(stripAnsi(output)).toContain('[[ attachment://report.pdf ]]')
   })
 
+  it('renders attachment refs beside a collapsed paste-backed peer message', () => {
+    const stdout = new PassThrough()
+    const stdin = new PassThrough()
+    const stderr = new PassThrough()
+    let output = ''
+
+    Object.assign(stdout, { columns: 80, isTTY: false, rows: 24 })
+    Object.assign(stdin, { isTTY: false })
+    Object.assign(stderr, { isTTY: false })
+    stdout.on('data', chunk => {
+      output += chunk.toString()
+    })
+
+    const instance = renderSync(
+      React.createElement(MessageLine, {
+        cols: 80,
+        msg: {
+          attachmentRefs: ['attachment://report.pdf'],
+          role: 'user',
+          text: `${'x'.repeat(320)} [[paste:1 attached]]`
+        },
+        t: DEFAULT_THEME
+      }),
+      {
+        patchConsole: false,
+        stderr: stderr as NodeJS.WriteStream,
+        stdin: stdin as NodeJS.ReadStream,
+        stdout: stdout as NodeJS.WriteStream
+      }
+    )
+
+    instance.unmount()
+    instance.cleanup()
+
+    const rendered = stripAnsi(output)
+    expect(rendered).toContain('[long message]')
+    expect(rendered).toContain('[[ attachment://report.pdf ]]')
+  })
+
   it('preserves a separator after compound user prompt glyphs in transcript rows', () => {
     const stdout = new PassThrough()
     const stdin = new PassThrough()

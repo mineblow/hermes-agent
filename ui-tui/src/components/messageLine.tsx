@@ -226,6 +226,11 @@ export const MessageLine = memo(function MessageLine({
             [long message]
           </Text>
           {rest.join('')}
+          {msg.attachmentRefs?.map(ref => (
+            <Text color={t.color.accent} key={ref}>
+              {`\n[[ ${ref} ]]`}
+            </Text>
+          ))}
         </Text>
       )
     }
