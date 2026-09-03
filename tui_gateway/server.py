@@ -3262,8 +3262,24 @@ _SESSION_RPC_CAPABILITIES = {
     # Keep this explicit so observer-visible read RPCs remain usable while new
     # mutators must be classified here before they can cross network ingress.
     "session.close": "session.steer",
+    "session.cwd.set": "session.steer",
+    "session.workspace.move": "session.steer",
+    "session.delete": "session.steer",
+    "session.title": "session.steer",
+    "session.set_hidden": "session.steer",
+    "session.compress": "session.steer",
+    "session.save": "session.steer",
     "session.undo": "session.steer",
     "session.branch": "session.steer",
+    "session.usage": "observe",
+    "session.context_breakdown": "observe",
+    "session.status": "observe",
+    "session.history": "observe",
+    "session.detach": "observe",
+    "session.attachments": "prompt.submit",
+    "session.events.since": "observe",
+    "session.presentation.snapshot": "observe",
+    "config.set": "session.steer",
     "prompt.background": "session.steer",
     "image.attach": "session.steer",
     "image.attach_bytes": "session.steer",
@@ -3271,6 +3287,14 @@ _SESSION_RPC_CAPABILITIES = {
     "file.attach": "session.steer",
     "image.detach": "session.steer",
 }
+
+# These RPCs establish or validate their attachment inside the handler, so the
+# generic live-session gate cannot require membership before invoking them.
+_SELF_AUTHORIZING_SESSION_RPCS = frozenset({
+    "session.activate",
+    "session.attach",
+    "session.resume",
+})
 
 
 def _authorization_session(method_name: str, params: dict) -> dict | None:
@@ -3309,9 +3333,33 @@ def _authorization_session(method_name: str, params: dict) -> dict | None:
     return None
 
 
+def _resolve_authorization_session(
+    rid, method_name: str, params: dict
+) -> tuple[dict | None, dict | None]:
+    """Resolve authorization state without letting registry races fail open/crash."""
+    try:
+        return _authorization_session(method_name, params), None
+    except Exception as exc:
+        return None, _err(rid, 5036, f"could not resolve live session authority: {exc}")
+
+
 def _authorize_session_rpc(rid, method_name: str, params: dict) -> dict | None:
     capability = _SESSION_RPC_CAPABILITIES.get(method_name)
     if capability is None:
+        session, resolution_error = _resolve_authorization_session(
+            rid, method_name, params
+        )
+        if resolution_error is not None:
+            return resolution_error
+        if (
+            method_name.startswith("session.")
+            and method_name not in _SELF_AUTHORIZING_SESSION_RPCS
+            and session is not None
+        ):
+            # New session RPCs must be deliberately classified before they can
+            # operate on a live shared runtime. Durable/non-live lookups retain
+            # legacy handler behavior because they resolve no live record.
+            return _err(rid, 4003, "live session RPC has no authorization policy")
         return None
     if method_name == "clarify.respond":
         request_id = str(params.get("request_id") or "")
@@ -3327,7 +3375,9 @@ def _authorize_session_rpc(rid, method_name: str, params: dict) -> dict | None:
                 and current_transport() is not None
             ):
                 return _err(rid, 4009, "clarification owner is unavailable")
-    session = _authorization_session(method_name, params)
+    session, resolution_error = _resolve_authorization_session(rid, method_name, params)
+    if resolution_error is not None:
+        return resolution_error
     if session is None:
         # Let the handler preserve its established not-found/expired response.
         return None
@@ -3382,11 +3432,12 @@ def handle_request(req: dict) -> dict | None:
         finally:
             _current_rpc_method.reset(token)
 
-    session = (
-        _authorization_session(method, params)
-        if method in _SESSION_RPC_CAPABILITIES
-        else None
-    )
+    if method in _SESSION_RPC_CAPABILITIES:
+        session, resolution_error = _resolve_authorization_session(rid, method, params)
+        if resolution_error is not None:
+            return resolution_error
+    else:
+        session = None
     if session is not None:
         # The lock is part of the authoritative runtime record, so every
         # attached transport converges on one control ingress order.
@@ -14479,13 +14530,11 @@ def _respond(rid, params, key, *, allow_expired=False):
                         "status": "resolved",
                     },
                 )
-    if resolution is not None and not _emit(
-        "clarify.resolved",
-        resolution[0],
-        resolution[1],
-        wait_for_delivery=True,
-    ):
-        return _err(rid, 5004, "clarification resolved but event delivery failed")
+    if resolution is not None:
+        # Resolution is committed under _prompt_lock above. Observer delivery is
+        # telemetry/presentation and must not delay or rewrite that authoritative
+        # result; disconnected observers recover it through replay/snapshots.
+        _emit("clarify.resolved", resolution[0], resolution[1])
     return _ok(rid, response)
 
 

@@ -95,8 +95,6 @@ class _LifecycleTransport:
         "tool.complete",
         "agent.terminal.output",
         "terminal.close",
-        "approval.request",
-        "clarify.request",
         "subagent.start",
         "subagent.tool",
         "subagent.complete",
@@ -160,9 +158,9 @@ def test_clarification_barrier_fans_out_but_only_controller_can_release_it():
     )
     try:
         worker.start()
-        request = observer.wait_for_event("clarify.request")
+        request = controller.wait_for_event("clarify.request")
         request_id = request["params"]["payload"]["request_id"]
-        assert controller.wait_for_event("clarify.request") == request
+        assert "clarify.request" not in observer.event_types()
 
         denied = _dispatch_sync(
             {
@@ -245,6 +243,58 @@ def test_orphaned_clarification_fails_closed_before_response_mutation():
         attacker_hub.close()
 
 
+def test_clarification_resolution_does_not_wait_for_observer_delivery(monkeypatch):
+    request_id = "clarification-delivery"
+    event = threading.Event()
+    sid = "clarification-delivery-session"
+    session = _session()
+    controller = _LifecycleTransport("clarification-delivery-controller")
+    hub = server._ensure_session_event_hub(sid, session)
+    hub.attach(controller, client_id=controller.client_id, mode=AttachmentMode.CONTROL)
+    server._sessions[sid] = session
+    emissions = []
+    with server._prompt_lock:
+        server._pending[request_id] = (sid, event)
+    monkeypatch.setattr(
+        server,
+        "_emit",
+        lambda *args, **kwargs: emissions.append((args, kwargs)) or False,
+    )
+    try:
+        response = _dispatch_sync(
+            {
+                "id": "clarification-delivery-response",
+                "method": "clarify.respond",
+                "params": {"request_id": request_id, "answer": "yes"},
+            },
+            controller,
+        )
+
+        assert response["result"]["status"] == "ok"
+        assert event.is_set()
+        assert server._answers[request_id] == "yes"
+        assert emissions == [
+            (
+                (
+                    "clarify.resolved",
+                    sid,
+                    {
+                        "request_id": request_id,
+                        "question_id": None,
+                        "status": "resolved",
+                    },
+                ),
+                {},
+            )
+        ]
+    finally:
+        with server._prompt_lock:
+            server._pending.pop(request_id, None)
+            server._answers.pop(request_id, None)
+        server._sessions.pop(sid, None)
+        hub.close()
+
+
 def test_clarification_revalidates_owner_atomically_before_mutation(monkeypatch):
     request_id = "clarification-owner-race"
     event = threading.Event()
@@ -316,8 +366,9 @@ def test_approval_request_fans_out_but_only_controller_can_resolve(
             sid,
             {"request_id": "approval-request-1", "command": "deploy"},
         )
-        request = observer.wait_for_event("approval.request")
-        assert controller.wait_for_event("approval.request") == request
+        request = controller.wait_for_event("approval.request")
+        assert request["params"]["payload"]["request_id"] == "approval-request-1"
+        assert "approval.request" not in observer.event_types()
 
         params = {
             "session_id": sid,
@@ -15955,7 +16006,7 @@ def test_session_delete_fails_closed_when_active_snapshot_raises(monkeypatch):
 
     assert "error" in resp
     assert resp["error"]["code"] == 5036
-    assert "enumerate active sessions" in resp["error"]["message"]
+    assert "live session authority" in resp["error"]["message"]
 
 
 def test_session_delete_returns_4007_when_missing(monkeypatch):
