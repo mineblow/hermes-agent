@@ -37,6 +37,8 @@ RUNTIME_PROXY_PROTOCOL_VERSION = LIVE_RUNTIME_PROTOCOL_VERSION
 MAX_FRAME_BYTES = 16 * 1024 * 1024
 DEFAULT_REQUEST_TIMEOUT_SECONDS = 30 * 60
 MAX_STABLE_RUNTIME_ROUTES = 4096
+DEFAULT_HANDSHAKE_TIMEOUT_SECONDS = 2.0
+DEFAULT_MAX_CONCURRENT_CONNECTIONS = 64
 
 
 def _profile_scoped_conversation_key(
@@ -316,7 +318,13 @@ class RuntimeProxyServer:
         owner_lookup: Callable[[str], RuntimeOwner | None],
         dispatch: Callable[[dict[str, Any], ProxyTransport], dict[str, Any] | None],
         detach: Callable[[ProxyTransport], None] | None = None,
+        handshake_timeout_seconds: float = DEFAULT_HANDSHAKE_TIMEOUT_SECONDS,
+        max_concurrent_connections: int = DEFAULT_MAX_CONCURRENT_CONNECTIONS,
     ) -> None:
+        if handshake_timeout_seconds <= 0:
+            raise ValueError("handshake_timeout_seconds must be positive")
+        if max_concurrent_connections < 1:
+            raise ValueError("max_concurrent_connections must be positive")
         self.endpoint = Path(endpoint)
         self._owner_lookup = owner_lookup
         self._dispatch = dispatch
@@ -326,6 +334,9 @@ class RuntimeProxyServer:
         self._accept_thread: threading.Thread | None = None
         self._connections_lock = threading.Lock()
         self._connections: set[socket.socket] = set()
+        self._handshake_timeout_seconds = handshake_timeout_seconds
+        self._max_concurrent_connections = max_concurrent_connections
+        self._connection_slots = threading.BoundedSemaphore(max_concurrent_connections)
 
     def start(self) -> bool:
         if os.name == "nt":
@@ -342,7 +353,7 @@ class RuntimeProxyServer:
             finally:
                 os.umask(old_umask)
             os.chmod(self.endpoint, 0o600)
-            listener.listen()
+            listener.listen(self._max_concurrent_connections)
             listener.settimeout(0.2)
         except OSError:
             try:
@@ -393,16 +404,39 @@ class RuntimeProxyServer:
                 continue
             except OSError:
                 return
+            if not self._connection_slots.acquire(blocking=False):
+                try:
+                    connection.close()
+                except OSError:
+                    pass
+                continue
             with self._connections_lock:
                 self._connections.add(connection)
-            threading.Thread(
-                target=self._handle_connection, args=(connection,), daemon=True
-            ).start()
+            try:
+                threading.Thread(
+                    target=self._run_connection, args=(connection,), daemon=True
+                ).start()
+            except BaseException:
+                with self._connections_lock:
+                    self._connections.discard(connection)
+                try:
+                    connection.close()
+                except OSError:
+                    pass
+                self._connection_slots.release()
+                raise
+
+    def _run_connection(self, connection: socket.socket) -> None:
+        try:
+            self._handle_connection(connection)
+        finally:
+            self._connection_slots.release()
 
     def _handle_connection(self, connection: socket.socket) -> None:
         transport: ProxyTransport | None = None
         stream = None
         try:
+            connection.settimeout(self._handshake_timeout_seconds)
             peer_pid, peer_uid, _peer_gid = require_posix_peer_credentials(connection)
             stream = connection.makefile("rwb", buffering=0)
             hello = read_frame(stream)
@@ -417,6 +451,7 @@ class RuntimeProxyServer:
                 expected_owner=current,
                 current_owner=self._owner_lookup(current.conversation_key),
             )
+            connection.settimeout(None)
 
             def send(envelope: dict[str, Any]) -> bool:
                 if self._owner_lookup(current.conversation_key) != current:

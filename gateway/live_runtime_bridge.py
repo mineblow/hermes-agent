@@ -8,7 +8,8 @@ import inspect
 import json
 import logging
 import uuid
-from collections.abc import Awaitable, Callable
+from collections.abc import AsyncIterator, Awaitable, Callable
+from contextlib import asynccontextmanager
 from dataclasses import dataclass
 from enum import Enum
 from pathlib import Path
@@ -166,12 +167,33 @@ ClientFactory = Callable[
 ]
 
 
+@dataclass
+class _RouteLockEntry:
+    lock: asyncio.Lock
+    users: int = 0
+
+
 class LiveRuntimeBridge:
     """Own one async runtime client per authenticated gateway routing key."""
 
     def __init__(self, state_for: Callable[[str], SessionState]) -> None:
         self._state_for = state_for
-        self._locks: dict[tuple[str, str], asyncio.Lock] = {}
+        self._locks: dict[tuple[str, str], _RouteLockEntry] = {}
+
+    @asynccontextmanager
+    async def _route_lock(self, lock_key: tuple[str, str]) -> AsyncIterator[None]:
+        entry = self._locks.setdefault(lock_key, _RouteLockEntry(lock=asyncio.Lock()))
+        entry.users += 1
+        try:
+            async with entry.lock:
+                yield
+        finally:
+            entry.users -= 1
+            if entry.users == 0 and self._locks.get(lock_key) is entry:
+                session_key, token = lock_key
+                attachments = self._state_for(session_key).live_runtime_attachments
+                if token not in attachments:
+                    self._locks.pop(lock_key, None)
 
     def attachment_for(
         self, session_key: str, routing_key: LiveRuntimeRoutingKey
@@ -308,8 +330,7 @@ class LiveRuntimeBridge:
         routing_key = LiveRuntimeRoutingKey.from_source(source, principal_id)
         resolved_profile_home = str(Path(profile_home).expanduser().resolve())
         lock_key = (session_key, routing_key.token)
-        lock = self._locks.setdefault(lock_key, asyncio.Lock())
-        async with lock:
+        async with self._route_lock(lock_key):
             attachments = self._state_for(session_key).live_runtime_attachments
             existing = attachments.get(routing_key.token)
             if existing is not None:
@@ -388,8 +409,7 @@ class LiveRuntimeBridge:
         expected: LiveRuntimeAttachment | None = None,
     ) -> bool:
         lock_key = (session_key, routing_key.token)
-        lock = self._locks.setdefault(lock_key, asyncio.Lock())
-        async with lock:
+        async with self._route_lock(lock_key):
             attachments = self._state_for(session_key).live_runtime_attachments
             attachment = attachments.get(routing_key.token)
             if attachment is None:

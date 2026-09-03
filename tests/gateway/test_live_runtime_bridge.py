@@ -206,6 +206,70 @@ async def test_detach_removes_state_and_closes_exactly_once():
     assert await bridge.detach("session-key", attachment.routing_key) is False
     assert attachment.client.closed == 1
     assert states["session-key"].live_runtime_attachments == {}
+    assert bridge._locks == {}
+
+
+@pytest.mark.asyncio
+async def test_detach_lock_cleanup_is_guarded_against_waiting_reattach():
+    bridge, _states = _bridge()
+    close_entered = asyncio.Event()
+    release_close = asyncio.Event()
+    creations = 0
+
+    class BlockingCloseClient(FakeClient):
+        async def close(self):
+            self.closed += 1
+            close_entered.set()
+            await release_close.wait()
+
+    async def factory(request):
+        nonlocal creations
+        creations += 1
+        if creations == 1:
+            return BlockingCloseClient(request)
+        return FakeClient(request)
+
+    first = await bridge.attach(
+        session_key="session-key",
+        source=_source(),
+        principal_id="principal-1",
+        durable_root="root-1",
+        durable_session_id="session-1",
+        profile_home="/profiles/default",
+        mode=AttachmentMode.CONTROL,
+        client_factory=factory,
+    )
+    lock_key = ("session-key", first.routing_key.token)
+    original_lock_entry = bridge._locks[lock_key]
+
+    detach_task = asyncio.create_task(
+        bridge.detach("session-key", first.routing_key, expected=first)
+    )
+    await close_entered.wait()
+    attach_task = asyncio.create_task(
+        bridge.attach(
+            session_key="session-key",
+            source=_source(),
+            principal_id="principal-1",
+            durable_root="root-2",
+            durable_session_id="session-2",
+            profile_home="/profiles/default",
+            mode=AttachmentMode.CONTROL,
+            client_factory=factory,
+        )
+    )
+    await asyncio.sleep(0)
+    assert bridge._locks[lock_key] is original_lock_entry
+
+    release_close.set()
+    assert await detach_task is True
+    replacement = await attach_task
+    assert bridge._locks[lock_key] is original_lock_entry
+
+    assert await bridge.detach(
+        "session-key", replacement.routing_key, expected=replacement
+    )
+    assert bridge._locks == {}
 
 
 @pytest.mark.asyncio
@@ -300,6 +364,7 @@ async def test_gateway_runner_shutdown_hook_closes_existing_attachments():
         runner._session_state("runner-session").live_runtime_attachments
         == {}
     )
+    assert bridge._locks == {}
 
 
 def test_routing_key_ignores_delivery_only_message_metadata():

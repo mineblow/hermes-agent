@@ -732,6 +732,62 @@ def test_unix_proxy_routes_response_and_preserves_async_event(tmp_path):
         server.stop()
 
 
+def test_unix_proxy_drops_peer_that_does_not_finish_handshake(tmp_path):
+    if os.name == "nt":
+        pytest.skip("Unix socket integration")
+    endpoint = tmp_path / "runtime.sock"
+    server = runtime_proxy.RuntimeProxyServer(
+        endpoint=endpoint,
+        owner_lookup=lambda _key: None,
+        dispatch=lambda _request, _transport: None,
+        handshake_timeout_seconds=0.05,
+    )
+    peer = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    try:
+        assert server.start() is True
+        peer.connect(str(endpoint))
+        deadline = time.monotonic() + 1
+        while server._connections and time.monotonic() < deadline:
+            time.sleep(0.005)
+        assert server._connections == set()
+        peer.settimeout(0.2)
+        assert peer.recv(1) == b""
+    finally:
+        peer.close()
+        server.stop()
+
+
+def test_unix_proxy_rejects_connections_before_spawning_unbounded_workers(tmp_path):
+    if os.name == "nt":
+        pytest.skip("Unix socket integration")
+    endpoint = tmp_path / "runtime.sock"
+    server = runtime_proxy.RuntimeProxyServer(
+        endpoint=endpoint,
+        owner_lookup=lambda _key: None,
+        dispatch=lambda _request, _transport: None,
+        handshake_timeout_seconds=2,
+        max_concurrent_connections=1,
+    )
+    first = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    rejected = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    try:
+        assert server.start() is True
+        first.connect(str(endpoint))
+        deadline = time.monotonic() + 1
+        while len(server._connections) != 1 and time.monotonic() < deadline:
+            time.sleep(0.005)
+        assert len(server._connections) == 1
+
+        rejected.connect(str(endpoint))
+        rejected.settimeout(1)
+        assert rejected.recv(1) == b""
+        assert len(server._connections) == 1
+    finally:
+        first.close()
+        rejected.close()
+        server.stop()
+
+
 def test_concurrent_proxy_connect_installs_one_client_and_ignores_loser_disconnect(
     monkeypatch, tmp_path
 ):
